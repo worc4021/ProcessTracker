@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using ProcessTracker.Core.Model;
 using ProcessTracker.Core.Orphans;
 using ProcessTracker.Core.Tracking;
@@ -13,7 +14,9 @@ namespace ProcessTracker.Core.Contracts;
 /// <summary>JSON settings every endpoint and client uses: web defaults (camelCase) with enums as strings.</summary>
 public static class ContractJson
 {
-    public static JsonSerializerOptions Options { get; } = Configure(new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    /// <remarks>The resolver is set explicitly so that the instance can be frozen, which the MCP SDK does.</remarks>
+    public static JsonSerializerOptions Options { get; } =
+        Configure(new JsonSerializerOptions(JsonSerializerDefaults.Web) { TypeInfoResolver = new DefaultJsonTypeInfoResolver() });
 
     /// <summary>Applies the contract settings on top of web defaults (for ASP.NET Core's own options instance).</summary>
     public static JsonSerializerOptions Configure(JsonSerializerOptions o)

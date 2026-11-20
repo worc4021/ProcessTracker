@@ -28,10 +28,9 @@ public static class RestEndpoints
 
         api.MapGet("/health", (ITrackerHost host, TimeProvider time) => Health(host, time));
 
-        api.MapGet("/load", (ITrackerHost host, ICallerResolver callers, HttpContext ctx) =>
-            LoadAssessor.Assess(host.View, host.Recent(LoadFrames), CallerUnit(callers, ctx), new LoadOptions()));
+        api.MapGet("/load", (ITrackerHost host, ICallerResolver callers, HttpContext ctx) => Load(host, CallerUnit(callers, ctx)));
 
-        api.MapGet("/sessions", (ITrackerHost host) => host.View.Sessions.Select(SessionViewDto.From).ToArray());
+        api.MapGet("/sessions", (ITrackerHost host) => Sessions(host.View));
 
         api.MapGet("/sessions/{unitId}", Results<Ok<SessionTreeDto>, NotFound> (string unitId, ITrackerHost host) =>
             SessionTree(host.View, unitId) is { } tree ? TypedResults.Ok(tree) : TypedResults.NotFound());
@@ -78,6 +77,12 @@ public static class RestEndpoints
         return new HealthDto(Version, ContractJson.AsUtc(host.StartedUtc), last, age);
     }
 
+    /// <summary>Machine pressure over the last few ticks, with the caller's own usage when <paramref name="callerUnit"/> is in the view.</summary>
+    public static LoadReport Load(ITrackerHost host, string? callerUnit) =>
+        LoadAssessor.Assess(host.View, host.Recent(LoadFrames), callerUnit, new LoadOptions());
+
+    public static SessionViewDto[] Sessions(TrackerView view) => view.Sessions.Select(SessionViewDto.From).ToArray();
+
     /// <summary>The caller's session unit, or null when the caller is not a session.</summary>
     public static string? CallerUnit(ICallerResolver callers, HttpContext ctx) =>
         callers.Resolve(ctx) is { Kind: AttributionKind.Session, UnitId: { } unit } ? unit : null;
@@ -114,31 +119,45 @@ public static class RestEndpoints
         var fromUtc = fromArg ?? (toUtc.Ticks > DefaultHistoryWindow.Ticks ? toUtc - DefaultHistoryWindow : MinUtc);
         if (fromUtc > toUtc) return TypedResults.BadRequest("from must not be after to");
 
-        // Clamp both ends into the retention window; a range entirely outside it becomes an empty instant.
-        var floor = now - retention;
-        fromUtc = Clamp(fromUtc, floor, now);
-        toUtc = Clamp(toUtc, floor, now);
-        IEnumerable<SegmentRecord> Records() => host.History(fromUtc, toUtc);
-        var view = host.View;
+        var series = unit is not null
+            ? SessionHistory(host, retention, now, unit, fromUtc, toUtc)
+            : ProcessHistory(host, retention, now, processKey, fromUtc, toUtc);
+        return series is null ? TypedResults.NotFound() : TypedResults.Ok(series);
+    }
 
-        if (unit is not null)
-        {
-            if (view.Sessions.FirstOrDefault(s => s.Info.UnitId == unit) is not { } session) return TypedResults.NotFound();
-            var points = Records()
-                .OfType<SessionRec>()
-                .Select(r => r.Value)
-                .Where(a => a.UnitId == unit)
-                .Select(a => new HistoryPointDto(
-                    ContractJson.AsUtc(a.TimestampUtc), a.CpuCores, a.PrivateBytes, a.ReadBytesDelta, a.WriteBytesDelta, a.ProcessCount))
-                .OrderBy(p => p.TimestampUtc)
-                .ToList();
-            return TypedResults.Ok(new HistorySeriesDto(unit, null, session.Info.Title, fromUtc, toUtc, points));
-        }
+    /// <summary>
+    /// A session unit's series over [<paramref name="fromUtc"/>, <paramref name="toUtc"/>] clamped into the retention
+    /// window, or null if the unit is not in the view.
+    /// </summary>
+    public static HistorySeriesDto? SessionHistory(
+        ITrackerHost host, TimeSpan retention, DateTime now, string unit, DateTime fromUtc, DateTime toUtc)
+    {
+        ClampToRetention(retention, now, ref fromUtc, ref toUtc);
+        if (host.View.Sessions.FirstOrDefault(s => s.Info.UnitId == unit) is not { } session) return null;
+        var points = host.History(fromUtc, toUtc)
+            .OfType<SessionRec>()
+            .Select(r => r.Value)
+            .Where(a => a.UnitId == unit)
+            .Select(a => new HistoryPointDto(
+                ContractJson.AsUtc(a.TimestampUtc), a.CpuCores, a.PrivateBytes, a.ReadBytesDelta, a.WriteBytesDelta, a.ProcessCount))
+            .OrderBy(p => p.TimestampUtc)
+            .ToList();
+        return new HistorySeriesDto(unit, null, session.Info.Title, fromUtc, toUtc, points);
+    }
+
+    /// <summary>
+    /// A process's series over [<paramref name="fromUtc"/>, <paramref name="toUtc"/>] clamped into the retention
+    /// window, or null if the process is neither live nor in that range of history.
+    /// </summary>
+    public static HistorySeriesDto? ProcessHistory(
+        ITrackerHost host, TimeSpan retention, DateTime now, ProcessKey processKey, DateTime fromUtc, DateTime toUtc)
+    {
+        ClampToRetention(retention, now, ref fromUtc, ref toUtc);
 
         // Process metadata comes from the live view; for an exited process, from its info record if it is in range.
-        var name = view.Processes.TryGetValue(processKey, out var live) ? live.Record.ImageName : null;
+        var name = host.View.Processes.TryGetValue(processKey, out var live) ? live.Record.ImageName : null;
         var processPoints = new List<HistoryPointDto>();
-        foreach (var r in Records())
+        foreach (var r in host.History(fromUtc, toUtc))
         {
             if (r is ProcessRec { Value: var s } && s.Key == processKey)
             {
@@ -150,9 +169,17 @@ public static class RestEndpoints
                 name ??= info.ImageName;
             }
         }
-        if (live is null && name is null && processPoints.Count == 0) return TypedResults.NotFound();
+        if (live is null && name is null && processPoints.Count == 0) return null;
         processPoints.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
-        return TypedResults.Ok(new HistorySeriesDto(null, processKey.ToString(), name, fromUtc, toUtc, processPoints));
+        return new HistorySeriesDto(null, processKey.ToString(), name, fromUtc, toUtc, processPoints);
+    }
+
+    /// <summary>Clamps both ends into [now - retention, now]; a range entirely outside it becomes an empty instant.</summary>
+    private static void ClampToRetention(TimeSpan retention, DateTime now, ref DateTime fromUtc, ref DateTime toUtc)
+    {
+        var floor = now - retention;
+        fromUtc = Clamp(fromUtc, floor, now);
+        toUtc = Clamp(toUtc, floor, now);
     }
 
     private static readonly DateTime MinUtc = new(0, DateTimeKind.Utc);

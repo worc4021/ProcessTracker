@@ -99,4 +99,18 @@ internal static partial class NativeMethods
         public int Priority, BasePriority;
         public uint ContextSwitches, ThreadState, WaitReason;
     }
+
+    public const uint AfInet = 2, TcpTableOwnerPidConnections = 4, ErrorInsufficientBuffer = 122;
+
+    /// <summary>Writes a MIB_TCPTABLE_OWNER_PID (a DWORD row count, then the rows) for the given table class.</summary>
+    [LibraryImport("iphlpapi.dll")]
+    public static unsafe partial uint GetExtendedTcpTable(
+        byte* tcpTable, ref int size, [MarshalAs(UnmanagedType.Bool)] bool order, uint af, uint tableClass, uint reserved);
+
+    /// <summary>MIB_TCPROW_OWNER_PID (24 bytes). Addresses and ports (low 16 bits) are in network byte order.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MibTcpRowOwnerPid
+    {
+        public uint State, LocalAddr, LocalPort, RemoteAddr, RemotePort, OwningPid;
+    }
 }

@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using ProcessTracker.Core.Contracts;
 using ProcessTracker.Service;
 using ProcessTracker.Service.Api;
+using ProcessTracker.Service.Mcp;
 
 // Flags: --console (run as a console app instead of a Windows service) and --dev (port 47812, dev data dir,
 // no single-instance mutex). Both are also accepted as configuration keys Console/Dev, e.g. "--Dev=true".
@@ -79,11 +80,16 @@ try
     builder.Services.AddSingleton(TimeProvider.System);
     builder.Services.AddSingleton<TrackerHost>();
     builder.Services.AddSingleton<ITrackerHost>(sp => sp.GetRequiredService<TrackerHost>());
-    builder.Services.AddSingleton<ICallerResolver, NullCallerResolver>();
+    builder.Services.AddSingleton<ICallerResolver, CallerResolver>();
+    builder.Services.AddHttpContextAccessor(); // MCP tools resolve the caller from the current request
+    builder.Services.AddMcpServer()
+        .WithHttpTransport(o => o.Stateless = true)
+        .WithTools<ProcessTrackerTools>(ContractJson.Options); // same JSON contract as REST (enums as strings)
     builder.Services.AddHostedService<CollectorWorker>();
 
     var app = builder.Build();
     app.MapRestEndpoints();
+    app.MapMcp("/mcp");
 
     // Fail fast if the server is listening anywhere but loopback, and log what it actually bound.
     var exposed = false;
