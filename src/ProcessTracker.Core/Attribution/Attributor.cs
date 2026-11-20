@@ -33,9 +33,13 @@ public sealed class Attributor
                     ? new Attr(AttributionKind.Session, parent.UnitId, sessionId, false)
                     : new Attr(AttributionKind.Session, "sid:" + sessionId, sessionId, false);
 
-            // 3. Terminal claude.exe (not the desktop app's copy).
+            // 3. Terminal claude.exe (not the desktop app's copy). Like rule 1, a claude.exe whose parent already belongs
+            // to a session (e.g. `claude mcp get` run by a session's shell) is just another process of that session,
+            // not the anchor of a new terminal session.
             if (isClaudeExe && inspect.ImagePath is not null && !isDesktopApp)
-                return new Attr(AttributionKind.Session, $"term:{proc.Key}", null, true);
+                return parent is { Kind: AttributionKind.Session }
+                    ? new Attr(AttributionKind.Session, parent.UnitId, parent.ClaudeSessionId, false)
+                    : new Attr(AttributionKind.Session, $"term:{proc.Key}", null, true);
 
             // 4. Desktop app.
             if (isDesktopApp)
