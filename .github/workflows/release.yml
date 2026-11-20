@@ -7,9 +7,12 @@ on:
         description: Release tag to build and publish (for example v0.1.0).
         required: true
         type: string
-
-permissions:
-  contents: write
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to rebuild and republish (for example v0.1.0).
+        required: true
+        type: string
 
 jobs:
   release:
@@ -33,6 +36,7 @@ jobs:
 
       - name: Resolve version
         run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "Tag '$env:TAG' must look like v<major>.<minor>.<patch>." }
           $version = (Get-Content -LiteralPath version.txt -Raw).Trim()
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "version.txt must hold X.Y.Z (got '$version')." }
           if ($env:TAG -ne "v$version") { throw "Tag '$env:TAG' does not match version.txt ($version)." }
@@ -62,13 +66,13 @@ jobs:
       # sign the already-published stage, then run only its wix build step again.
       - name: Sign binaries
         if: vars.SIGNING_ENABLED == 'true'
-        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           endpoint: ${{ secrets.SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
           files: |
             ${{ github.workspace }}\artifacts\stage\ProcessTracker.Service.exe
@@ -84,13 +88,13 @@ jobs:
 
       - name: Sign MSI
         if: vars.SIGNING_ENABLED == 'true'
-        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           endpoint: ${{ secrets.SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
           files: ${{ github.workspace }}\artifacts\ProcessTracker-${{ env.VERSION }}-x64.msi
 

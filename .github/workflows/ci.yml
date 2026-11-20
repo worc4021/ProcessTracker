@@ -54,9 +54,10 @@ jobs:
           $text = Get-Content -LiteralPath $log -Raw
           if ($text -notmatch 'total:\s*(\d+)' -or [int]$Matches[1] -eq 0) { throw 'No DataFolderSetupTests ran.' }
           $skipped = @([regex]::Matches($text, '(?m)^(?:\x1b\[[0-9;]*m)*skipped\s+(\S+)') | ForEach-Object { $_.Groups[1].Value })
-          $unexpected = @($skipped | Where-Object { $_ -notlike '*.Prepare_NotElevated' })
-          if ($unexpected.Count -gt 0) { throw "Elevated-only tests were skipped (runner not elevated?): $($unexpected -join ', ')" }
-          if ($skipped.Count -ne 1) { throw "Expected exactly Prepare_NotElevated to be skipped, saw $($skipped.Count) skipped." }
+          $expected = 'ProcessTracker.Cli.Tests.Admin.DataFolderSetupTests.Prepare_NotElevated_RefusesAndChangesNothing'
+          if ($skipped.Count -ne 1 -or $skipped[0] -ne $expected) {
+            throw "Expected only $expected to be skipped (runner not elevated?), saw $($skipped.Count): $($skipped -join ', ')"
+          }
       - name: Upload smoke logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
