@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using ProcessTracker.Core.Model;
 using ProcessTracker.Core.Orphans;
@@ -43,6 +44,15 @@ public sealed class TrackerTests : IDisposable
     }
 
     private void Step(TimeSpan? by = null) => _src.Advance(by ?? TickInterval);
+
+    private void ExecRaw(string sql)
+    {
+        using var c = new SqliteConnection($"Data Source={Path.Combine(_dir, "state.db")};Pooling=False");
+        c.Open();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
 
     [Fact]
     public void Tick_NewSessionProcess_AppearsWithAttribution()
@@ -333,5 +343,65 @@ public sealed class TrackerTests : IDisposable
         _time.Advance(TimeSpan.FromMinutes(31));
         t.Tick();
         Assert.DoesNotContain(t.State.Load().Processes, r => r.Key == p);
+    }
+
+    [Fact]
+    public void Tick_ParentPidReusedByNewerProcess_NotTreatedAsParent()
+    {
+        // The child's real parent (pid 10) died and pid 10 now belongs to a process created after the child.
+        var child = _src.Add(11, 200, 10, "MATLAB.exe");
+        var impostor = AddAnchor(pid: 10, create: 300);
+
+        var v = NewTracker().Tick();
+
+        var c = v.Processes[child];
+        Assert.Null(c.Record.Parent);
+        Assert.Equal(Attr.Unattributed, c.Record.Attribution);
+        Assert.True(v.Processes.ContainsKey(impostor));
+    }
+
+    [Fact]
+    public void Tick_InspectorThrows_TickStillPublishes_ProcessRecordedOnce()
+    {
+        var bad = _src.Add(95, 50, 1, "bad.exe");
+        _insp.Throw(bad);
+        var claude = AddAnchor();
+        var t = NewTracker();
+
+        var v = t.Tick();
+
+        Assert.Same(v, t.View);
+        Assert.Equal("host:h1", v.Processes[claude].Record.Attribution.UnitId);
+        Assert.Equal(Attr.Unattributed, v.Processes[bad].Record.Attribution);
+        Step();
+        Assert.True(t.Tick().Processes.ContainsKey(bad));
+        Assert.Equal(1, _insp.Calls(bad));
+    }
+
+    [Fact]
+    public void Tick_SaveFailsOnce_NextTickPersistsEarlierUpserts()
+    {
+        var a = _src.Add(90, 1000, 1, "a.exe");
+        var b = _src.Add(91, 1001, 1, "b.exe");
+        var t = NewTracker();
+        t.Tick();
+
+        // Make SaveTick fail for one tick, in which b exits and c appears.
+        ExecRaw("ALTER TABLE processes RENAME TO processes_hidden");
+        _src.Remove(b);
+        var c = _src.Add(92, 1002, 1, "c.exe");
+        Step();
+        var v2 = t.Tick();
+        Assert.Same(v2, t.View);
+        Assert.Equal(T0 + TickInterval, v2.TimestampUtc);
+        ExecRaw("ALTER TABLE processes_hidden RENAME TO processes");
+
+        Step();
+        t.Tick();
+
+        var records = t.State.Load().Processes;
+        Assert.Equal(T0 + TickInterval, records.Single(r => r.Key == b).ExitedUtc);
+        Assert.Equal(T0 + TickInterval, records.Single(r => r.Key == c).FirstSeenUtc);
+        Assert.Null(records.Single(r => r.Key == a).ExitedUtc);
     }
 }

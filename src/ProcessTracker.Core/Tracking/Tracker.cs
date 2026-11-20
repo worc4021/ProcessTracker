@@ -1,5 +1,4 @@
 using System.Collections.Frozen;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using ProcessTracker.Core.Activity;
 using ProcessTracker.Core.Attribution;
@@ -54,6 +53,7 @@ public sealed class Tracker : IDisposable
 
     private readonly Dictionary<ProcessKey, LiveProcess> _live = new();
     private readonly Dictionary<string, SessionInfo> _savedSessions = new();
+    private readonly Dictionary<ProcessKey, ProcessRecord> _unsavedRecords = new();
     private readonly Queue<(string Unit, string Id)> _transcriptQueue = new();
     private readonly HashSet<(string Unit, string Id)> _transcriptQueued = new();
     private readonly Dictionary<string, (string Id, DateTime At)> _transcriptRead = new();
@@ -260,7 +260,14 @@ public sealed class Tracker : IDisposable
             : null;
 
         // AccessDenied/Unsupported are recorded like any other result and, being recorded, never inspected again.
-        var inspect = _inspector.Inspect(p.Key);
+        // An inspector that throws is treated as Unsupported, so one bad process cannot stall every later tick.
+        InspectResult inspect;
+        try { inspect = _inspector.Inspect(p.Key); }
+        catch (Exception e) when (IsNonFatal(e))
+        {
+            _log.LogWarning(e, "Inspecting process {Key} ({Image}) failed; recording it as unsupported", p.Key, p.ImageName);
+            inspect = new InspectResult(InspectStatus.Unsupported, null, null, null, null, null);
+        }
         if (inspect.Status == InspectStatus.Gone) return null;
 
         Attr? parentAttribution = parent is { } k && _live.TryGetValue(k, out var lp) ? lp.Record.Attribution : null;
@@ -269,7 +276,8 @@ public sealed class Tracker : IDisposable
 
         _live[p.Key] = new LiveProcess(rec);
         _sessions.Observe(rec);
-        if (attribution is { Kind: AttributionKind.Session, UnitId: { } unit, ClaudeSessionId: { } id }
+        if (_transcripts is not null
+            && attribution is { Kind: AttributionKind.Session, UnitId: { } unit, ClaudeSessionId: { } id }
             && _transcriptQueued.Add((unit, id)))
             _transcriptQueue.Enqueue((unit, id));
         return rec;
@@ -321,7 +329,10 @@ public sealed class Tracker : IDisposable
         return views.OrderByDescending(v => v.Info.FirstSeenUtc).ThenBy(v => v.Info.UnitId, StringComparer.Ordinal).ToArray();
     }
 
-    /// <summary>Saves new and exited records, all live counters, and only the sessions that changed.</summary>
+    /// <summary>
+    /// Saves new and exited records, all live counters, and only the sessions that changed. Records from a failed
+    /// save are kept (last write per key wins) and retried with the next tick.
+    /// </summary>
     private void Persist(
         DateTime now, List<ProcessRecord> upserts, List<(ProcessKey, ActivityState, RawProcessCounters)> liveRows,
         IReadOnlyList<SessionInfo> sessions)
@@ -329,14 +340,16 @@ public sealed class Tracker : IDisposable
         var changed = sessions
             .Where(s => !_savedSessions.TryGetValue(s.UnitId, out var saved) || !saved.Equals(s))
             .ToList();
+        foreach (var r in upserts) _unsavedRecords[r.Key] = r;
         try
         {
-            State.SaveTick(now, upserts, liveRows, changed);
+            State.SaveTick(now, _unsavedRecords.Values.ToList(), liveRows, changed);
+            _unsavedRecords.Clear();
             foreach (var s in changed) _savedSessions[s.UnitId] = s;
             if (_persistFailing) _log.LogInformation("State database writes recovered");
             _persistFailing = false;
         }
-        catch (SqliteException e)
+        catch (Exception e) when (IsNonFatal(e))
         {
             if (!_persistFailing) _log.LogError(e, "Saving tracker state failed; retrying every tick");
             _persistFailing = true;
@@ -351,8 +364,10 @@ public sealed class Tracker : IDisposable
 
         _writer.EnforceRetention(wall);
         try { State.PruneExitedBefore(wall - _retention); }
-        catch (SqliteException e) { _log.LogError(e, "Pruning exited process records failed"); }
+        catch (Exception e) when (IsNonFatal(e)) { _log.LogError(e, "Pruning exited process records failed"); }
     }
+
+    private static bool IsNonFatal(Exception e) => e is not (OutOfMemoryException or AccessViolationException);
 
     public void Dispose()
     {
