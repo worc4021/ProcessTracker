@@ -43,7 +43,7 @@ public sealed class TrackerHost : ITrackerHost, IDisposable
             Retention = options.Retention,
             OrphanIdleAlert = options.OrphanIdleAlert,
             UserProfilePath = options.UserProfilePath,
-        }, log, time);
+        }, log, time, new ProfileResolver());
         _historyDir = Path.Combine(options.DataDir, "history");
         StartedUtc = time.GetUtcNow().UtcDateTime;
     }

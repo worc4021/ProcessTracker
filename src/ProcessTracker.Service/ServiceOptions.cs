@@ -22,7 +22,7 @@ public sealed class ServiceOptions
     /// <summary>Data folder; empty means %ProgramData%\ProcessTracker (or %LOCALAPPDATA%\ProcessTracker-dev with --dev).</summary>
     public string DataDir { get; set; } = "";
 
-    /// <summary>Profile whose .claude\projects transcripts are read; empty means the current user's profile.</summary>
+    /// <summary>Profile whose .claude\projects transcripts are read; empty means each session's profile is that of its anchor's owner.</summary>
     public string UserProfilePath { get; set; } = "";
 
     /// <summary>History retention in hours; values below 2 are raised to 2.</summary>
@@ -65,8 +65,6 @@ public sealed class ServiceOptions
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessTracker-dev")
                 : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ProcessTracker");
         }
-        if (string.IsNullOrWhiteSpace(o.UserProfilePath))
-            o.UserProfilePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         return o;
     }
 }
