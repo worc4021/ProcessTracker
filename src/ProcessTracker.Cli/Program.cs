@@ -16,6 +16,7 @@ public static class Program
             TreeCommand.Create(),
             HistoryCommand.Create(),
             KillCommand.Create(),
+            AdminCommand.Create(),
         };
         return root.Parse(args).InvokeAsync();
     }
