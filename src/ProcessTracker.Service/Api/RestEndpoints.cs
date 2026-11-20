@@ -44,8 +44,8 @@ public static class RestEndpoints
 
         api.MapGet("/orphans", (ITrackerHost host) => Orphans(host.View));
 
-        api.MapGet("/overview", (ITrackerHost host, OverviewCache cache) =>
-            Results.Bytes(cache.GetJson(host), "application/json; charset=utf-8"));
+        api.MapGet("/overview", (ITrackerHost host, OverviewCache cache, string? expand) =>
+            Results.Bytes(cache.GetJson(host, expand), "application/json; charset=utf-8"));
 
         api.MapGet("/processes/by-pid/{pid:int}", (int pid, ITrackerHost host) =>
             host.View.Processes.Values.Where(p => p.Record.Key.Pid == pid).Select(ProcessViewDto.From).ToArray());
@@ -93,16 +93,64 @@ public static class RestEndpoints
 
     public static SessionViewDto[] Sessions(TrackerView view) => view.Sessions.Select(SessionViewDto.From).ToArray();
 
-    /// <summary>One consistent snapshot for the dashboard: load, every session with its tree, and the orphans, all from one view.</summary>
-    public static OverviewDto Overview(ITrackerHost host) => Overview(host, host.View);
+    private const int MaxExpandIds = 128;
+    private const int MaxExpandChars = 8192;
+
+    /// <summary>
+    /// The session ids of a comma-separated <c>expand</c> parameter that exist in <paramref name="view"/>, de-duplicated and
+    /// sorted. Unknown ids are ignored; the list is capped at 128 ids and 8 KB so a request cannot ask for unbounded work.
+    /// </summary>
+    public static string[] ParseExpand(string? expand, TrackerView view)
+    {
+        if (string.IsNullOrWhiteSpace(expand)) return [];
+        if (expand.Length > MaxExpandChars) expand = expand[..MaxExpandChars];
+        var known = view.Sessions.Select(s => s.Info.UnitId).ToHashSet(StringComparer.Ordinal);
+        return expand.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Take(MaxExpandIds)
+            .Where(known.Contains)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// One consistent snapshot for the dashboard from a single view: load, a summary of every session, the process rows of
+    /// the <paramref name="expanded"/> sessions only, and the orphans.
+    /// </summary>
+    public static OverviewDto Overview(ITrackerHost host, string? expand = null) =>
+        Overview(host, host.View, ParseExpand(expand, host.View));
 
     /// <summary>The overview of <paramref name="view"/> (which must be <c>host.View</c> as read by the caller).</summary>
-    public static OverviewDto Overview(ITrackerHost host, TrackerView view)
+    public static OverviewDto Overview(ITrackerHost host, TrackerView view, IReadOnlyCollection<string> expanded)
     {
         var load = LoadAssessor.Assess(view, host.Recent(LoadFrames), null, new LoadOptions());
-        var processes = view.Processes.Values.ToList();
-        var sessions = view.Sessions.Select(s => SessionTreeDto.Build(s, processes)).ToArray();
-        return new OverviewDto(load, sessions, Orphans(view), ContractJson.AsUtc(view.TimestampUtc),
+        var lastActive = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        foreach (var p in view.Processes.Values)
+        {
+            if (p.Record.Attribution.UnitId is { } unit && p.EffectiveLastActive is { } t
+                && (!lastActive.TryGetValue(unit, out var cur) || t > cur))
+                lastActive[unit] = t;
+        }
+        var sessions = view.Sessions
+            .Select(s => new OverviewSessionDto(SessionViewDto.From(s),
+                lastActive.TryGetValue(s.Info.UnitId, out var t) ? ContractJson.AsUtc(t) : null))
+            .ToArray();
+        var rows = expanded.Count == 0
+            ? []
+            : view.Processes.Values
+                .Where(p => p.Record.Attribution.UnitId is { } u && expanded.Contains(u))
+                .OrderBy(p => p.Record.Key.CreateTimeTicks)
+                .ThenBy(p => p.Record.Key.Pid)
+                .Select(OverviewProcessDto.From)
+                .ToArray();
+        var orphans = view.Processes.Values
+            .Where(p => p.State == ProcessState.Orphan)
+            .OrderByDescending(p => p.Alertable)
+            .ThenByDescending(p => p.Latest.PrivateBytes)
+            .ThenBy(p => p.Record.Key.Pid)
+            .Select(OverviewProcessDto.From)
+            .ToArray();
+        return new OverviewDto(load, sessions, rows, orphans, ContractJson.AsUtc(view.TimestampUtc),
             CollectorWorker.Interval.TotalSeconds);
     }
 

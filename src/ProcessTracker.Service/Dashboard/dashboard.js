@@ -58,6 +58,7 @@
 
   var snap = null;        // last good overview
   var snapAt = 0;         // local time it arrived
+  var snapExpand = '';    // the expand list that snapshot was requested with
   var fetchFailed = false;
 
   // Seconds idle relative to the snapshot's own time, so the display does not drift between polls.
@@ -67,28 +68,30 @@
   }
 
   // ---- view models ----
-  function procNode(n, nowMs) {
-    var p = n.process;
+  function procNode(p, nowMs) {
     return {
       kind: 'proc', id: p.key, name: p.imageName, pid: p.pid,
       cpu: p.cpuCores, priv: p.privateBytes, ws: p.workingSet,
       read: p.readBytesDelta, write: p.writeBytesDelta,
-      idle: idleOf(p.effectiveLastActiveUtc || p.lastActiveUtc, nowMs),
-      state: p.state, alertable: p.alertable, procs: 1,
-      children: n.children.map(function (c) { return procNode(c, nowMs); })
+      idle: idleOf(p.effectiveLastActiveUtc, nowMs),
+      state: p.state, alertable: p.alertable, procs: 1, children: []
     };
   }
-  function sessionNode(t, nowMs) {
-    var s = t.session;
-    var kids = t.processes.map(function (n) { return procNode(n, nowMs); });
-    var idle = null;
-    (function walk(list) {
-      list.forEach(function (k) {
-        if (k.idle != null && (idle == null || k.idle < idle)) idle = k.idle;
-        walk(k.children);
-      });
-    })(kids);
-    if (idle == null) idle = idleOf(s.lastTranscriptWriteUtc, nowMs);
+  // The service sends process rows flat (parentKey); a row whose parent is not among the same session's rows is a root.
+  function buildForest(rows, nowMs) {
+    var nodes = {};
+    rows.forEach(function (p) { nodes[p.key] = procNode(p, nowMs); });
+    var roots = [];
+    rows.forEach(function (p) {
+      var parent = p.parentKey != null ? nodes[p.parentKey] : null;
+      if (parent && parent !== nodes[p.key]) parent.children.push(nodes[p.key]); else roots.push(nodes[p.key]);
+    });
+    return roots;
+  }
+  function sessionNode(o, rowsByUnit, nowMs) {
+    var s = o.session;
+    var kids = buildForest(rowsByUnit[s.unitId] || [], nowMs);
+    var idle = o.lastActiveUtc ? idleOf(o.lastActiveUtc, nowMs) : idleOf(s.lastTranscriptWriteUtc, nowMs);
     return {
       kind: 'session', id: s.unitId, name: s.title || s.unitId, pid: null, unit: s.unitId,
       cpu: s.cpuCores, priv: s.privateBytes, ws: null, read: null, write: null,
@@ -191,7 +194,8 @@
     var row = el('div', 'row ' + n.kind);
     var name = el('div', 'name');
     name.style.setProperty('--depth', String(depth));
-    var hasKids = n.children.length > 0;
+    // A collapsed session's rows are not fetched, so it is expandable by its process count, not by loaded rows.
+    var hasKids = n.kind === 'session' ? n.procs > 0 : n.children.length > 0;
     var tw = el('button', 'tw' + (hasKids ? '' : ' leaf'), isOpen(n, q) ? '▼' : '▶');
     tw.type = 'button';
     tw.setAttribute('aria-label', 'expand or collapse');
@@ -201,6 +205,7 @@
         else ui.collapsed[n.id] = !(ui.collapsed[n.id] === true);
         saveUi();
         renderSessions();
+        if (n.kind === 'session') refreshSoon(); // fetch (or drop) this session's rows now
       });
     }
     name.appendChild(tw);
@@ -224,13 +229,19 @@
     }
   }
   // Forget expand/collapse state of sessions and processes that are no longer in the snapshot.
+  // Rows of collapsed sessions are not loaded, so process ids cannot be checked against the snapshot: sessions are
+  // pruned exactly, collapsed processes are capped (oldest entries go first).
+  var MAX_COLLAPSED = 500;
   function pruneState(sessions) {
     var ids = {};
-    (function walk(list) { list.forEach(function (n) { ids[n.id] = true; walk(n.children); }); })(sessions);
+    sessions.forEach(function (n) { ids[n.id] = true; });
     var changed = false;
-    ['expanded', 'collapsed'].forEach(function (k) {
-      Object.keys(ui[k]).forEach(function (id) { if (!ids[id]) { delete ui[k][id]; changed = true; } });
-    });
+    Object.keys(ui.expanded).forEach(function (id) { if (!ids[id]) { delete ui.expanded[id]; changed = true; } });
+    var keys = Object.keys(ui.collapsed);
+    if (keys.length > MAX_COLLAPSED) {
+      keys.slice(0, keys.length - MAX_COLLAPSED).forEach(function (id) { delete ui.collapsed[id]; });
+      changed = true;
+    }
     if (changed) saveUi();
   }
   function renderSessions() {
@@ -239,7 +250,9 @@
     if (!snap) { pane.appendChild(el('div', 'empty', 'Loading…')); return; }
     var nowMs = parseMs(snap.timestampUtc) || Date.now();
     var q = ui.filter.trim().toLowerCase();
-    var sessions = snap.sessions.map(function (t) { return sessionNode(t, nowMs); });
+    var rowsByUnit = {};
+    snap.processes.forEach(function (p) { (rowsByUnit[p.unitId] = rowsByUnit[p.unitId] || []).push(p); });
+    var sessions = snap.sessions.map(function (o) { return sessionNode(o, rowsByUnit, nowMs); });
     pruneState(sessions);
     if (q) sessions = sessions.map(function (s) { return pruneTree(s, q, false); }).filter(Boolean);
     // live first, then by memory (the column sort applies within each session's tree)
@@ -289,13 +302,13 @@
     });
     if (q) list = list.filter(function (p) {
       return p.imageName.toLowerCase().indexOf(q) >= 0 || String(p.pid).indexOf(q) >= 0
-        || (p.attribution.unitId || '').toLowerCase().indexOf(q) >= 0;
+        || (p.unitId || '').toLowerCase().indexOf(q) >= 0;
     });
     $('orphan-count').textContent = snap ? '(' + snap.orphans.length + ')' : '';
     if (!snap) { pane.appendChild(el('div', 'empty', 'Loading…')); return; }
     if (list.length === 0) { pane.appendChild(el('div', 'empty', q ? 'No match.' : 'No orphans.')); return; }
     var titles = {};
-    snap.sessions.forEach(function (t) { titles[t.session.unitId] = t.session.title || t.session.unitId; });
+    snap.sessions.forEach(function (o) { titles[o.session.unitId] = o.session.title || o.session.unitId; });
     var nowMs = parseMs(snap.timestampUtc) || Date.now();
     var wrap = el('div', 'scroll');
     var table = el('table');
@@ -311,10 +324,10 @@
       var tr = el('tr');
       tr.appendChild(el('td', p.alertable ? 'alert' : 's-Orphan', p.imageName + (p.alertable ? '  (alertable)' : '')));
       tr.appendChild(el('td', 'num mono', p.pid));
-      var u = p.attribution.unitId;
+      var u = p.unitId;
       tr.appendChild(el('td', '', u ? (titles[u] || u) : '—'));
       tr.appendChild(el('td', 'num', gb(p.privateBytes)));
-      tr.appendChild(el('td', 'num', idleText(idleOf(p.effectiveLastActiveUtc || p.lastActiveUtc, nowMs))));
+      tr.appendChild(el('td', 'num', idleText(idleOf(p.effectiveLastActiveUtc, nowMs))));
       var td = el('td');
       var btn = el('button', 'copy', 'copy kill command');
       btn.type = 'button';
@@ -397,26 +410,47 @@
     if (timer) clearTimeout(timer);
     timer = setTimeout(poll, ms);
   }
+  var MAX_EXPAND = 100; // keeps the request line well under Kestrel's 8 KB limit
+  var pendingRefresh = false;
+  // The sessions whose process rows the page needs: the expanded ones, or every session with processes while a
+  // filter is active (the filter searches process names and PIDs, which collapsed sessions do not load).
+  function wantedExpand() {
+    var ids;
+    if (ui.filter.trim() && snap) {
+      ids = snap.sessions.filter(function (o) { return o.session.processCount > 0; })
+        .sort(function (a, b) { return b.session.privateBytes - a.session.privateBytes; })
+        .map(function (o) { return o.session.unitId; });
+    } else {
+      ids = Object.keys(ui.expanded).filter(function (id) { return ui.expanded[id] === true; });
+    }
+    return ids.slice(0, MAX_EXPAND).sort();
+  }
+  // Fetch now (after an expand/collapse or filter change) instead of waiting for the next 2 s poll.
+  function refreshSoon() {
+    if (inFlight) pendingRefresh = true; else poll();
+  }
   function poll() {
     if (timer) { clearTimeout(timer); timer = null; } // never two timer chains
     if (document.visibilityState === 'hidden') return; // resumed by visibilitychange
     if (inFlight) { schedule(POLL_MS); return; }
     inFlight = true;
+    var expand = wantedExpand().join(',');
+    var url = '/api/overview' + (expand ? '?expand=' + encodeURIComponent(expand) : '');
     var ctl = typeof AbortController === 'function' ? new AbortController() : null;
     var abort = ctl ? setTimeout(function () { ctl.abort(); }, 8000) : null;
-    fetch('/api/overview', { cache: 'no-store', credentials: 'same-origin', signal: ctl ? ctl.signal : undefined })
+    fetch(url, { cache: 'no-store', credentials: 'same-origin', signal: ctl ? ctl.signal : undefined })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (o) {
-        var same = snap && snap.timestampUtc === o.timestampUtc;
-        snap = o; snapAt = Date.now(); fetchFailed = false;
+        var same = snap && snap.timestampUtc === o.timestampUtc && snapExpand === expand;
+        snap = o; snapExpand = expand; snapAt = Date.now(); fetchFailed = false;
         return !same;
       })
       .catch(function () { fetchFailed = true; return false; })
       .then(function (changed) {
         if (abort) clearTimeout(abort);
         inFlight = false;
-        if (changed) render(); else renderHeader(); // same tick: nothing to repaint
-        schedule(POLL_MS);
+        if (changed) render(); else renderHeader(); // same tick and rows: nothing to repaint
+        if (pendingRefresh) { pendingRefresh = false; poll(); } else schedule(POLL_MS);
       });
   }
 
@@ -431,6 +465,7 @@
       saveUi();
       renderSessions();
       renderOrphans();
+      if (wantedExpand().join(',') !== snapExpand) refreshSoon(); // the filter changed which rows are needed
     });
     document.addEventListener('visibilitychange', function () {
       if (document.visibilityState === 'visible') { if (!inFlight) poll(); }

@@ -167,29 +167,114 @@ public sealed class DashboardTests : IDisposable
         Assert.Contains("2026-11-20T12:00:02", third);
     }
 
-    [Fact]
-    public async Task Overview_HasLoadSessionTreesAndOrphansFromOneView()
-    {
-        _app.Tracker.View = new TrackerView(T0, default,
-            new[]
-            {
-                Proc(10, "claude.exe", UnitA),
-                Proc(11, "node.exe", UnitA, parentPid: 10),
-                Proc(12, "Dymola.exe", UnitA, state: ProcessState.Orphan),
-                Proc(20, "claude.exe", "host:local_b"),
-            }.ToFrozenDictionary(p => p.Record.Key),
-            [Session(UnitA), Session("host:local_b")]);
+    private const string UnitB = "host:local_b";
+    private const int CacheLimit = Service.Api.OverviewCache.MaxEntries;
 
-        var o = await _http.GetFromJsonAsync<OverviewDto>("/api/overview", ContractJson.Options, TestContext.Current.CancellationToken);
+    private void SetView(DateTime ts, params ProcessView[] procs) =>
+        _app.Tracker.View = new TrackerView(ts, default, procs.ToFrozenDictionary(p => p.Record.Key), [Session(UnitA), Session(UnitB)]);
+
+    private Task<OverviewDto?> Overview(string query = "") =>
+        _http.GetFromJsonAsync<OverviewDto>("/api/overview" + query, ContractJson.Options, TestContext.Current.CancellationToken);
+
+    private static string Expand(params string[] ids) => "?expand=" + Uri.EscapeDataString(string.Join(',', ids));
+
+    [Fact]
+    public async Task Overview_HasLoadSessionSummariesFlatRowsForExpandedOnlyAndOrphans()
+    {
+        SetView(T0,
+            Proc(10, "claude.exe", UnitA),
+            Proc(11, "node.exe", UnitA, parentPid: 10),
+            Proc(12, "Dymola.exe", UnitA, state: ProcessState.Orphan),
+            Proc(20, "claude.exe", UnitB));
+
+        var o = await Overview(Expand(UnitA));
 
         Assert.NotNull(o);
         Assert.Equal(T0, o.TimestampUtc);
         Assert.Equal(CollectorWorker.Interval.TotalSeconds, o.SampleIntervalSeconds);
         Assert.NotNull(o.Load);
-        Assert.Equal(2, o.Sessions.Count);
-        var a = o.Sessions.Single(s => s.Session.UnitId == UnitA);
-        Assert.Equal([Key(10).ToString(), Key(12).ToString()], a.Processes.Select(p => p.Process.Key));
-        Assert.Equal(Key(11).ToString(), Assert.Single(a.Processes[0].Children).Process.Key);
+        Assert.Equal([UnitA, UnitB], o.Sessions.Select(s => s.Session.UnitId).Order()); // every session has a summary
+        // flat rows of the expanded session only, with parent keys; the page builds the tree
+        Assert.Equal([Key(10).ToString(), Key(11).ToString(), Key(12).ToString()], o.Processes.Select(p => p.Key));
+        Assert.All(o.Processes, p => Assert.Equal(UnitA, p.UnitId));
+        Assert.Equal(Key(10).ToString(), o.Processes.Single(p => p.Pid == 11).ParentKey);
+        Assert.Null(o.Processes.Single(p => p.Pid == 10).ParentKey);
         Assert.Equal(Key(12).ToString(), Assert.Single(o.Orphans).Key);
+    }
+
+    [Fact]
+    public async Task Overview_WithoutExpand_HasNoProcessRowsButStillOrphans()
+    {
+        SetView(T0, Proc(10, "claude.exe", UnitA), Proc(12, "Dymola.exe", UnitA, state: ProcessState.Orphan));
+
+        var o = await Overview();
+
+        Assert.NotNull(o);
+        Assert.Empty(o.Processes);
+        Assert.Single(o.Orphans);
+        Assert.Equal(2, o.Sessions.Count);
+    }
+
+    [Fact]
+    public async Task Overview_UnknownAndDuplicateExpandIdsAreIgnored()
+    {
+        SetView(T0, Proc(10, "claude.exe", UnitA), Proc(20, "claude.exe", UnitB));
+
+        var o = await Overview(Expand("nope", UnitB, "", UnitB, " x "));
+
+        Assert.NotNull(o);
+        Assert.Equal(Key(20).ToString(), Assert.Single(o.Processes).Key);
+    }
+
+    [Fact]
+    public void ParseExpand_NormalizesCapsAndFiltersToKnownSessions()
+    {
+        var view = new TrackerView(T0, default, FrozenDictionary<ProcessKey, ProcessView>.Empty, [Session(UnitA), Session(UnitB)]);
+
+        Assert.Empty(Service.Api.RestEndpoints.ParseExpand(null, view));
+        Assert.Empty(Service.Api.RestEndpoints.ParseExpand("  ", view));
+        Assert.Equal([UnitA, UnitB], Service.Api.RestEndpoints.ParseExpand($" {UnitB} , {UnitA},{UnitB},zzz", view));
+        // ids beyond the 8 KB prefix are never read
+        Assert.Equal([UnitA], Service.Api.RestEndpoints.ParseExpand(UnitA + "," + new string('x', 9000) + "," + UnitB, view));
+    }
+
+    [Fact]
+    public async Task Overview_CachePerExpandSet_IsConsistentAndBounded()
+    {
+        SetView(T0, Proc(10, "claude.exe", UnitA), Proc(20, "claude.exe", UnitB));
+        var ct = TestContext.Current.CancellationToken;
+
+        var a1 = await _http.GetStringAsync("/api/overview" + Expand(UnitA), ct);
+        var b = await _http.GetStringAsync("/api/overview" + Expand(UnitB), ct);
+        var a2 = await _http.GetStringAsync("/api/overview" + Expand(UnitA), ct);
+        for (var i = 0; i < CacheLimit + 2; i++) // churn through the bound: results must stay correct
+            await _http.GetStringAsync("/api/overview" + Expand(i % 2 == 0 ? UnitA : UnitB, "u" + i), ct);
+        var a3 = await _http.GetStringAsync("/api/overview" + Expand(UnitA), ct);
+
+        Assert.Equal(a1, a2);
+        Assert.Equal(a1, a3);
+        Assert.NotEqual(a1, b);
+    }
+
+    [Fact]
+    public async Task DeepProcessChain_BeyondDefaultJsonDepth_StillSerializes()
+    {
+        var chain = new List<ProcessView> { Proc(1, "root.exe", UnitA) };
+        for (var pid = 2; pid <= 120; pid++) chain.Add(Proc(pid, "child.exe", UnitA, parentPid: pid - 1));
+        SetView(T0, [.. chain]);
+
+        var o = await Overview(Expand(UnitA));
+        var tree = await _http.GetFromJsonAsync<SessionTreeDto>($"/api/sessions/{UnitA}", ContractJson.Options, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(o);
+        Assert.Equal(120, o.Processes.Count);
+        Assert.NotNull(tree);
+        var depth = 0;
+        for (var n = tree.Processes.Single(); ; n = n.Children.Single())
+        {
+            depth++;
+            if (n.Children.Count == 0) break;
+        }
+        Assert.Equal(120, depth);
     }
 }
