@@ -106,6 +106,42 @@ public class ActivityTrackerTests
     }
 
     [Fact]
+    public void EffectiveLastActiveAll_MatchesPerProcessRollUp()
+    {
+        var tracker = new ActivityTracker(new ActivityOptions());
+        var root = Key(1); var a = Key(2); var a1 = Key(3); var a2 = Key(4); var b = Key(5); var lone = Key(6);
+        var table = new ProcessTable();
+        table.SetLive([(a1, a), (root, null), (a, root), (a2, a), (b, root), (lone, Key(99))]);
+        tracker.Update(Sample(root, T, cpu: 1f), "x.exe");
+        tracker.Update(Sample(a1, T.AddSeconds(3), cpu: 1f), "x.exe");
+        tracker.Update(Sample(b, T.AddSeconds(7), cpu: 1f), "x.exe");
+
+        var all = tracker.EffectiveLastActiveAll(table);
+
+        Assert.Equal(6, all.Count);
+        foreach (var k in new[] { root, a, a1, a2, b, lone })
+            Assert.Equal(tracker.EffectiveLastActive(k, table), all[k]);
+        Assert.Equal(T.AddSeconds(7), all[root]);
+        Assert.Equal(T.AddSeconds(3), all[a]);
+        Assert.Null(all[a2]);
+    }
+
+    [Fact]
+    public void EffectiveLastActiveAll_TerminatesOnParentCycle()
+    {
+        var tracker = new ActivityTracker(new ActivityOptions());
+        var a = Key(1); var b = Key(2);
+        var table = new ProcessTable();
+        table.SetLive([(a, b), (b, a)]);
+        tracker.Update(Sample(b, T, cpu: 1f), "x.exe");
+
+        var all = tracker.EffectiveLastActiveAll(table);
+
+        Assert.Equal(2, all.Count);
+        Assert.Equal(T, all[b]);
+    }
+
+    [Fact]
     public void Descendants_SurvivesParentCycle()
     {
         var a = Key(1); var b = Key(2);

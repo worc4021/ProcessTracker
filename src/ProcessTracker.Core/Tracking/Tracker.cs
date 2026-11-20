@@ -181,7 +181,8 @@ public sealed class Tracker : IDisposable
         }
 
         // Samples and activity.
-        var samples = new List<ProcessSample>(_live.Count);
+        var samples = new ProcessSample[_live.Count];
+        var n = 0;
         foreach (var (key, lp) in _live)
         {
             var raw = current[key];
@@ -189,7 +190,7 @@ public sealed class Tracker : IDisposable
             _activity.Update(s, raw.ImageName);
             lp.Prev = raw;
             lp.PrevTs = now;
-            samples.Add(s);
+            samples[n++] = s;
         }
         _table.SetLive(_live.Select(kv => (kv.Key, kv.Value.Record.Parent)));
 
@@ -199,13 +200,14 @@ public sealed class Tracker : IDisposable
         ReadTranscripts(now);
 
         // Classification and per-session totals.
-        var processViews = new Dictionary<ProcessKey, ProcessView>(samples.Count);
+        var effectiveAll = _activity.EffectiveLastActiveAll(_table);
+        var processViews = new Dictionary<ProcessKey, ProcessView>(samples.Length);
         var totals = new Dictionary<string, SessionAggregate>();
         foreach (var s in samples)
         {
             var rec = _live[s.Key].Record;
             var state = OrphanClassifier.Classify(rec, _sessions, _table);
-            var effective = _activity.EffectiveLastActive(s.Key, _table);
+            var effective = effectiveAll[s.Key];
             var alertable = OrphanClassifier.IsAlertable(rec, state, effective, now, _options.OrphanIdleAlert);
             processViews[s.Key] = new ProcessView(rec, s, _activity.Get(s.Key), effective, state, alertable);
 
@@ -226,7 +228,7 @@ public sealed class Tracker : IDisposable
         var allSessions = _sessions.All();
         var sessionViews = BuildSessionViews(allSessions, totals, now);
 
-        var frame = new TickFrame(now, system, samples.ToArray(), totals.Values.ToArray());
+        var frame = new TickFrame(now, system, samples, totals.Values.ToArray());
         Ring.Add(frame);
         _writer.Enqueue(frame, newRecords);
         Persist(now, upserts, allSessions, forceLive: false);

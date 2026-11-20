@@ -37,4 +37,41 @@ public sealed class ActivityTracker(ActivityOptions options)
             best = ActivityState.Max(best, Get(d).LastActiveAt);
         return best;
     }
+
+    /// <summary>
+    /// <see cref="EffectiveLastActive"/> for every live process in one post-order pass over the tree (each process is
+    /// visited once). Terminates on a parent cycle, which cannot occur in practice since a parent is never created
+    /// after its child.
+    /// </summary>
+    public Dictionary<ProcessKey, DateTime?> EffectiveLastActiveAll(ProcessTable t)
+    {
+        var result = new Dictionary<ProcessKey, DateTime?>(t.Live.Count);
+        var onPath = new HashSet<ProcessKey>();
+        var stack = new Stack<(ProcessKey Key, bool ChildrenDone)>();
+        foreach (var root in t.Live)
+        {
+            if (result.ContainsKey(root)) continue;
+            stack.Push((root, false));
+            while (stack.Count > 0)
+            {
+                var (k, childrenDone) = stack.Pop();
+                if (!childrenDone)
+                {
+                    if (result.ContainsKey(k) || !onPath.Add(k)) continue;
+                    stack.Push((k, true));
+                    var children = t.Children(k);
+                    for (var i = 0; i < children.Count; i++)
+                        if (!result.ContainsKey(children[i]) && !onPath.Contains(children[i])) stack.Push((children[i], false));
+                    continue;
+                }
+                var best = Get(k).LastActiveAt;
+                var done = t.Children(k);
+                for (var i = 0; i < done.Count; i++)
+                    if (result.TryGetValue(done[i], out var ce)) best = ActivityState.Max(best, ce);
+                result[k] = best;
+                onPath.Remove(k);
+            }
+        }
+        return result;
+    }
 }
