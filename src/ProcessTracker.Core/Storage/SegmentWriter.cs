@@ -7,7 +7,8 @@ namespace ProcessTracker.Core.Storage;
 
 /// <summary>
 /// Appends tick frames to 5-minute segment files from a single background task. Enqueue never blocks
-/// (bounded channel, drop-oldest). Idle processes are written only as a 60 s heartbeat.
+/// (bounded channel, drop-oldest). A process sample is written when the process is first seen, when it was active
+/// (crossed an activity threshold), and otherwise only as a 60 s heartbeat.
 /// </summary>
 public sealed class SegmentWriter : IDisposable
 {
@@ -15,7 +16,7 @@ public sealed class SegmentWriter : IDisposable
     private static readonly TimeSpan ForgetAfter = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan MinRetention = TimeSpan.FromHours(2);
 
-    private readonly record struct Item(TickFrame Frame, IReadOnlyList<ProcessRecord> NewProcesses);
+    private readonly record struct Item(TickFrame Frame, IReadOnlyList<ProcessRecord> NewProcesses, IReadOnlyList<bool>? Active);
     private struct Seen { public DateTime LastWritten; public DateTime LastSeen; }
 
     private readonly string _dir;
@@ -49,10 +50,18 @@ public sealed class SegmentWriter : IDisposable
         _drain = Task.Run(DrainAsync);
     }
 
-    public void Enqueue(TickFrame f, IReadOnlyList<ProcessRecord> newProcesses)
+    /// <param name="f">The frame.</param>
+    /// <param name="newProcesses">Records of processes first seen in this frame.</param>
+    /// <param name="active">
+    /// Per sample of <paramref name="f"/> (same order): whether it crossed an activity threshold, as decided by
+    /// <see cref="Activity.ActivityTracker.Update"/>. Null treats every sample as idle.
+    /// </param>
+    public void Enqueue(TickFrame f, IReadOnlyList<ProcessRecord> newProcesses, IReadOnlyList<bool>? active = null)
     {
+        if (active is not null && active.Count != f.Samples.Count)
+            throw new ArgumentException("One activity flag per sample is required.", nameof(active));
         Interlocked.Increment(ref _enqueued);
-        if (!_channel.Writer.TryWrite(new Item(f, newProcesses)))
+        if (!_channel.Writer.TryWrite(new Item(f, newProcesses, active)))
             Interlocked.Increment(ref _completed); // writer completed (disposed): frame discarded
     }
 
@@ -117,9 +126,10 @@ public sealed class SegmentWriter : IDisposable
             SegmentFormat.WriteProcessInfo(w, info);
             SegmentFormat.EndRecord(w, at);
         }
-        foreach (var s in f.Samples)
+        for (var i = 0; i < f.Samples.Count; i++)
         {
-            if (!ShouldWrite(s, f.TimestampUtc)) continue;
+            var s = f.Samples[i];
+            if (!ShouldWrite(s, item.Active?[i] == true, f.TimestampUtc)) continue;
             at = SegmentFormat.BeginRecord(w, SegmentFormat.TypeProcess);
             SegmentFormat.WriteProcess(w, s);
             SegmentFormat.EndRecord(w, at);
@@ -136,10 +146,8 @@ public sealed class SegmentWriter : IDisposable
         stream.Flush(false);
     }
 
-    private bool ShouldWrite(ProcessSample s, DateTime now)
+    private bool ShouldWrite(in ProcessSample s, bool active, DateTime now)
     {
-        var active = s.CpuCores > 0 || s.ReadOpsDelta > 0 || s.WriteOpsDelta > 0
-                     || s.OtherOpsDelta > 0 || s.ContextSwitchesDelta > 0;
         var known = _seen.TryGetValue(s.Key, out var seen);
         var write = active || !known || now - seen.LastWritten >= Heartbeat;
         _seen[s.Key] = new Seen { LastWritten = write ? now : seen.LastWritten, LastSeen = now };

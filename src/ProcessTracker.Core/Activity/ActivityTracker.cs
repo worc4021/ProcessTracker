@@ -8,19 +8,23 @@ public sealed class ActivityTracker(ActivityOptions options)
 {
     private readonly Dictionary<ProcessKey, ActivityState> _states = new();
 
-    public void Update(in ProcessSample s, string imageName)
+    /// <summary>Records the signals of <paramref name="s"/> that cross the image's thresholds.</summary>
+    /// <returns>True when any signal crossed its threshold, i.e. the process was active in this sample.</returns>
+    public bool Update(in ProcessSample s, string imageName)
     {
         var t = options.PerImage.TryGetValue(imageName, out var perImage) ? perImage : options.Default;
         var at = s.TimestampUtc;
         var cur = Get(s.Key);
 
+        var cpu = s.CpuCores > t.CpuCores;
+        var io = s.ReadOpsDelta + s.OtherOpsDelta >= t.IoOps;
+        var write = s.WriteOpsDelta >= t.WriteOps;
+        var wake = s.ContextSwitchesDelta > t.ContextSwitches;
         var next = new ActivityState(
-            s.CpuCores > t.CpuCores ? at : cur.LastCpuAt,
-            s.ReadOpsDelta + s.OtherOpsDelta >= t.IoOps ? at : cur.LastIoAt,
-            s.WriteOpsDelta >= t.WriteOps ? at : cur.LastWriteAt,
-            s.ContextSwitchesDelta > t.ContextSwitches ? at : cur.LastWakeAt);
+            cpu ? at : cur.LastCpuAt, io ? at : cur.LastIoAt, write ? at : cur.LastWriteAt, wake ? at : cur.LastWakeAt);
 
         if (next != cur) _states[s.Key] = next;
+        return cpu || io || write || wake;
     }
 
     public ActivityState Get(ProcessKey k) => _states.TryGetValue(k, out var st) ? st : default;

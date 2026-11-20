@@ -158,10 +158,28 @@ public sealed class SegmentTests : IDisposable
             for (var i = 0; i < 5; i++)
             {
                 var ts = T0.AddSeconds(2 * i);
-                w.Enqueue(Frame(ts, [Sample(10, ts, cpu: i == 0 ? 0 : 0.1f, ctx: i == 0 ? 1 : 0)]), []);
+                w.Enqueue(Frame(ts, [Sample(10, ts, cpu: 0.1f)]), [], [true]);
             }
         });
         Assert.Equal(5, ReadAll().OfType<ProcessRec>().Count());
+    }
+
+    [Fact]
+    public async Task Writer_SubThresholdDeltas_AreHeartbeatOnly()
+    {
+        // Non-zero but sub-threshold activity (one context switch, a trace of CPU) is idle for history.
+        await Write(w =>
+        {
+            for (var i = 0; i < 30; i++)
+            {
+                var ts = T0.AddSeconds(2 * i);
+                w.Enqueue(Frame(ts, [Sample(10, ts, cpu: 0.001f, ctx: 1), Sample(11, ts, cpu: 0.5f)]), [],
+                    [false, i % 10 == 0]);
+            }
+        });
+        var recs = ReadAll().OfType<ProcessRec>().ToList();
+        Assert.Single(recs, r => r.Value.Key.Pid == 10);           // first sight only
+        Assert.Equal(3, recs.Count(r => r.Value.Key.Pid == 11));   // first sight (active) + two active ticks
     }
 
     [Fact]

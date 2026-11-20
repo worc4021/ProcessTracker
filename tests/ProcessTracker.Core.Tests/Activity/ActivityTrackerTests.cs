@@ -46,6 +46,18 @@ public class ActivityTrackerTests
     }
 
     [Fact]
+    public void Update_ReportsWhetherAnySignalFired_UsingPerImageThresholds()
+    {
+        var tracker = new ActivityTracker(new ActivityOptions());
+        Assert.True(tracker.Update(Sample(Key(1), T, ctx: 150), "foo.exe"));
+        Assert.False(tracker.Update(Sample(Key(2), T, ctx: 1, cpu: 0.001f), "foo.exe"));
+        Assert.False(tracker.Update(Sample(Key(3), T, cpu: 0.03f, ctx: 1500), "MATLAB.exe"));
+        Assert.True(tracker.Update(Sample(Key(4), T, writeOps: 1), "MATLAB.exe"));
+        // Still active although nothing changed in the stored state.
+        Assert.True(tracker.Update(Sample(Key(1), T, ctx: 150), "foo.exe"));
+    }
+
+    [Fact]
     public void MatlabJvmNoise_NotActive()
     {
         var tracker = new ActivityTracker(new ActivityOptions());

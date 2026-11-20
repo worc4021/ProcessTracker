@@ -182,12 +182,13 @@ public sealed class Tracker : IDisposable
 
         // Samples and activity.
         var samples = new ProcessSample[_live.Count];
+        var active = new bool[_live.Count]; // per sample: crossed an activity threshold (decides history writes)
         var n = 0;
         foreach (var (key, lp) in _live)
         {
             var raw = current[key];
             var s = lp.Prev is { } prev ? SampleCalculator.Compute(prev, lp.PrevTs, raw, now) : SampleCalculator.First(raw, now);
-            _activity.Update(s, raw.ImageName);
+            active[n] = _activity.Update(s, raw.ImageName);
             lp.Prev = raw;
             lp.PrevTs = now;
             samples[n++] = s;
@@ -230,7 +231,7 @@ public sealed class Tracker : IDisposable
 
         var frame = new TickFrame(now, system, samples, totals.Values.ToArray());
         Ring.Add(frame);
-        _writer.Enqueue(frame, newRecords);
+        _writer.Enqueue(frame, newRecords, active);
         Persist(now, upserts, allSessions, forceLive: false);
 
         // A fresh dictionary per tick, never touched again once published: readers see an immutable snapshot.
