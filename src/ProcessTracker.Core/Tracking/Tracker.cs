@@ -74,6 +74,7 @@ public sealed class Tracker : IDisposable
     private readonly HashSet<(string Unit, string Id)> _transcriptQueued = new();
     private readonly Dictionary<string, (string Id, DateTime At)> _transcriptRead = new();
     private readonly Dictionary<string, DateTime> _desktopRead = new();
+    private readonly HashSet<string> _rejectedProfiles = new(StringComparer.OrdinalIgnoreCase);
 
     private TrackerView _view = TrackerView.Empty;
     private SystemCounters? _prevSystem;
@@ -387,12 +388,13 @@ public sealed class Tracker : IDisposable
 
     /// <summary>
     /// The profile whose files describe the unit: the configured profile if set, else the profile of the anchor's
-    /// owner (the last one resolved while the anchor is unknown or gone). Null when no profile is known.
+    /// owner (the last one resolved while the anchor is unknown or gone). Null when no profile is known, or when the
+    /// path is not a fully qualified local drive path (<c>X:\...</c>; no UNC or device paths): nothing is read then.
     /// </summary>
     private string? ProfileFor(string unit)
     {
         var profile = _options.UserProfilePath;
-        if (!string.IsNullOrEmpty(profile)) return profile;
+        if (!string.IsNullOrEmpty(profile)) return IsLocalDrivePath(profile) ? profile : RejectProfile(profile);
 
         if (_profiles is not null && _sessions.Get(unit)?.Anchor is { } anchor)
         {
@@ -402,9 +404,25 @@ public sealed class Tracker : IDisposable
             {
                 _log.LogWarning(e, "Resolving the profile of {Anchor} failed", anchor);
             }
-            if (!string.IsNullOrEmpty(resolved)) _unitProfile[unit] = resolved;
+            if (!string.IsNullOrEmpty(resolved))
+            {
+                if (IsLocalDrivePath(resolved)) _unitProfile[unit] = resolved;
+                else RejectProfile(resolved);
+            }
         }
         return _unitProfile.GetValueOrDefault(unit);
+    }
+
+    /// <summary>A fully qualified path on a drive letter (<c>C:\x</c>), not UNC (<c>\\server</c>) or a device path.</summary>
+    public static bool IsLocalDrivePath(string path) =>
+        path.Length >= 4 && char.IsAsciiLetter(path[0]) && path[1] == ':' && path[2] == '\\'
+        && path[3] != '\\' && Path.IsPathFullyQualified(path);
+
+    private string? RejectProfile(string profile)
+    {
+        if (_rejectedProfiles.Add(profile))
+            _log.LogWarning("Ignoring profile path {Profile}: not a local drive path; its session files are not read", profile);
+        return null;
     }
 
     /// <summary>The transcript reader for the unit's profile (see <see cref="ProfileFor"/>), or null.</summary>

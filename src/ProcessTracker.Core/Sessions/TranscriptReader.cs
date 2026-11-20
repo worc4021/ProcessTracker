@@ -13,6 +13,7 @@ public sealed class TranscriptReader
     private const int MaxBytes = 256 * 1024;
     private const int Chunk = 32 * 1024;
     private const int MaxTitle = 80;
+    private const int MaxPath = 400;
     private const int MaxCachedPaths = 1024;
     private readonly string _projectsDir;
     private readonly Dictionary<string, string> _paths = new(StringComparer.Ordinal);
@@ -114,9 +115,8 @@ public sealed class TranscriptReader
             using var doc = JsonDocument.Parse(line);
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object) return;
-            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String
-                && !string.IsNullOrEmpty(c.GetString()))
-                cwd = c.GetString();
+            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String)
+                cwd = SessionText.Clean(c.GetString(), MaxPath);
             title ??= TitleOf(root);
         }
         catch (JsonException) { }
@@ -152,11 +152,8 @@ public sealed class TranscriptReader
         }
         if (text is null || StripLeadingTags(text) is not { } own) return null;
 
-        var oneLine = string.Join(' ', own.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-        if (oneLine.Length == 0) return null;
-        if (oneLine.Length <= MaxTitle) return oneLine;
-        var len = char.IsHighSurrogate(oneLine[MaxTitle - 1]) ? MaxTitle - 1 : MaxTitle;
-        return oneLine[..len];
+        // One line, no control or bidi characters (terminal escapes), at most MaxTitle characters.
+        return SessionText.Clean(own, MaxTitle);
     }
 
     /// <summary>

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Sessions;
 
 namespace ProcessTracker.Cli;
 
@@ -30,14 +31,33 @@ public static class Format
 
     public static string Truncate(string? s, int width)
     {
-        s ??= "";
-        s = s.ReplaceLineEndings(" ");
+        s = Safe(s);
         return s.Length <= width ? s : string.Concat(s.AsSpan(0, width - 1), "~");
+    }
+
+    /// <summary>
+    /// Text from the service made safe for a terminal: line breaks and tabs become spaces, every other control
+    /// character (C0, DEL, C1: escape sequences such as OSC 52) and every bidirectional control becomes '?'.
+    /// </summary>
+    public static string Safe(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        s = s.ReplaceLineEndings(" ");
+        if (!s.Any(SessionText.IsUnsafe)) return s;
+        return string.Create(s.Length, s, static (span, src) =>
+        {
+            for (var i = 0; i < src.Length; i++)
+            {
+                var c = src[i];
+                span[i] = c == (char)9 ? ' ' : SessionText.IsUnsafe(c) ? '?' : c; // 9: tab
+            }
+        });
     }
 
     /// <summary>Renders rows under headers; columns whose header is in <paramref name="rightAligned"/> are right-aligned.</summary>
     public static string Table(string[] headers, IReadOnlyList<string[]> rows, params string[] rightAligned)
     {
+        rows = rows.Select(r => r.Select(Safe).ToArray()).ToList(); // every cell, whatever its source
         var widths = headers.Select((h, i) => Math.Max(h.Length, rows.Count == 0 ? 0 : rows.Max(r => r[i].Length))).ToArray();
         var sb = new StringBuilder();
         void Line(string[] cells)

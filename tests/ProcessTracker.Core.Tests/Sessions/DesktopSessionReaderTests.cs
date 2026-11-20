@@ -160,6 +160,57 @@ public sealed class DesktopSessionReaderTests : IDisposable
     }
 
     [Fact]
+    public void Read_CachedPath_SkipsTheDirectorySearch()
+    {
+        WriteSession(Full);
+        var reader = new DesktopSessionReader(Profile);
+        Assert.NotNull(reader.Read(HostId));
+        Assert.Equal(1, reader.Searches);
+
+        Assert.NotNull(reader.Read(HostId));
+        Assert.NotNull(reader.Read(HostId));
+        Assert.Equal(1, reader.Searches);
+
+        // Once the cached file is gone the tree is searched again.
+        File.Delete(Path.Combine(SessionsDir(), "a", "b", HostId + ".json"));
+        Assert.Null(reader.Read(HostId));
+        Assert.Equal(2, reader.Searches);
+    }
+
+    private void HardLink(string link, string target)
+    {
+        var psi = new ProcessStartInfo("cmd.exe", $"/c mklink /H \"{link}\" \"{target}\"")
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        p.WaitForExit();
+        Assert.Equal(0, p.ExitCode);
+    }
+
+    [Fact]
+    public void Read_HardLinkedFile_IsRejected()
+    {
+        // A hard link in the tree to a file elsewhere has two names; so does a tree file linked from elsewhere.
+        var elsewhere = Path.Combine(_root, "elsewhere-hard");
+        Directory.CreateDirectory(elsewhere);
+        var outside = Path.Combine(elsewhere, "secret.json");
+        File.WriteAllText(outside, """{"title":"secret"}""");
+        var dir = Path.Combine(SessionsDir(), "a", "b");
+        Directory.CreateDirectory(dir);
+        HardLink(Path.Combine(dir, HostId + ".json"), outside);
+
+        Assert.Null(new DesktopSessionReader(Profile).Read(HostId));
+    }
+
+    [Fact]
+    public void Read_InvalidProfilePath_NullNoThrow()
+    {
+        var reader = new DesktopSessionReader("C:\\bad" + (char)0 + "path");
+        Assert.Null(reader.Read(HostId));
+    }
+
+    [Fact]
     public void Read_TruncatesLongFields_AndCollapsesWhitespaceAndControls()
     {
         var title = "  Line one\n\tline\u0007 two\u202E " + new string('t', 300);

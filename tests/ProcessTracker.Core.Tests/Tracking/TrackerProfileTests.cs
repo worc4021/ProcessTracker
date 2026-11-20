@@ -177,6 +177,65 @@ public sealed class TrackerProfileTests : IDisposable
     }
 
     [Fact]
+    public void Tracker_HostileTranscriptTitle_ReachesSessionViewWithoutControlsOrBidi()
+    {
+        var anchor = AddSession();
+        var resolver = new FakeResolver();
+        var profile = Path.Combine(_dir, "hostile");
+        var project = Path.Combine(profile, ".claude", "projects", "C--work");
+        Directory.CreateDirectory(project);
+        var line = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["type"] = "user", ["cwd"] = @"C:\work",
+            ["message"] = new Dictionary<string, object>
+            {
+                ["content"] = "Fix " + Sessions.SessionTextTests.Osc52 + "bug" + Sessions.SessionTextTests.Rlo + " now",
+            },
+        });
+        File.WriteAllText(Path.Combine(project, "s1.jsonl"), line + "\n");
+        resolver.Map[anchor] = profile;
+
+        var s = Assert.Single(NewTracker(resolver).Tick().Sessions).Info;
+        Assert.Equal("Fix ]52;c;ZXZpbA== bug now", s.DisplayTitle);
+        Assert.False(Sessions.SessionTextTests.HasUnsafe(s.DisplayTitle));
+    }
+
+    [Theory]
+    [InlineData(@"\\server\share\u")]
+    [InlineData(@"\\?\C:\Users\u")]
+    [InlineData(@"\\.\C:\Users\u")]
+    [InlineData(@"relative\u")]
+    [InlineData(@"C:relative")]
+    [InlineData(@"C:\")]
+    public void Tracker_NonLocalDriveProfile_IsRejected_NothingRead(string bad)
+    {
+        Assert.False(Tracker.IsLocalDrivePath(bad));
+
+        var anchor = AddSession();
+        var resolver = new FakeResolver();
+        resolver.Map[anchor] = bad;
+        Assert.Null(Assert.Single(NewTracker(resolver).Tick().Sessions).Info.Title);
+    }
+
+    [Fact]
+    public void Tracker_ConfiguredUncProfile_IsRejected_ResolverNotUsedEither()
+    {
+        var anchor = AddSession();
+        var resolver = new FakeResolver();
+        resolver.Map[anchor] = MakeProfile("owner", "from owner");
+
+        var s = Assert.Single(NewTracker(resolver, @"\\server\share\u").Tick().Sessions);
+
+        Assert.Null(s.Info.Title);
+        Assert.Equal(0, resolver.Calls);
+    }
+
+    [Theory]
+    [InlineData(@"C:\Users\u")]
+    [InlineData(@"d:\profiles\u")]
+    public void IsLocalDrivePath_Accepts(string path) => Assert.True(Tracker.IsLocalDrivePath(path));
+
+    [Fact]
     public void Tracker_ResolverLosesAnchor_KeepsLastResolvedProfile()
     {
         var anchor = AddSession();

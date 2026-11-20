@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -45,11 +44,17 @@ public sealed partial class DesktopSessionReader
 
     private static readonly JsonDocumentOptions JsonOptions = new() { MaxDepth = 64 };
 
-    private readonly string _profile;
+    private readonly string _profileArg;
+    private string? _profile;
+    private string? _finalProfile;
     private readonly Dictionary<string, (string Path, DateTime Written, DesktopSessionInfo Info)> _cache =
         new(StringComparer.OrdinalIgnoreCase);
 
-    public DesktopSessionReader(string userProfilePath) => _profile = Path.GetFullPath(userProfilePath);
+    /// <summary>The profile is only normalized on the first read, inside the never-throw boundary.</summary>
+    public DesktopSessionReader(string userProfilePath) => _profileArg = userProfilePath;
+
+    /// <summary>How many times the directory tree was searched (a cached path that is still safe skips the search).</summary>
+    public int Searches { get; private set; }
 
     [GeneratedRegex(@"\Alocal_[0-9a-fA-F-]{36}\z", RegexOptions.CultureInvariant)]
     private static partial Regex HostIdPattern();
@@ -67,6 +72,7 @@ public sealed partial class DesktopSessionReader
         try
         {
             if (!IsValidHostId(hostSessionId)) return null;
+            _profile ??= Path.GetFullPath(_profileArg).TrimEnd(Path.DirectorySeparatorChar);
             var id = hostSessionId!;
             if (Locate(id) is not { } file) return null;
 
@@ -75,7 +81,12 @@ public sealed partial class DesktopSessionReader
             var written = fi.LastWriteTimeUtc;
             if (_cache.TryGetValue(id, out var c) && c.Path == file && c.Written == written) return c.Info;
 
-            if (ReadCapped(file) is not { } bytes) return null;
+            // The handle is compared with the path as the file system resolves it (long names, the profile's own links).
+            _finalProfile ??= FileHandleChecks.DirectoryFinalPath(_profile)?.TrimEnd(Path.DirectorySeparatorChar);
+            if (_finalProfile is null
+                || !file.StartsWith(_profile + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return null;
+            var expectedFinal = _finalProfile + file[_profile!.Length..];
+            if (ReadCapped(file, expectedFinal, ExpectedRoot(), id) is not { } bytes) return null;
             if (Parse(bytes) is not { } info) return null;
             if (_cache.Count >= MaxCached) _cache.Clear();
             _cache[id] = (file, written, info);
@@ -96,8 +107,9 @@ public sealed partial class DesktopSessionReader
             _cache.Remove(id);
         }
 
-        var root = Path.Combine(_profile, "AppData", "Local", "Claude-Data");
-        if (!IsSafeDir(Path.Combine(_profile, "AppData")) || !IsSafeDir(Path.Combine(_profile, "AppData", "Local"))
+        Searches++;
+        var root = ExpectedRoot();
+        if (!IsSafeDir(Path.Combine(_profile!, "AppData")) || !IsSafeDir(Path.Combine(_profile!, "AppData", "Local"))
             || !IsSafeDir(root)) return null;
 
         var name = id + ".json";
@@ -122,7 +134,7 @@ public sealed partial class DesktopSessionReader
         if (!fi.Exists || IsReparse(fi.Attributes)) return false;
         for (var dir = fi.Directory; dir is not null; dir = dir.Parent)
         {
-            if (string.Equals(dir.FullName.TrimEnd('\\'), _profile.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(dir.FullName.TrimEnd('\\'), _profile!.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
                 return true;
             if (!dir.Exists || IsReparse(dir.Attributes)) return false;
         }
@@ -137,11 +149,21 @@ public sealed partial class DesktopSessionReader
 
     private static bool IsReparse(FileAttributes a) => (a & FileAttributes.ReparsePoint) != 0;
 
-    /// <summary>The whole file if it is at most <see cref="MaxBytes"/>; null when it is larger.</summary>
-    private static byte[]? ReadCapped(string file)
+    /// <summary><c>&lt;profile&gt;\AppData\Local\Claude-Data</c>.</summary>
+    private string ExpectedRoot() => Path.Combine(_profile!, "AppData", "Local", "Claude-Data");
+
+    /// <summary>
+    /// The whole file if it is at most <see cref="MaxBytes"/>. Null when it is larger, or when the opened handle does
+    /// not resolve to exactly the path that was checked (a junction or link swapped in after the checks) or the file
+    /// has more than one name (a hard link to a file elsewhere).
+    /// </summary>
+    private static byte[]? ReadCapped(string file, string expectedFinal, string root, string id)
     {
         using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
             bufferSize: 1, FileOptions.SequentialScan);
+        if (!FileHandleChecks.IsExactlyAt(fs.SafeFileHandle, expectedFinal)) return null;
+        if (!file.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(Path.GetFileName(file), id + ".json", StringComparison.OrdinalIgnoreCase)) return null;
         if (fs.Length > MaxBytes) return null;
         var buf = new byte[(int)fs.Length];
         var n = 0;
@@ -185,36 +207,6 @@ public sealed partial class DesktopSessionReader
         return DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
     }
 
-    /// <summary>
-    /// One line of at most <paramref name="max"/> characters: whitespace and control characters collapse to single
-    /// spaces, bidirectional overrides are dropped, a trailing surrogate pair is never split. Null when empty.
-    /// </summary>
-    public static string? Clean(string? s, int max)
-    {
-        if (string.IsNullOrEmpty(s)) return null;
-        var sb = new StringBuilder(Math.Min(s.Length, max + 1));
-        var space = false;
-        foreach (var ch in s)
-        {
-            if (IsBidiControl(ch)) continue;
-            if (char.IsWhiteSpace(ch) || char.IsControl(ch))
-            {
-                space = sb.Length > 0;
-                continue;
-            }
-            if (space) { sb.Append(' '); space = false; }
-            sb.Append(ch);
-            if (sb.Length > max) break;
-        }
-        if (sb.Length == 0) return null;
-        if (sb.Length > max)
-        {
-            var len = char.IsHighSurrogate(sb[max - 1]) ? max - 1 : max;
-            sb.Length = len;
-        }
-        return sb.ToString().TrimEnd();
-    }
-
-    private static bool IsBidiControl(char c) =>
-        c is '‎' or '‏' or (>= '‪' and <= '‮') or (>= '⁦' and <= '⁩');
+    /// <summary>See <see cref="SessionText.Clean"/>.</summary>
+    public static string? Clean(string? s, int max) => SessionText.Clean(s, max);
 }

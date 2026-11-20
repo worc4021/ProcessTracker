@@ -102,7 +102,8 @@
     return {
       kind: 'session', id: s.unitId, name: s.title || s.unitId, sub: sub, tip: tip.join('\n'), pid: null, unit: s.unitId,
       cpu: s.cpuCores, priv: s.privateBytes, ws: null, read: null, write: null,
-      idle: idle, state: s.isLive ? 'live' : 'ended', live: s.isLive, procs: s.processCount, children: kids
+      idle: idle, state: s.isLive ? 'live' : 'ended', live: s.isLive, procs: s.processCount, children: kids,
+      endedMs: parseMs(s.endedUtc) || 0
     };
   }
 
@@ -268,7 +269,8 @@
     sessions.sort(function (a, b) { return (b.live ? 1 : 0) - (a.live ? 1 : 0) || b.priv - a.priv; });
     // Ended sessions without processes go under one collapsed "Ended (N)" row at the bottom, newest first.
     var shown = sessions.filter(function (s) { return s.live || s.procs > 0; });
-    var ended = sessions.filter(function (s) { return !s.live && s.procs === 0; });
+    var ended = sessions.filter(function (s) { return !s.live && s.procs === 0; })
+      .sort(function (a, b) { return b.endedMs - a.endedMs; });
     var wrap = el('div', 'scroll');
     var grid = el('div', 'grid');
     grid.appendChild(header());
