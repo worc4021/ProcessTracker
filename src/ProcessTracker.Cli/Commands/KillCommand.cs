@@ -34,23 +34,14 @@ public static class KillCommand
             return await Fail($"Service returned an invalid key '{target.Key}'.");
 
         // 2. PID reuse guard: the live process must still be the one the service knows.
-        Process live;
-        try
-        {
-            live = Process.GetProcessById(pid);
-            if (live.StartTime.ToUniversalTime().ToFileTimeUtc() != key.CreateTimeTicks)
-                return await Fail($"PID {pid} now belongs to a different process (create time differs); nothing killed.");
-        }
-        catch (Exception e) when (e is ArgumentException or InvalidOperationException or Win32Exception)
-        {
-            return await Fail($"PID {pid} cannot be inspected ({e.Message}); nothing killed.");
-        }
+        if (CreateTimeMismatch(pid, key) is { } mismatch) return await Fail(mismatch);
 
         // 3. Guard. Tree members are the target's descendants as known to the service: every process listed in
         // a session tree or as an orphan whose parent chain leads to the target.
         var members = tree ? await DescendantsAsync(api, target, ct) : [];
-        await LetOwnProcessBeSampledAsync(ct);
-        var caller = await api.CallerAsync(ct) is { } dto ? new Attribution(dto.Kind, dto.UnitId, dto.ClaudeSessionId, dto.IsAnchor) : null;
+        var fromService = await api.CallerAsync(ct) is { } dto ? new Attribution(dto.Kind, dto.UnitId, dto.ClaudeSessionId, dto.IsAnchor) : null;
+        var caller = CallerIdentity.Resolve(fromService,
+            Environment.GetEnvironmentVariable("CLAUDE_CODE_HOST_SESSION_ID"), Environment.GetEnvironmentVariable("CLAUDE_CODE_SESSION_ID"));
         var decision = KillGuard.Check(caller, target, tree, members);
         if (!decision.Allowed)
             return await Fail(decision.Reason!);
@@ -65,15 +56,18 @@ public static class KillCommand
                 return await Fail("Declined; nothing killed.");
         }
 
-        // 5. Kill.
+        // 5. Kill. The create time is re-read from a fresh Process object right before, since the prompt and the
+        // lookups above can take arbitrarily long and the PID could have been reused meanwhile.
         string result;
         try
         {
+            if (CreateTimeMismatch(pid, key) is { } changed) return await Fail(changed);
+            using var live = Process.GetProcessById(pid);
             live.Kill(entireProcessTree: tree);
             result = "killed";
             Console.WriteLine($"Killed {target.ImageName} (PID {pid}){(tree ? " and its process tree" : "")}.");
         }
-        catch (Exception e) when (e is InvalidOperationException or Win32Exception or AggregateException or NotSupportedException)
+        catch (Exception e) when (e is InvalidOperationException or ArgumentException or Win32Exception or AggregateException or NotSupportedException)
         {
             result = $"failed: {e.Message}";
             await Console.Error.WriteLineAsync($"Kill failed: {e.Message}");
@@ -93,14 +87,20 @@ public static class KillCommand
         return result == "killed" ? CommandSupport.Ok : CommandSupport.Refused;
     }
 
-    /// <summary>
-    /// The service attributes the caller from its own process, which it only knows after a sampling tick (2 s).
-    /// Waiting makes the guard independent of the X-Claude-Session header, which an agent could simply omit.
-    /// </summary>
-    private static async Task LetOwnProcessBeSampledAsync(CancellationToken ct)
+    /// <summary>Null if the live process with this PID still has the key's create time; otherwise why not.</summary>
+    private static string? CreateTimeMismatch(int pid, ProcessKey key)
     {
-        var remaining = TimeSpan.FromSeconds(3.5) - (DateTime.Now - Process.GetCurrentProcess().StartTime);
-        if (remaining > TimeSpan.Zero) await Task.Delay(remaining, ct);
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            return p.StartTime.ToUniversalTime().ToFileTimeUtc() == key.CreateTimeTicks
+                ? null
+                : $"PID {pid} now belongs to a different process (create time differs); nothing killed.";
+        }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException or Win32Exception)
+        {
+            return $"PID {pid} cannot be inspected ({e.Message}); nothing killed.";
+        }
     }
 
     private static async Task<int> Fail(string message)
