@@ -131,3 +131,8 @@ proctrack --dev sessions
 `--console --dev` runs the same code as a console app. It listens on port 47812, keeps its data in
 `%LOCALAPPDATA%\ProcessTracker-dev`, takes no single-instance mutex and does not read the ProgramData settings,
 so it can run next to the installed service. `--Port <n>` and `--DataDir <path>` override the port and data folder.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The software is provided "as is", without warranty of any kind, and the authors
+accept no liability for any damage arising from its use.
