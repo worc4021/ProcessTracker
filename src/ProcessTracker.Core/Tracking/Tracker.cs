@@ -383,8 +383,11 @@ public sealed class Tracker : IDisposable
         var saveLive = forceLive || _liveSavedUtc is not { } last || now < last || now - last >= LiveCountersInterval;
         try
         {
-            // _live holds this tick's counters (Prev was just set to them) and _activity this tick's state.
-            var live = saveLive ? _live.Select(kv => (kv.Key, _activity.Get(kv.Key), kv.Value.Prev!)) : null;
+            // _live holds this tick's counters (Prev was just set to them) and _activity this tick's state. A process
+            // without counters (recorded by a tick that then failed) is left out rather than failing the save.
+            var live = saveLive
+                ? _live.Where(kv => kv.Value.Prev is not null).Select(kv => (kv.Key, _activity.Get(kv.Key), kv.Value.Prev!))
+                : null;
             State.SaveTick(now, _unsavedRecords.Values.ToList(), live, changed);
             _unsavedRecords.Clear();
             foreach (var s in changed) _savedSessions[s.UnitId] = s;
