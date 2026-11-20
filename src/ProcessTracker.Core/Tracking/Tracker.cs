@@ -64,6 +64,9 @@ public sealed class Tracker : IDisposable
     private readonly SegmentWriter _writer;
 
     private readonly Dictionary<ProcessKey, LiveProcess> _live = new();
+
+    /// <summary>Live processes whose attribution is a session anchor (a small subset of <see cref="_live"/>).</summary>
+    private readonly HashSet<ProcessKey> _liveAnchors = new();
     private readonly Dictionary<string, SessionInfo> _savedSessions = new();
     private readonly Dictionary<ProcessKey, ProcessRecord> _unsavedRecords = new();
     private readonly Queue<(string Unit, string Id)> _transcriptQueue = new();
@@ -179,9 +182,11 @@ public sealed class Tracker : IDisposable
         {
             upserts.Add(_live[key].Record with { ExitedUtc = now });
             _live.Remove(key);
+            _liveAnchors.Remove(key);
             _sessions.ProcessExited(key, now);
             _activity.Forget(key);
         }
+        ReviveEndedSessions();
 
         // Samples and activity.
         var samples = new ProcessSample[_live.Count];
@@ -270,6 +275,7 @@ public sealed class Tracker : IDisposable
                     }
                 }
                 _live[key] = lp;
+                if (IsAnchorRecord(rec)) _liveAnchors.Add(key);
             }
             else
             {
@@ -308,12 +314,42 @@ public sealed class Tracker : IDisposable
         var rec = new ProcessRecord(p.Key, parent, p.ImageName, inspect.ImagePath, inspect.CommandLine, attribution, now, null);
 
         _live[p.Key] = new LiveProcess(rec);
+        if (IsAnchorRecord(rec)) _liveAnchors.Add(p.Key);
         _sessions.Observe(rec);
         if (_transcriptsEnabled
             && attribution is { Kind: AttributionKind.Session, UnitId: { } unit, ClaudeSessionId: { } id }
             && _transcriptQueued.Add((unit, id)))
             _transcriptQueue.Enqueue((unit, id));
         return rec;
+    }
+
+    private static bool IsAnchorRecord(ProcessRecord r) =>
+        r.Attribution is { Kind: AttributionKind.Session, UnitId: not null, IsAnchor: true };
+
+    /// <summary>
+    /// A session that is not live while one of its anchor processes still runs (its anchor exited, or a state restored
+    /// from before a fix left a dead anchor in place) is revived with the newest such anchor. Costs one lookup per live
+    /// anchor process, of which there are about as many as sessions.
+    /// </summary>
+    private void ReviveEndedSessions()
+    {
+        Dictionary<string, ProcessRecord>? revive = null;
+        foreach (var key in _liveAnchors)
+        {
+            var rec = _live[key].Record;
+            var unit = rec.Attribution.UnitId!;
+            if (_sessions.IsLive(unit)) continue;
+            revive ??= new Dictionary<string, ProcessRecord>(StringComparer.Ordinal);
+            if (!revive.TryGetValue(unit, out var best) || rec.Key.CreateTimeTicks > best.Key.CreateTimeTicks)
+                revive[unit] = rec;
+        }
+        if (revive is null) return;
+
+        foreach (var (unit, rec) in revive)
+        {
+            _sessions.Observe(rec);
+            _log.LogInformation("Session {Unit} revived with its running anchor {Anchor}", unit, rec.Key);
+        }
     }
 
     /// <summary>At most <see cref="MaxTranscriptReadsPerTick"/> reads: new session ids first, then refreshes of live sessions.</summary>

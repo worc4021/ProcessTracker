@@ -16,11 +16,16 @@ public sealed class Attributor
             var isClaudeExe = string.Equals(proc.ImageName, ClaudeImage, StringComparison.OrdinalIgnoreCase);
             var isDesktopApp = inspect.ImagePath?.Contains(DesktopAppMarker, StringComparison.OrdinalIgnoreCase) == true;
 
-            // 1. Host session id. A present-but-empty CLAUDE_CODE_SESSION_ID counts as absent.
+            // 1. Host session id. A present-but-empty CLAUDE_CODE_SESSION_ID counts as absent. A claude.exe without a
+            // session id is the anchor unless its parent already belongs to the same unit: a `claude ...` run from
+            // inside the session (e.g. `claude mcp get`) inherits the host id but is just another session process.
             var sessionId = string.IsNullOrEmpty(inspect.SessionId) ? null : inspect.SessionId;
             if (!string.IsNullOrEmpty(inspect.HostSessionId))
-                return new Attr(AttributionKind.Session, "host:" + inspect.HostSessionId, sessionId,
-                    isClaudeExe && sessionId is null);
+            {
+                var unit = "host:" + inspect.HostSessionId;
+                var parentInUnit = parent is { Kind: AttributionKind.Session } && parent.UnitId == unit;
+                return new Attr(AttributionKind.Session, unit, sessionId, isClaudeExe && sessionId is null && !parentInUnit);
+            }
 
             // 2. Session id only (terminal child).
             if (sessionId is not null)

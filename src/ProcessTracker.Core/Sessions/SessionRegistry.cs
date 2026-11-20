@@ -22,10 +22,11 @@ public sealed class SessionRegistry
         var ids = s.ClaudeSessionIds;
         if (a.ClaudeSessionId is { } id && !ids.Contains(id)) ids = [.. ids, id];
 
-        // A newer live anchor means the session was resumed: it is live again. Stale or exited
-        // anchor records (older create time) must never replace the current anchor.
+        // A live anchor takes over when there is none, when the current one has exited (the session ended, so
+        // another running anchor of the unit revives it), or when it is newer (the session was resumed). An older
+        // anchor never displaces a running one, and an exited record never replaces anything.
         var takeAnchor = a.IsAnchor && r.ExitedUtc is null
-            && (s.Anchor is not { } cur || r.Key.CreateTimeTicks > cur.CreateTimeTicks);
+            && (s.Anchor is not { } cur || s.EndedUtc is not null || r.Key.CreateTimeTicks > cur.CreateTimeTicks);
 
         _sessions[unit] = s with
         {

@@ -41,6 +41,33 @@ public class AttributorTests
     }
 
     [Fact]
+    public void Attributor_ClaudeExeChildOfSameSession_IsNotAnchor()
+    {
+        // A nested `claude ...` run from inside the session inherits the host id but is not the session's anchor.
+        var a = Sut.Attribute(Proc("claude.exe"), Ok(host: "local_x", path: @"C:\x\claude.exe"),
+            Session("host:local_x", "sid1"));
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "host:local_x", null, false), a);
+    }
+
+    [Theory]
+    [InlineData("none")]
+    [InlineData("unattributed")]
+    [InlineData("desktop-app")]
+    [InlineData("other-session")]
+    public void Attributor_ClaudeExeWithHostId_ParentOutsideSession_IsAnchor(string parentKind)
+    {
+        var parent = parentKind switch
+        {
+            "unattributed" => ProcessTracker.Core.Model.Attribution.Unattributed,
+            "desktop-app" => new ProcessTracker.Core.Model.Attribution(AttributionKind.ClaudeApp, null, null, false),
+            "other-session" => Session("host:other", "sid1"),
+            _ => null,
+        };
+        var a = Sut.Attribute(Proc("claude.exe"), Ok(host: "local_x", path: @"C:\x\claude.exe"), parent);
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "host:local_x", null, true), a);
+    }
+
+    [Fact]
     public void HostId_OnChild_WithEmptySessionId_HasNullSessionId()
     {
         var a = Sut.Attribute(Proc("node.exe"), Ok(sid: "", host: "local_x"), null);

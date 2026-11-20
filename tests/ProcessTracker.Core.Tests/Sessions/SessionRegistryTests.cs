@@ -68,6 +68,43 @@ public class SessionRegistryTests
     }
 
     [Fact]
+    public void Observe_OlderLiveAnchor_SessionEnded_RevivesWithIt()
+    {
+        var reg = new SessionRegistry();
+        reg.Observe(Rec(Key(1), null, true));
+        reg.Observe(Rec(Key(7), null, true, T.AddMinutes(1)));
+        reg.ProcessExited(Key(7), T.AddMinutes(5));
+        Assert.False(reg.IsLive(Unit));
+
+        reg.Observe(Rec(Key(1), null, true));
+
+        Assert.True(reg.IsLive(Unit));
+        Assert.Equal(Key(1), reg.Get(Unit)!.Anchor);
+        Assert.Null(reg.Get(Unit)!.EndedUtc);
+    }
+
+    [Fact]
+    public void Observe_OlderLiveAnchor_WhileCurrentAnchorLive_DoesNotReplace()
+    {
+        var reg = new SessionRegistry();
+        reg.Observe(Rec(Key(7), null, true));
+        reg.Observe(Rec(Key(1), null, true));
+        Assert.Equal(Key(7), reg.Get(Unit)!.Anchor);
+        Assert.True(reg.IsLive(Unit));
+    }
+
+    [Fact]
+    public void Observe_ExitedAnchorRecord_NeverReplaces()
+    {
+        var reg = new SessionRegistry();
+        reg.Observe(Rec(Key(1), null, true));
+        reg.ProcessExited(Key(1), T.AddMinutes(5));
+        reg.Observe(Rec(Key(9), null, true) with { ExitedUtc = T.AddMinutes(6) });
+        Assert.Equal(Key(1), reg.Get(Unit)!.Anchor);
+        Assert.False(reg.IsLive(Unit));
+    }
+
+    [Fact]
     public void Observe_OldAnchorReobservedAfterResume_StaysLive()
     {
         var reg = new SessionRegistry();
