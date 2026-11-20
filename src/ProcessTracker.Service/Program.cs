@@ -100,6 +100,7 @@ try
     builder.Services.AddSingleton<TrackerHost>();
     builder.Services.AddSingleton<ITrackerHost>(sp => sp.GetRequiredService<TrackerHost>());
     builder.Services.AddSingleton<ICallerResolver, CallerResolver>();
+    builder.Services.AddSingleton<OverviewCache>();
     builder.Services.AddHttpContextAccessor(); // MCP tools resolve the caller from the current request
     builder.Services.AddMcpServer()
         .WithHttpTransport(o => o.Stateless = true)
@@ -121,7 +122,9 @@ try
         return Task.CompletedTask;
     });
 
+    app.UseDashboardHeaders();
     app.MapRestEndpoints();
+    app.MapDashboard();
     app.MapMcp("/mcp");
 
     // Fail fast if the server is listening anywhere but loopback, and log what it actually bound.

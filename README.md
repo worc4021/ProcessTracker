@@ -120,6 +120,15 @@ The tools are all read-only. There are no kill tools.
 | `list_orphans` | Orphaned processes, alertable ones first |
 | `get_process_history` | One process's usage over the last minutes, by `pid@ticks` key |
 
+## Dashboard
+
+Open <http://127.0.0.1:47811/> in a browser (it redirects to `/dashboard/`). The page is read-only: a live view of
+machine pressure, every session with its process tree, the orphans and the load report, refreshed every 2 seconds
+while the tab is visible. It is served by the service itself from files embedded in the executable, needs no
+internet and runs no inline script. It cannot kill anything. The Orphans tab only copies a
+`proctrack kill <pid> --tree` command to the clipboard for you to run yourself. The same loopback-only and
+Host/Origin checks as the API apply to it.
+
 ## Development mode
 
 ```powershell
