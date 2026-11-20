@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ProcessTracker MSI (per-machine, x64). Built by scripts/build-msi.ps1, which defines:
+    ProductVersion  numeric X.Y.Z from version.txt
+    StageDir        the published service (root), bin\proctrack.exe and upgrade.ps1
+  The data folder %ProgramData%\ProcessTracker is deliberately not authored here: an MSI-created folder would inherit
+  %ProgramData%'s ACL (Users may add files) and be classified untrusted. proctrack admin prepare-data owns it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="ProcessTracker"
+           Manufacturer="worc4021"
+           Version="$(ProductVersion)"
+           UpgradeCode="69B0FAFC-2873-43F9-8377-3B554A10091D"
+           Scope="perMachine"
+           Compressed="yes">
+    <SummaryInformation Description="ProcessTracker: tracks which Claude Code session owns each process." />
+
+    <!-- Every build replaces whatever is installed, including the same or a higher version (ruling P1). -->
+    <MajorUpgrade AllowDowngrades="yes" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- msiexec /x ... PURGEDATA=1 also deletes the data folder. -->
+    <Property Id="PURGEDATA" Secure="yes" />
+
+    <!-- scripts\install.ps1 installed into <ProgramFiles>\ProcessTracker\current (a junction); both cannot coexist. -->
+    <Property Id="LEGACYSERVICEEXE" Secure="yes">
+      <DirectorySearch Id="LegacyCurrentFolder" Path="[ProgramFiles64Folder]ProcessTracker\current" Depth="0">
+        <FileSearch Id="LegacyServiceExe" Name="ProcessTracker.Service.exe" />
+      </DirectorySearch>
+    </Property>
+    <Launch Condition="Installed OR NOT LEGACYSERVICEEXE"
+            Message="A ProcessTracker install from scripts\install.ps1 is present. Run scripts\uninstall-legacy.ps1 from an elevated PowerShell first." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ProcessTracker" />
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="ProductFiles" />
+      <ComponentRef Id="Service" />
+    </Feature>
+
+    <ComponentGroup Id="ProductFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(StageDir)\**">
+        <Exclude Files="$(StageDir)\ProcessTracker.Service.exe" />
+      </Files>
+    </ComponentGroup>
+
+    <Component Id="Service" Directory="INSTALLFOLDER">
+      <File Id="ServiceExe" Source="$(StageDir)\ProcessTracker.Service.exe" KeyPath="yes" />
+      <ServiceInstall Id="ServiceInstall"
+                      Name="ProcessTracker"
+                      DisplayName="ProcessTracker"
+                      Description="Tracks which Claude Code session owns each process."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Vital="yes" />
+      <ServiceControl Id="ServiceControl" Name="ProcessTracker" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      <!-- Only bin\ (proctrack.exe) goes on the system PATH. -->
+      <Environment Id="PathBin" Name="PATH" Value="[INSTALLFOLDER]bin" Part="last" Action="set" System="yes" Permanent="no" />
+      <!-- The service logs to the Application log under this source; same message file as EventLog.CreateEventSource. -->
+      <util:EventSource Name="ProcessTracker"
+                        Log="Application"
+                        EventMessageFile="[WindowsFolder]Microsoft.NET\Framework64\v4.0.30319\EventLogMessages.dll" />
+    </Component>
+
+    <!--
+      Deferred, no-impersonate (SYSTEM) actions run bin\proctrack.exe through WixQuietExec, which logs its output to the
+      MSI log; each command line is the CustomActionData set by the SetProperty of the same Id.
+      Install, upgrade and repair: anything but a full removal.
+    -->
+    <SetProperty Id="RegisterTask" Sequence="execute" Before="RegisterTask"
+                 Condition="NOT REMOVE~=&quot;ALL&quot;"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; admin register-task --install-dir &quot;[INSTALLFOLDER]\&quot;" />
+    <!-- [INSTALLFOLDER] ends in a backslash; doubling it before the closing quote keeps it from escaping the quote, so
+         proctrack receives exactly the folder path. -->
+    <CustomAction Id="RegisterTask" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- Recovery: restart after 5 s, 5 s and 30 s, failure count reset after a day (as install.ps1 did). Not
+         ServiceConfigFailureActions (MsiServiceConfigFailureActions, flagged WIX1149 as unreliable) and not
+         util:ServiceConfig (one restart delay for all three failures). -->
+    <SetProperty Id="ConfigureRecovery" Sequence="execute" Before="ConfigureRecovery"
+                 Condition="NOT REMOVE~=&quot;ALL&quot;"
+                 Value="&quot;[System64Folder]sc.exe&quot; failure ProcessTracker reset= 86400 actions= restart/5000/restart/5000/restart/30000" />
+    <CustomAction Id="ConfigureRecovery" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <SetProperty Id="PrepareData" Sequence="execute" Before="PrepareData"
+                 Condition="NOT REMOVE~=&quot;ALL&quot;"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; admin prepare-data" />
+    <CustomAction Id="PrepareData" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- Full uninstall only: not when a major upgrade removes the previous version. -->
+    <SetProperty Id="RemoveTask" Sequence="execute" Before="RemoveTask"
+                 Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; admin remove-task" />
+    <CustomAction Id="RemoveTask" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <SetProperty Action="SetRemoveDataKeep" Id="RemoveData" Sequence="execute" Before="RemoveData"
+                 Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT PURGEDATA=&quot;1&quot;"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; admin remove-data" />
+    <SetProperty Action="SetRemoveDataPurge" Id="RemoveData" Sequence="execute" Before="RemoveData"
+                 Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND PURGEDATA=&quot;1&quot;"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; admin remove-data --purge" />
+    <CustomAction Id="RemoveData" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!--
+      Immediate actions run as the installing user (the Claude Code config to change is theirs). WixQuietExec takes an
+      immediate action's command line from WixQuietExecCmdLine.
+      McpRegister: first install only, after InstallFinalize (bin\proctrack.exe is in place).
+      McpUnregister: full uninstall only. Immediate actions run while the script is generated, before any deferred
+      action executes, so bin\proctrack.exe still exists.
+    -->
+    <SetProperty Action="SetMcpRegisterCmdLine" Id="WixQuietExecCmdLine" Sequence="execute" Before="McpRegister"
+                 Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; mcp register" />
+    <CustomAction Id="McpRegister" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="immediate" Return="ignore" />
+
+    <SetProperty Action="SetMcpUnregisterCmdLine" Id="WixQuietExecCmdLine" Sequence="execute" Before="McpUnregister"
+                 Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"
+                 Value="&quot;[INSTALLFOLDER]bin\proctrack.exe&quot; mcp unregister" />
+    <CustomAction Id="McpUnregister" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="immediate" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="McpUnregister" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveData" After="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveTask" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RegisterTask" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="ConfigureRecovery" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="PrepareData" Before="StartServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="McpRegister" After="InstallFinalize" Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

@@ -22,6 +22,8 @@ public static class ContractJson
     public static JsonSerializerOptions Configure(JsonSerializerOptions o)
     {
         o.Converters.Add(new JsonStringEnumConverter());
+        o.MaxDepth = 256; // a process tree can nest deeper than the default 64
+
         return o;
     }
 
@@ -128,6 +130,48 @@ public sealed record SessionTreeDto(SessionViewDto Session, IReadOnlyList<Proces
         return new SessionTreeDto(SessionViewDto.From(session), roots);
     }
 }
+
+/// <summary>
+/// The fields of a process that the dashboard renders. A process whose <see cref="ParentKey"/> is not in the same
+/// session's rows is a root; the page builds the tree from the flat list.
+/// </summary>
+public sealed record OverviewProcessDto(
+    string Key,
+    string? ParentKey,
+    string? UnitId,
+    int Pid,
+    string ImageName,
+    float CpuCores,
+    long PrivateBytes,
+    long WorkingSet,
+    long ReadBytesDelta,
+    long WriteBytesDelta,
+    DateTime? EffectiveLastActiveUtc,
+    ProcessState State,
+    bool Alertable)
+{
+    public static OverviewProcessDto From(ProcessView v)
+    {
+        var r = v.Record;
+        var s = v.Latest;
+        return new OverviewProcessDto(
+            r.Key.ToString(), r.Parent?.ToString(), r.Attribution.UnitId, r.Key.Pid, r.ImageName,
+            s.CpuCores, s.PrivateBytes, s.WorkingSet, s.ReadBytesDelta, s.WriteBytesDelta,
+            ContractJson.AsUtc(v.EffectiveLastActive), v.State, v.Alertable);
+    }
+}
+
+/// <summary>A session summary; LastActiveUtc is the most recent activity of any of its live processes.</summary>
+public sealed record OverviewSessionDto(SessionViewDto Session, DateTime? LastActiveUtc);
+
+/// <summary>
+/// Everything the dashboard shows, built from one <see cref="TrackerView"/> so the page is consistent: machine load,
+/// a summary of every session, the process rows (flat, one list) of only the sessions the caller asked to expand, and
+/// the orphans.
+/// </summary>
+public sealed record OverviewDto(
+    Load.LoadReport Load, IReadOnlyList<OverviewSessionDto> Sessions, IReadOnlyList<OverviewProcessDto> Processes,
+    IReadOnlyList<OverviewProcessDto> Orphans, DateTime TimestampUtc, double SampleIntervalSeconds);
 
 /// <summary>One history point. ProcessCount is set for session series only.</summary>
 public sealed record HistoryPointDto(

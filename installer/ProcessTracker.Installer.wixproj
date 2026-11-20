@@ -1,0 +1,37 @@
+<Project Sdk="WixToolset.Sdk">
+  <!--
+    The SDK version is pinned in global.json (msbuild-sdks). scripts/build-msi.ps1 publishes into a stage folder and
+    builds this with -p:StageDir=<stage> -p:ProductVersion=<version.txt>.
+    Without StageDir (a solution build, Release only) the project stages itself into obj\stage with the same publish
+    commands as build-msi.ps1 (keep both in sync), built under obj\stage-build so it never touches the outputs of the
+    solution build running alongside.
+  -->
+  <PropertyGroup>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">$(VersionPrefix)</ProductVersion>
+    <OutputName>ProcessTracker-$(ProductVersion)-x64</OutputName>
+    <SelfStage Condition="'$(StageDir)' == ''">true</SelfStage>
+    <StageDir Condition="'$(StageDir)' == ''">$(MSBuildProjectDirectory)\obj\stage</StageDir>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);StageDir=$(StageDir)</DefineConstants>
+    <!-- ICE60: e_sqlite3.dll has a version but no language resource (language-neutral native DLL), harmless.
+         ICE61: no maximum version on the major-upgrade search, which is the point of MajorUpgrade AllowDowngrades
+         (any build replaces whatever is installed, ruling P1). -->
+    <SuppressIces>ICE60;ICE61</SuppressIces>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" />
+  </ItemGroup>
+
+  <Target Name="StageForInstaller" BeforeTargets="BeforeBuild" Condition="'$(SelfStage)' == 'true'">
+    <PropertyGroup>
+      <_Dotnet>$(DOTNET_HOST_PATH)</_Dotnet>
+      <_Dotnet Condition="'$(_Dotnet)' == ''">dotnet</_Dotnet>
+      <_StageBuild>$(MSBuildProjectDirectory)\obj\stage-build</_StageBuild>
+      <_Publish>-c $(Configuration) -r win-x64 --self-contained -p:DevSuffix=$(DevSuffix) --artifacts-path &quot;$(_StageBuild)&quot;</_Publish>
+    </PropertyGroup>
+    <RemoveDir Directories="$(StageDir)" />
+    <Exec Command="&quot;$(_Dotnet)&quot; publish &quot;$(MSBuildProjectDirectory)\..\src\ProcessTracker.Service\ProcessTracker.Service.csproj&quot; $(_Publish) -o &quot;$(StageDir)&quot;" />
+    <Exec Command="&quot;$(_Dotnet)&quot; publish &quot;$(MSBuildProjectDirectory)\..\src\ProcessTracker.Cli\ProcessTracker.Cli.csproj&quot; $(_Publish) -p:PublishSingleFile=true -o &quot;$(StageDir)\bin&quot;" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\upgrade.ps1" DestinationFolder="$(StageDir)" />
+  </Target>
+</Project>

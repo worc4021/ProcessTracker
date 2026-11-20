@@ -1,0 +1,134 @@
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build and publish (for example v0.1.0).
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to rebuild and republish (for example v0.1.0).
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+
+      - name: Resolve version
+        run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "Tag '$env:TAG' must look like v<major>.<minor>.<patch>." }
+          $version = (Get-Content -LiteralPath version.txt -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "version.txt must hold X.Y.Z (got '$version')." }
+          if ($env:TAG -ne "v$version") { throw "Tag '$env:TAG' does not match version.txt ($version)." }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          "MSI=artifacts\ProcessTracker-$version-x64.msi" >> $env:GITHUB_ENV
+
+      - name: Test
+        run: dotnet test --solution ProcessTracker.slnx -c Release -- --filter-not-trait "Category=Perf"
+
+      - name: Build MSI
+        run: |
+          ./scripts/build-msi.ps1 -Configuration Release -OutDir artifacts
+          if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 failed.' }
+          if (-not (Test-Path -LiteralPath $env:MSI)) { throw "Expected $env:MSI was not produced." }
+
+      # The same MSI rebuilt with a dev suffix is the upgrade candidate. It goes to its own folder so the
+      # release stage and MSI stay untouched.
+      - name: Build smoke upgrade MSI
+        run: |
+          ./scripts/build-msi.ps1 -Configuration Release -DevSuffix smoke -OutDir artifacts-smoke
+          if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 (smoke) failed.' }
+
+      - name: MSI smoke test
+        run: ./scripts/msi-smoke.ps1 -Msi $env:MSI -UpgradeMsi "artifacts-smoke\ProcessTracker-$env:VERSION-x64.msi" -LogDir "$env:RUNNER_TEMP\msi-smoke"
+
+      # build-msi.ps1 republishes (and wipes) the stage, so signed binaries cannot go through it:
+      # sign the already-published stage, then run only its wix build step again.
+      - name: Sign binaries
+        if: vars.SIGNING_ENABLED == 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\artifacts\stage\ProcessTracker.Service.exe
+            ${{ github.workspace }}\artifacts\stage\bin\proctrack.exe
+
+      - name: Rebuild MSI from signed binaries
+        if: vars.SIGNING_ENABLED == 'true'
+        run: |
+          $stage = Join-Path $PWD 'artifacts\stage'
+          dotnet build installer\ProcessTracker.Installer.wixproj -c Release --no-incremental -warnaserror "-p:StageDir=$stage" "-p:ProductVersion=$env:VERSION" -o artifacts\wix
+          if ($LASTEXITCODE -ne 0) { throw 'wix build failed.' }
+          Copy-Item -LiteralPath "artifacts\wix\ProcessTracker-$env:VERSION-x64.msi" -Destination $env:MSI -Force
+
+      - name: Sign MSI
+        if: vars.SIGNING_ENABLED == 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\artifacts\ProcessTracker-${{ env.VERSION }}-x64.msi
+
+      - name: Write SHA256SUMS.txt
+        run: |
+          $hash = (Get-FileHash -LiteralPath $env:MSI -Algorithm SHA256).Hash.ToLowerInvariant()
+          $line = "$hash  $(Split-Path -Leaf $env:MSI)`n"
+          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS.txt'), $line, [Text.UTF8Encoding]::new($false))
+          Get-Content -LiteralPath SHA256SUMS.txt
+
+      - name: Upload to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload $env:TAG $env:MSI SHA256SUMS.txt --clobber --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed.' }
+
+      - name: Submit to winget
+        if: vars.WINGET_PUBLISHED == 'true'
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          WINGETCREATE_SHA256: 63d980ba79e97042395bd6eb5992c2db9e01e9e7a8a22958a95c288f27310413
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'wingetcreate.exe'
+          Invoke-WebRequest -Uri 'https://github.com/microsoft/winget-create/releases/download/v1.28.1.0/wingetcreate.exe' -OutFile $exe
+          $actual = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          if ($actual -ne $env:WINGETCREATE_SHA256.ToUpperInvariant()) { throw "wingetcreate.exe SHA256 mismatch (got $actual)." }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/ProcessTracker-$env:VERSION-x64.msi|x64"
+          & $exe update worc4021.ProcessTracker --version $env:VERSION --urls $url --submit --token $env:WINGET_TOKEN
+          if ($LASTEXITCODE -ne 0) { throw 'wingetcreate update failed.' }
+
+      - name: Note skipped winget step
+        if: vars.WINGET_PUBLISHED != 'true'
+        run: |
+          $msg = 'winget step skipped (WINGET_PUBLISHED is not true)'
+          Write-Host "::notice::$msg"
+          "::notice::$msg" >> $env:GITHUB_STEP_SUMMARY

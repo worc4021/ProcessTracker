@@ -57,10 +57,16 @@ public sealed class Tracker : IDisposable
     private readonly ActivityTracker _activity;
     private readonly ProcessTable _table = new();
     private readonly SessionRegistry _sessions = new();
-    private readonly TranscriptReader? _transcripts;
+    private readonly IProfileResolver? _profiles;
+    private readonly bool _transcriptsEnabled;
+    private readonly Dictionary<string, TranscriptReader> _readers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _unitProfile = new(StringComparer.Ordinal);
     private readonly SegmentWriter _writer;
 
     private readonly Dictionary<ProcessKey, LiveProcess> _live = new();
+
+    /// <summary>Live processes whose attribution is a session anchor (a small subset of <see cref="_live"/>).</summary>
+    private readonly HashSet<ProcessKey> _liveAnchors = new();
     private readonly Dictionary<string, SessionInfo> _savedSessions = new();
     private readonly Dictionary<ProcessKey, ProcessRecord> _unsavedRecords = new();
     private readonly Queue<(string Unit, string Id)> _transcriptQueue = new();
@@ -78,7 +84,7 @@ public sealed class Tracker : IDisposable
     private bool _disposed;
 
     public Tracker(ISnapshotSource source, IProcessInspector inspector, TrackerOptions options, ILogger<Tracker> log,
-        TimeProvider time)
+        TimeProvider time, IProfileResolver? profiles = null)
     {
         if (string.IsNullOrWhiteSpace(options.DataDir))
             throw new ArgumentException("TrackerOptions.DataDir is required.", nameof(options));
@@ -98,8 +104,8 @@ public sealed class Tracker : IDisposable
             PerImage = new Dictionary<string, ActivityThresholds>(activity.PerImage, StringComparer.OrdinalIgnoreCase),
         });
 
-        if (!string.IsNullOrEmpty(options.UserProfilePath))
-            _transcripts = new TranscriptReader(options.UserProfilePath);
+        _profiles = profiles;
+        _transcriptsEnabled = !string.IsNullOrEmpty(options.UserProfilePath) || profiles is not null;
 
         Directory.CreateDirectory(options.DataDir);
         State = new StateStore(Path.Combine(options.DataDir, "state.db"), log);
@@ -176,9 +182,11 @@ public sealed class Tracker : IDisposable
         {
             upserts.Add(_live[key].Record with { ExitedUtc = now });
             _live.Remove(key);
+            _liveAnchors.Remove(key);
             _sessions.ProcessExited(key, now);
             _activity.Forget(key);
         }
+        ReviveEndedSessions();
 
         // Samples and activity.
         var samples = new ProcessSample[_live.Count];
@@ -267,6 +275,7 @@ public sealed class Tracker : IDisposable
                     }
                 }
                 _live[key] = lp;
+                if (IsAnchorRecord(rec)) _liveAnchors.Add(key);
             }
             else
             {
@@ -305,18 +314,48 @@ public sealed class Tracker : IDisposable
         var rec = new ProcessRecord(p.Key, parent, p.ImageName, inspect.ImagePath, inspect.CommandLine, attribution, now, null);
 
         _live[p.Key] = new LiveProcess(rec);
+        if (IsAnchorRecord(rec)) _liveAnchors.Add(p.Key);
         _sessions.Observe(rec);
-        if (_transcripts is not null
+        if (_transcriptsEnabled
             && attribution is { Kind: AttributionKind.Session, UnitId: { } unit, ClaudeSessionId: { } id }
             && _transcriptQueued.Add((unit, id)))
             _transcriptQueue.Enqueue((unit, id));
         return rec;
     }
 
+    private static bool IsAnchorRecord(ProcessRecord r) =>
+        r.Attribution is { Kind: AttributionKind.Session, UnitId: not null, IsAnchor: true };
+
+    /// <summary>
+    /// A session that is not live while one of its anchor processes still runs (its anchor exited, or a state restored
+    /// from before a fix left a dead anchor in place) is revived with the newest such anchor. Costs one lookup per live
+    /// anchor process, of which there are about as many as sessions.
+    /// </summary>
+    private void ReviveEndedSessions()
+    {
+        Dictionary<string, ProcessRecord>? revive = null;
+        foreach (var key in _liveAnchors)
+        {
+            var rec = _live[key].Record;
+            var unit = rec.Attribution.UnitId!;
+            if (_sessions.IsLive(unit)) continue;
+            revive ??= new Dictionary<string, ProcessRecord>(StringComparer.Ordinal);
+            if (!revive.TryGetValue(unit, out var best) || rec.Key.CreateTimeTicks > best.Key.CreateTimeTicks)
+                revive[unit] = rec;
+        }
+        if (revive is null) return;
+
+        foreach (var (unit, rec) in revive)
+        {
+            _sessions.Observe(rec);
+            _log.LogInformation("Session {Unit} revived with its running anchor {Anchor}", unit, rec.Key);
+        }
+    }
+
     /// <summary>At most <see cref="MaxTranscriptReadsPerTick"/> reads: new session ids first, then refreshes of live sessions.</summary>
     private void ReadTranscripts(DateTime now)
     {
-        if (_transcripts is null) return;
+        if (!_transcriptsEnabled) return;
         var budget = MaxTranscriptReadsPerTick;
 
         while (budget > 0 && _transcriptQueue.TryDequeue(out var item))
@@ -338,6 +377,33 @@ public sealed class Tracker : IDisposable
     }
 
     /// <summary>
+    /// The reader for the unit's transcripts: the configured profile if set, else the profile of the anchor's owner
+    /// (the last one resolved while the anchor is unknown or gone). Null when no profile is known.
+    /// </summary>
+    private TranscriptReader? ReaderFor(string unit)
+    {
+        var profile = _options.UserProfilePath;
+        if (string.IsNullOrEmpty(profile))
+        {
+            if (_profiles is not null && _sessions.Get(unit)?.Anchor is { } anchor)
+            {
+                string? resolved = null;
+                try { resolved = _profiles.ProfileOf(anchor); }
+                catch (Exception e) when (IsNonFatal(e))
+                {
+                    _log.LogWarning(e, "Resolving the profile of {Anchor} failed", anchor);
+                }
+                if (!string.IsNullOrEmpty(resolved)) _unitProfile[unit] = resolved;
+            }
+            if (!_unitProfile.TryGetValue(unit, out profile)) return null;
+        }
+
+        if (!_readers.TryGetValue(profile, out var reader))
+            _readers[profile] = reader = new TranscriptReader(profile);
+        return reader;
+    }
+
+    /// <summary>
     /// Parses a transcript the first time; a refresh of the same transcript only stats the file once the session's
     /// cwd and title are known.
     /// </summary>
@@ -345,12 +411,13 @@ public sealed class Tracker : IDisposable
     {
         var refresh = _transcriptRead.TryGetValue(unit, out var last) && last.Id == claudeSessionId;
         _transcriptRead[unit] = (claudeSessionId, now);
+        if (ReaderFor(unit) is not { } reader) return; // retried at the next refresh
         if (refresh && _sessions.Get(unit) is { Cwd: not null, Title: not null })
         {
-            if (_transcripts!.LastWriteUtc(claudeSessionId) is { } written)
+            if (reader.LastWriteUtc(claudeSessionId) is { } written)
                 _sessions.ApplyTranscript(unit, new TranscriptInfo(null, null, written));
         }
-        else if (_transcripts!.Read(claudeSessionId) is { } info) _sessions.ApplyTranscript(unit, info);
+        else if (reader.Read(claudeSessionId) is { } info) _sessions.ApplyTranscript(unit, info);
     }
 
     /// <summary>Sessions that are live, have live processes, or ended within the retention window; newest first.</summary>

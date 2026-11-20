@@ -186,7 +186,7 @@ public sealed class StateStoreTests : IDisposable
     }
 
     [Fact]
-    [Trait("Category", "Perf")] // timing-sensitive: deploy.ps1 leaves it out
+    [Trait("Category", "Perf")] // timing-sensitive: deploy.ps1 and CI leave it out
     public void SaveTick_1000Processes_Under30ms()
     {
         using var s = new StateStore(DbPath);

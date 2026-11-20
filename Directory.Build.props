@@ -5,8 +5,20 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <VersionPrefix>0.1.0</VersionPrefix>
-    <!-- /api/health reports the informational version; the updater compares it with the deployed folder name, so no +<git hash>. -->
+    <!-- version.txt is the single version source (release-please bumps it). -->
+    <VersionPrefix>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)version.txt').Trim())</VersionPrefix>
+    <!-- /api/health reports the informational version; keep it free of a +<git hash> so it compares equal to X.Y.Z[-dev.stamp]. -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+  <!-- Local deploys pass -p:DevSuffix=dev.yyyyMMddHHmm; release builds leave it empty. -->
+  <PropertyGroup Condition="'$(DevSuffix)' != ''">
+    <InformationalVersion>$(VersionPrefix)-$(DevSuffix)</InformationalVersion>
+  </PropertyGroup>
+  <!-- A caller-supplied -p:Version (for example a manual dotnet publish) still wins when there is no DevSuffix. -->
+  <PropertyGroup Condition="'$(DevSuffix)' == '' and '$(Version)' != ''">
+    <InformationalVersion>$(Version)</InformationalVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DevSuffix)' == '' and '$(Version)' == ''">
+    <InformationalVersion>$(VersionPrefix)</InformationalVersion>
   </PropertyGroup>
 </Project>

@@ -113,4 +113,22 @@ internal static partial class NativeMethods
     {
         public uint State, LocalAddr, LocalPort, RemoteAddr, RemotePort, OwningPid;
     }
+
+    public const uint TokenQuery = 0x0008;
+    public const int TokenUserClass = 1;
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool OpenProcessToken(nint process, uint desiredAccess, out nint token);
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static unsafe partial bool GetTokenInformation(nint token, int infoClass, byte* info, int length, out int returnLength);
+
+    [LibraryImport("advapi32.dll", EntryPoint = "ConvertSidToStringSidW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool ConvertSidToStringSid(nint sid, out nint stringSid);
+
+    [LibraryImport("kernel32.dll")]
+    public static partial nint LocalFree(nint mem);
 }

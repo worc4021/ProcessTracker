@@ -5,3 +5,4 @@ publish/
 *.db
 .vs/
 TestResults/
+artifacts/

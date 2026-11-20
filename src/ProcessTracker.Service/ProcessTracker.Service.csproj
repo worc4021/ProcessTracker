@@ -4,10 +4,6 @@
     <!-- The Web SDK defaults to server GC (a heap per core); a small background service wants workstation GC. -->
     <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
-  <!-- deploy.ps1 -SimulateUnhealthy (-p:SimulateUnhealthy=true): /api/health reports version "unhealthy" to exercise rollback. -->
-  <PropertyGroup Condition="'$(SimulateUnhealthy)' == 'true'">
-    <DefineConstants>$(DefineConstants);SIMULATE_UNHEALTHY</DefineConstants>
-  </PropertyGroup>
   <ItemGroup>
     <!-- 192 MB GC heap cap and non-concurrent GC (resource budget, spec section 12). -->
     <RuntimeHostConfigurationOption Include="System.GC.HeapHardLimit" Value="0xC000000" />
@@ -15,6 +11,10 @@
   </ItemGroup>
   <ItemGroup>
     <Content Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The dashboard is embedded, not served from disk: nothing writable is ever served. -->
+    <EmbeddedResource Include="Dashboard\*.*" LogicalName="dashboard/%(Filename)%(Extension)" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />

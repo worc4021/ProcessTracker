@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using ProcessTracker.Core.Model;
 using ProcessTracker.Core.Orphans;
+using ProcessTracker.Core.Sessions;
 using ProcessTracker.Core.Tests.Fakes;
 using ProcessTracker.Core.Tracking;
 using Attr = ProcessTracker.Core.Model.Attribution;
@@ -111,6 +112,97 @@ public sealed class TrackerTests : IDisposable
         Assert.Equal(T0 + TickInterval, s.Info.EndedUtc);
         Assert.Equal(1, s.ProcessCount);
         Assert.Equal(T0 + TickInterval, t.State.Load().Processes.Single(r => r.Key == claude).ExitedUtc);
+    }
+
+    [Fact]
+    public void Tick_NestedClaudeExe_DoesNotHijackAnchor()
+    {
+        // Anchor A runs a shell, which runs `claude mcp get ...`: a nested claude.exe B that inherits the host id but
+        // has no session id. B must not become the anchor, so its exit must not end the session.
+        var a = AddAnchor();
+        var shell = _src.Add(11, 200, 10, "bash.exe");
+        _insp.Set(shell, FakeInspector.Ok(sessionId: "s1", hostSessionId: "h1"));
+        var t = NewTracker();
+        t.Tick();
+
+        var b = _src.Add(12, 300, 11, "claude.exe");
+        _insp.Set(b, FakeInspector.Ok(hostSessionId: "h1", imagePath: ClaudePath));
+        Step();
+        var v1 = t.Tick();
+        Assert.False(v1.Processes[b].Record.Attribution.IsAnchor);
+        Assert.Equal(a, Assert.Single(v1.Sessions).Info.Anchor);
+
+        _src.Remove(b);
+        Step();
+        var v2 = t.Tick();
+
+        var s = Assert.Single(v2.Sessions);
+        Assert.True(s.IsLive);
+        Assert.Equal(a, s.Info.Anchor);
+        Assert.Null(s.Info.EndedUtc);
+        Assert.Equal(ProcessState.Normal, v2.Processes[a].State);
+        Assert.Equal(ProcessState.Normal, v2.Processes[shell].State);
+    }
+
+    [Fact]
+    public void Tick_AnchorExits_OtherLiveAnchorRevivesSession()
+    {
+        // Two claude.exe of the same desktop session, both launched from outside it (e.g. overlapping a resume).
+        var older = AddAnchor(pid: 10, create: 100);
+        var child = _src.Add(11, 200, 10, "MATLAB.exe");
+        var newer = AddAnchor(pid: 20, create: 300);
+        var t = NewTracker();
+        Assert.Equal(newer, Assert.Single(t.Tick().Sessions).Info.Anchor);
+
+        _src.Remove(newer);
+        Step();
+        var v = t.Tick();
+
+        var s = Assert.Single(v.Sessions);
+        Assert.True(s.IsLive);
+        Assert.Equal(older, s.Info.Anchor);
+        Assert.Null(s.Info.EndedUtc);
+        Assert.Equal(ProcessState.Normal, v.Processes[child].State);
+        Assert.Equal(older, t.State.Load().Sessions.Single().Anchor);
+    }
+
+    [Fact]
+    public void Restore_EndedSessionWithLiveAnchor_IsRevived()
+    {
+        // State left by the bug: the session's anchor is a nested claude.exe that exited, so the session is ended,
+        // while the real (older) anchor is still running and recorded with IsAnchor=true.
+        var anchor = AddAnchor();
+        var matlab = _src.Add(11, 200, 10, "MATLAB.exe");
+        var nested = new ProcessKey(12, 300);
+        var ended = T0 - TimeSpan.FromMinutes(1);
+        var unit = new Attr(AttributionKind.Session, "host:h1", null, true);
+        Directory.CreateDirectory(_dir);
+        using (var store = new ProcessTracker.Core.Storage.StateStore(Path.Combine(_dir, "state.db")))
+        {
+            store.SaveTick(ended,
+            [
+                new ProcessRecord(anchor, null, "claude.exe", ClaudePath, null, unit, T0 - TimeSpan.FromHours(1), null),
+                new ProcessRecord(matlab, anchor, "MATLAB.exe", null, null, unit with { IsAnchor = false },
+                    T0 - TimeSpan.FromMinutes(30), null),
+                new ProcessRecord(nested, anchor, "claude.exe", ClaudePath, null, unit,
+                    T0 - TimeSpan.FromMinutes(2), ended),
+            ], null,
+            [new SessionInfo("host:h1", "h1", [], nested, T0 - TimeSpan.FromHours(1), ended, null, null, null)]);
+        }
+
+        var t = NewTracker(new FakeInspector());
+        t.Restore();
+        var v = t.Tick();
+
+        var s = Assert.Single(v.Sessions);
+        Assert.True(s.IsLive);
+        Assert.Equal(anchor, s.Info.Anchor);
+        Assert.Null(s.Info.EndedUtc);
+        Assert.Equal(ProcessState.Normal, v.Processes[matlab].State);
+        Assert.Equal(ProcessState.Normal, v.Processes[anchor].State);
+        var saved = t.State.Load().Sessions.Single();
+        Assert.Equal(anchor, saved.Anchor);
+        Assert.Null(saved.EndedUtc);
     }
 
     [Fact]
