@@ -7,7 +7,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- version.txt is the single version source (release-please bumps it). -->
     <VersionPrefix>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)version.txt').Trim())</VersionPrefix>
-    <!-- /api/health reports the informational version; the updater compares it with the deployed folder name, so no +<git hash>. -->
+    <!-- /api/health reports the informational version; keep it free of a +<git hash> so it compares equal to X.Y.Z[-dev.stamp]. -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
   <!-- Local deploys pass -p:DevSuffix=dev.yyyyMMddHHmm; release builds leave it empty. -->

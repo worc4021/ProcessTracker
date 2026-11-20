@@ -14,7 +14,7 @@ public sealed class ServiceOptions
 
     /// <summary>
     /// Loopback port; 0 means the mode default (47811, or 47812 with --dev). Only the command line can set it (for
-    /// development and tests): the updater, install script and CLI all assume 47811, so a Port in an appsettings.json
+    /// development and tests): the installer, upgrade task and CLI all assume 47811, so a Port in an appsettings.json
     /// is ignored.
     /// </summary>
     public int Port { get; set; }

@@ -72,7 +72,7 @@ try
 
     if (!asConsole)
     {
-        // As a service, Information and above go to the Application event log under the source install.ps1 creates
+        // As a service, Information and above go to the Application event log under the source the MSI creates
         // (Get-WinEvent -ProviderName ProcessTracker). Per-request framework logging stays at Warning.
         builder.Services.AddWindowsService(o => o.ServiceName = "ProcessTracker");
         builder.Services.Configure<EventLogSettings>(s =>

@@ -18,16 +18,9 @@ public static class RestEndpoints
     private static readonly TimeSpan DefaultHistoryWindow = TimeSpan.FromMinutes(30);
     private const int LoadFrames = 5;
 
-    /// <summary>
-    /// InformationalVersion of the service assembly, as reported by <c>/api/health</c>; the literal "unhealthy" in a
-    /// SIMULATE_UNHEALTHY build, which exists only to test the updater's rollback.
-    /// </summary>
+    /// <summary>InformationalVersion of the service assembly, as reported by <c>/api/health</c>.</summary>
     public static string Version { get; } =
-#if SIMULATE_UNHEALTHY
-        "unhealthy";
-#else
         typeof(RestEndpoints).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "0.0.0";
-#endif
 
     public static IEndpointRouteBuilder MapRestEndpoints(this IEndpointRouteBuilder app)
     {

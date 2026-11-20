@@ -1,15 +1,22 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Uninstalls ProcessTracker: stops and deletes the service, removes the Claude Code MCP entry, the PATH entry and the
-    installed versions. Keeps %ProgramData%\ProcessTracker (history, state, settings) and the ProcessTracker event source
-    unless -PurgeData is given.
+    Removes a phase 1 (script-installed) ProcessTracker, so the MSI can be installed. Not for MSI installs: remove those
+    with winget or msiexec.
 
 .DESCRIPTION
-    Run from an elevated PowerShell as the user who ran install.ps1 (the user PATH and Claude Code config of the
-    elevated account are the ones cleaned up). Safe to run on a partial install.
+    The phase 1 install (scripts\install.ps1, now retired) put versions under <Root>\versions, pointed the junction
+    <Root>\current at one of them and added <Root>\current to the USER PATH. The MSI refuses to install while that
+    junction exists. Run this once, from an elevated PowerShell as the user who ran install.ps1 (the user PATH and Claude
+    Code config of the elevated account are the ones cleaned up). Safe to run on a partial install.
+      1. Stops and deletes the ProcessTracker service.
+      2. Removes the process-tracker MCP entry, only if Claude Code has one (claude mcp get / remove, user scope).
+      3. Removes <Root>\current from the user PATH.
+      4. Removes the junction with rmdir (never Remove-Item, which would follow it) and deletes <Root>\versions.
+    %ProgramData%\ProcessTracker (history, state, settings) is KEPT by default: the MSI adopts that folder, so history
+    survives the migration. Then install the MSI (winget install worc4021.ProcessTracker, or scripts\deploy.ps1).
 
-    Exit codes: 0 uninstalled, 1 failed, 3 nothing changed (not elevated).
+    Exit codes: 0 removed, 1 failed, 3 nothing changed (not elevated, data folder is a link, or this is an MSI install).
 
 .PARAMETER Root
     Install root holding versions\ and the current junction.
@@ -29,13 +36,19 @@ $ErrorActionPreference = 'Stop'
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host 'uninstall.ps1 must run from an elevated PowerShell (Run as administrator). Nothing was changed.' -ForegroundColor Red
+    Write-Host 'uninstall-legacy.ps1 must run from an elevated PowerShell (Run as administrator). Nothing was changed.' -ForegroundColor Red
     exit 3
 }
 
 $serviceName = 'ProcessTracker'
 $current = Join-Path $Root 'current'
 $dataDir = Join-Path $env:ProgramData 'ProcessTracker'
+
+# An MSI install has bin\proctrack.exe and no junction; deleting its service here would break it.
+if ((Test-Path -LiteralPath (Join-Path $Root 'bin\proctrack.exe')) -and -not (Test-Path -LiteralPath $current)) {
+    Write-Host "$Root holds an MSI install, not a phase 1 install. Remove it with 'winget uninstall worc4021.ProcessTracker' or msiexec /x. Nothing was changed." -ForegroundColor Red
+    exit 3
+}
 
 if ($PurgeData) {
     $item = Get-Item -LiteralPath $dataDir -Force -ErrorAction SilentlyContinue
@@ -75,15 +88,19 @@ try {
         Write-Host "The $serviceName service is not installed." -ForegroundColor Cyan
     }
 
-    # Claude Code MCP entry.
+    # Claude Code MCP entry, only if one is registered (claude mcp get exits non-zero when it is not).
     $claude = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $claude) {
-        Write-Warning 'claude was not found on the PATH; remove the MCP entry yourself: claude mcp remove process-tracker --scope user'
+        Write-Warning 'claude was not found on the PATH; if an MCP entry exists, remove it yourself: claude mcp remove process-tracker --scope user'
     }
     else {
-        Write-Host '== Removing the MCP server from Claude Code' -ForegroundColor Cyan
-        & $claude mcp remove process-tracker --scope user
-        if ($LASTEXITCODE -ne 0) { Write-Warning "claude mcp remove failed with exit code $LASTEXITCODE (it may not have been registered)." }
+        & $claude mcp get process-tracker *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '== Removing the MCP server from Claude Code' -ForegroundColor Cyan
+            & $claude mcp remove process-tracker --scope user
+            if ($LASTEXITCODE -ne 0) { Write-Warning "claude mcp remove failed with exit code $LASTEXITCODE; remove it yourself: claude mcp remove process-tracker --scope user" }
+        }
+        else { Write-Host 'No process-tracker MCP entry in Claude Code.' -ForegroundColor Cyan }
     }
 
     # User PATH entry (kept as REG_EXPAND_SZ).
@@ -130,9 +147,9 @@ try {
     }
 }
 catch {
-    Write-Host "Uninstall failed: $_" -ForegroundColor Red
+    Write-Host "Removal failed: $_" -ForegroundColor Red
     exit 1
 }
 
-Write-Host 'ProcessTracker uninstalled.' -ForegroundColor Green
+Write-Host 'Phase 1 ProcessTracker removed. Install the MSI next (winget install worc4021.ProcessTracker, or scripts\deploy.ps1).' -ForegroundColor Green
 exit 0

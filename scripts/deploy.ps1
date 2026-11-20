@@ -1,42 +1,32 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Tests, publishes and deploys ProcessTracker to the installed service, rolling back if the new version is unhealthy.
+    Tests, builds the MSI and installs it over whatever is installed (a local development deploy).
 
 .DESCRIPTION
-    Run from an elevated PowerShell in the checkout, after install.ps1 has registered the service.
+    Run from an elevated PowerShell in the checkout.
       1. dotnet test, without the timing-sensitive tests (trait Category=Perf), so a loaded machine cannot fail a
-         deploy (stops on failure).
-      2. Version = VersionPrefix + "-local.yyyyMMddHHmm".
-      3. Publishes the service, the CLI (proctrack) and the updater, self-contained win-x64, into <Root>\versions\<version>.
-      4. Copies the updater to %TEMP% and runs it from there (it must not run from a folder it swaps). The updater stops
-         the service, points <Root>\current at the new folder, starts it and waits for /api/health to report the new
-         version; on failure it points back to the previous version.
-      5. Prints the outcome.
+         deploy (stops on failure; skip with -SkipTests).
+      2. scripts\build-msi.ps1 -DevSuffix dev.<yyyyMMddHHmm>: the MSI carries the version in version.txt, and the
+         service and proctrack report X.Y.Z-dev.<yyyyMMddHHmm>.
+      3. msiexec /i <msi> /qn /l*v artifacts\deploy.log. The MSI upgrades any installed build, including a newer one
+         (MajorUpgrade AllowDowngrades), so a dev build always replaces the installed one.
+      4. Polls http://127.0.0.1:47811/api/health for up to 60 s until it reports X.Y.Z-dev.<stamp> with a collector tick
+         younger than 5 s.
 
-    Exit codes: 0 Upgraded, 1 RolledBack, 2 RollbackFailed (the updater's), 3 nothing changed (not elevated, service not
-    installed, tests or publish failed).
+    A fresh machine gets a first install this way too. A phase 1 (script-installed) copy must be removed first with
+    scripts\uninstall-legacy.ps1; this script refuses while it is present.
 
-.PARAMETER Root
-    Install root holding versions\ and the current junction.
+    Exit codes: 0 installed and healthy; 1 installed but unhealthy (reinstall the last release from
+    https://github.com/worc4021/ProcessTracker/releases/latest); 3 nothing changed (not elevated, phase 1 install
+    present, tests or build failed, or msiexec failed, in which case the MSI has rolled back).
 
-.PARAMETER SimulateUnhealthy
-    Builds the service with SIMULATE_UNHEALTHY, so /api/health reports version "unhealthy" and the deploy rolls back.
-    For testing the rollback only.
-
-.PARAMETER TimeoutSeconds
-    How long the updater waits for the new version to report healthy.
-
-.PARAMETER PublishOnly
-    Steps 1-3 only; writes the new version to the pipeline. Used by install.ps1.
+.PARAMETER SkipTests
+    Skip step 1.
 #>
 [CmdletBinding()]
 param(
-    [string]$Root = 'C:\Program Files\ProcessTracker',
-    [switch]$SimulateUnhealthy,
-    [ValidateRange(1, 600)]
-    [int]$TimeoutSeconds = 15,
-    [switch]$PublishOnly
+    [switch]$SkipTests
 )
 
 Set-StrictMode -Version Latest
@@ -49,64 +39,68 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
+$releasesUrl = 'https://github.com/worc4021/ProcessTracker/releases/latest'
+$healthUrl = 'http://127.0.0.1:47811/api/health'
+$healthTimeoutSeconds = 60
 
-# Runs dotnet with its output on the console (never in the pipeline, which carries -PublishOnly's result).
-function Invoke-Dotnet {
-    & dotnet @args | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "dotnet $($args -join ' ') failed with exit code $LASTEXITCODE." }
+# The MSI's launch condition refuses a phase 1 install; say so before spending minutes on tests and a build.
+$legacyExe = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ProcessTracker\current\ProcessTracker.Service.exe'
+if (Test-Path -LiteralPath $legacyExe) {
+    Write-Host 'A phase 1 install (script-installed, with a "current" junction) is present. Run scripts\uninstall-legacy.ps1 from an elevated PowerShell first (it keeps your data). Nothing was changed.' -ForegroundColor Red
+    exit 3
 }
 
-$versionDir = $null
+$stamp = (Get-Date).ToString('yyyyMMddHHmm')
+$devSuffix = "dev.$stamp"
+$artifacts = Join-Path $repo 'artifacts'
+$log = Join-Path $artifacts 'deploy.log'
+
 try {
-    if (-not $PublishOnly -and -not (Get-Service -Name ProcessTracker -ErrorAction SilentlyContinue)) {
-        throw 'The ProcessTracker service is not installed; run install.ps1 first.'
+    if (-not $SkipTests) {
+        Write-Host '== Running tests (without the timing-sensitive Category=Perf ones)' -ForegroundColor Cyan
+        & dotnet test --solution (Join-Path $repo 'ProcessTracker.slnx') '--' --filter-not-trait 'Category=Perf' | Out-Host # '--' quoted: a bare -- would be eaten by PowerShell
+        if ($LASTEXITCODE -ne 0) { throw "dotnet test failed with exit code $LASTEXITCODE." }
     }
 
-    Write-Host '== Running tests (without the timing-sensitive Category=Perf ones)' -ForegroundColor Cyan
-    Invoke-Dotnet test --solution (Join-Path $repo 'ProcessTracker.slnx') '--' --filter-not-trait 'Category=Perf' # '--' quoted: a bare -- would be eaten by PowerShell
+    Write-Host "== Building the MSI ($devSuffix)" -ForegroundColor Cyan
+    $msi = & (Join-Path $PSScriptRoot 'build-msi.ps1') -DevSuffix $devSuffix | Select-Object -Last 1
+    $buildCode = $LASTEXITCODE
+    if ($buildCode -ne 0 -or -not $msi -or -not (Test-Path -LiteralPath ([string]$msi))) { throw "build-msi.ps1 failed (exit code $buildCode)." }
+    $msi = [string]$msi
 
-    $prefix = (& dotnet msbuild (Join-Path $repo 'src\ProcessTracker.Service\ProcessTracker.Service.csproj') -getProperty:VersionPrefix)
-    if ($LASTEXITCODE -ne 0 -or -not $prefix) { throw 'Could not read VersionPrefix.' }
-    $version = "$("$prefix".Trim())-local.$((Get-Date).ToString('yyyyMMddHHmm'))"
-
-    $candidate = Join-Path $Root "versions\$version"
-    if (Test-Path -LiteralPath $candidate) { throw "$candidate already exists; wait a minute and deploy again." }
-    New-Item -ItemType Directory -Path $candidate -Force | Out-Null
-    $versionDir = $candidate
-
-    Write-Host "== Publishing $version to $versionDir" -ForegroundColor Cyan
-    $publish = @('-c', 'Release', '-r', 'win-x64', '--self-contained', "-p:Version=$version", '-o', $versionDir)
-    $serviceArgs = $publish
-    if ($SimulateUnhealthy) { $serviceArgs = $publish + '-p:SimulateUnhealthy=true' }
-    Invoke-Dotnet publish (Join-Path $repo 'src\ProcessTracker.Service') @serviceArgs
-    Invoke-Dotnet publish (Join-Path $repo 'src\ProcessTracker.Cli') @publish
-    Invoke-Dotnet publish (Join-Path $repo 'src\ProcessTracker.Updater') @publish
+    $version = (Get-Content -LiteralPath (Join-Path $repo 'version.txt') -Raw).Trim()
+    $expected = "$version-$devSuffix"
 }
 catch {
-    if ($versionDir -and (Test-Path -LiteralPath $versionDir)) {
-        Remove-Item -LiteralPath $versionDir -Recurse -Force -ErrorAction SilentlyContinue # a plain folder, never a junction
-    }
-    if ($PublishOnly) { throw }
     Write-Host "Deploy failed, nothing changed: $_" -ForegroundColor Red
     exit 3
 }
 
-if ($PublishOnly) { return $version }
-
-Write-Host "== Upgrading the service to $version" -ForegroundColor Cyan
-$updaterDir = Join-Path ([IO.Path]::GetTempPath()) "ProcessTracker.Updater.$version"
-New-Item -ItemType Directory -Path $updaterDir -Force | Out-Null
-$updater = Join-Path $updaterDir 'ProcessTracker.Updater.exe'
-Copy-Item -LiteralPath (Join-Path $versionDir 'ProcessTracker.Updater.exe') -Destination $updater -Force
-
-& $updater --root $Root --version $version --timeout $TimeoutSeconds
-$code = $LASTEXITCODE
-Remove-Item -LiteralPath $updaterDir -Recurse -Force -ErrorAction SilentlyContinue
-
-switch ($code) {
-    0 { Write-Host "Outcome: Upgraded to $version." -ForegroundColor Green }
-    1 { Write-Host "Outcome: RolledBack. $version was unhealthy; the previous version is serving again." -ForegroundColor Yellow }
-    2 { Write-Host 'Outcome: RollbackFailed. Neither version reported healthy; check the service and Event Viewer.' -ForegroundColor Red }
-    default { Write-Host "Outcome: the updater changed nothing (exit code $code)." -ForegroundColor Red }
+Write-Host "== Installing $msi (log: $log)" -ForegroundColor Cyan
+New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
+$install = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', "`"$log`"") -Wait -PassThru
+if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+    Write-Host "msiexec failed with exit code $($install.ExitCode); the MSI rolled back and nothing changed. See $log." -ForegroundColor Red
+    exit 3
 }
-exit $code
+if ($install.ExitCode -eq 3010) { Write-Warning 'The install asks for a restart (exit code 3010).' }
+
+Write-Host "== Waiting up to $healthTimeoutSeconds s for $expected to report healthy" -ForegroundColor Cyan
+$deadline = (Get-Date).AddSeconds($healthTimeoutSeconds)
+$last = 'no answer yet'
+while ((Get-Date) -lt $deadline) {
+    try {
+        $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
+        $last = "version $($health.version), tickAgeSeconds $($health.tickAgeSeconds)"
+        if ($health.version -eq $expected -and $null -ne $health.tickAgeSeconds -and [double]$health.tickAgeSeconds -lt 5) {
+            Write-Host "Healthy: $expected." -ForegroundColor Green
+            exit 0
+        }
+    }
+    catch { $last = $_.Exception.Message }
+    Start-Sleep -Seconds 1
+}
+
+Write-Host "Installed $expected but it is not healthy after $healthTimeoutSeconds s (last: $last). See the Application event log (source ProcessTracker) and $log." -ForegroundColor Red
+Write-Host "To go back to the last release, install its MSI from $releasesUrl" -ForegroundColor Yellow
+exit 1
