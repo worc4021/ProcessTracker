@@ -52,8 +52,9 @@ jobs:
           dotnet test --project tests/ProcessTracker.Cli.Tests/ProcessTracker.Cli.Tests.csproj -c Release -- --filter-class "*DataFolderSetupTests*" 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw "dotnet test failed with exit code $LASTEXITCODE." }
           $text = Get-Content -LiteralPath $log -Raw
+          $text = $text -replace '\x1b\[[0-9;]*m', ''
           if ($text -notmatch 'total:\s*(\d+)' -or [int]$Matches[1] -eq 0) { throw 'No DataFolderSetupTests ran.' }
-          $skipped = @([regex]::Matches($text, '(?m)^(?:\x1b\[[0-9;]*m)*skipped\s+(\S+)') | ForEach-Object { $_.Groups[1].Value })
+          $skipped = @([regex]::Matches($text, '(?m)^skipped\s+(\S+)') | ForEach-Object { $_.Groups[1].Value })
           $expected = 'ProcessTracker.Cli.Tests.Admin.DataFolderSetupTests.Prepare_NotElevated_RefusesAndChangesNothing'
           if ($skipped.Count -ne 1 -or $skipped[0] -ne $expected) {
             throw "Expected only $expected to be skipped (runner not elevated?), saw $($skipped.Count): $($skipped -join ', ')"
