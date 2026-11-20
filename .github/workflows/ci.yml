@@ -23,3 +23,44 @@ jobs:
         run: dotnet build ProcessTracker.slnx -c Release -warnaserror
       - name: Test
         run: dotnet test --solution ProcessTracker.slnx -c Release --no-build -- --filter-not-trait "Category=Perf"
+
+  msi-smoke:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+      - name: Build MSIs
+        run: |
+          $version = (Get-Content -LiteralPath version.txt -Raw).Trim()
+          "VERSION=$version" >> $env:GITHUB_ENV
+          ./scripts/build-msi.ps1 -Configuration Release -OutDir artifacts
+          if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 failed.' }
+          # The upgrade candidate: the same version rebuilt with a dev suffix, in its own folder.
+          ./scripts/build-msi.ps1 -Configuration Release -DevSuffix smoke -OutDir artifacts-smoke
+          if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 (smoke) failed.' }
+      - name: MSI smoke test
+        run: ./scripts/msi-smoke.ps1 -Msi "artifacts\ProcessTracker-$env:VERSION-x64.msi" -UpgradeMsi "artifacts-smoke\ProcessTracker-$env:VERSION-x64.msi" -LogDir "$env:RUNNER_TEMP\msi-smoke"
+      # The runner is elevated, so the elevated-only tests run here instead of skipping.
+      - name: Elevated data folder tests
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'elevated-tests.log'
+          dotnet test --project tests/ProcessTracker.Cli.Tests/ProcessTracker.Cli.Tests.csproj -c Release -- --filter-class "*DataFolderSetupTests*" 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "dotnet test failed with exit code $LASTEXITCODE." }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'total:\s*(\d+)' -or [int]$Matches[1] -eq 0) { throw 'No DataFolderSetupTests ran.' }
+          $skipped = @([regex]::Matches($text, '(?m)^(?:\x1b\[[0-9;]*m)*skipped\s+(\S+)') | ForEach-Object { $_.Groups[1].Value })
+          $unexpected = @($skipped | Where-Object { $_ -notlike '*.Prepare_NotElevated' })
+          if ($unexpected.Count -gt 0) { throw "Elevated-only tests were skipped (runner not elevated?): $($unexpected -join ', ')" }
+          if ($skipped.Count -ne 1) { throw "Expected exactly Prepare_NotElevated to be skipped, saw $($skipped.Count) skipped." }
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: msi-smoke-logs
+          path: ${{ runner.temp }}/msi-smoke
+          if-no-files-found: ignore
