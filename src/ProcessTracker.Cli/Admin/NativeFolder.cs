@@ -16,15 +16,12 @@ public sealed record AceInfo(SecurityIdentifier Sid, int Mask, bool IsAllow);
 internal static class NativeFolder
 {
     private const uint Delete = 0x10000, ReadControl = 0x20000, WriteDac = 0x40000, WriteOwner = 0x80000, FileReadAttributes = 0x80, Synchronize = 0x100000;
-    // No FILE_SHARE_DELETE. Share modes are only checked for handles with data or DELETE access, so the open below
-    // requests DELETE: that is what stops anyone (including us) renaming or replacing the folder while it is held, and
-    // makes the open fail if a user already holds a handle with DELETE.
-    private const uint ShareRead = 1, ShareWrite = 2;
+    private const uint ShareRead = 1, ShareWrite = 2, ShareDelete = 4;
     private const uint OpenExisting = 3;
     private const uint BackupSemantics = 0x02000000, OpenReparsePoint = 0x00200000;
     private const uint OwnerInfo = 1, DaclInfo = 4, ProtectedDacl = 0x80000000;
     private const uint ReparseAttribute = 0x400, DirectoryAttribute = 0x10;
-    public const int ErrorFileNotFound = 2, ErrorPathNotFound = 3, ErrorAlreadyExists = 183, ErrorInsufficientBuffer = 122;
+    public const int ErrorFileNotFound = 2, ErrorPathNotFound = 3, ErrorAccessDenied = 5, ErrorSharingViolation = 32, ErrorAlreadyExists = 183, ErrorInsufficientBuffer = 122;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SecurityAttributes { public int Length; public IntPtr Descriptor; public int InheritHandle; }
@@ -75,11 +72,25 @@ internal static class NativeFolder
         finally { pinned.Free(); }
     }
 
-    /// <summary>Opens the path itself (a link is opened as a link). Null with the Win32 error when it cannot be opened.</summary>
-    public static SafeFileHandle? Open(string path, out int error)
+    /// <summary>
+    /// Opens the path itself (a link is opened as a link) to inspect and re-secure it. No data or DELETE access is
+    /// requested, so share modes are not checked: other programs holding the folder open (a terminal's current
+    /// directory, Explorer) never make this fail. Null with the Win32 error when it cannot be opened.
+    /// </summary>
+    public static SafeFileHandle? OpenForSecurity(string path, out int error) =>
+        OpenPath(path, ReadControl | WriteDac | WriteOwner | FileReadAttributes | Synchronize, ShareRead | ShareWrite | ShareDelete, out error);
+
+    /// <summary>
+    /// Opens the path itself with DELETE access and without share-delete: while held, nobody can rename or replace the
+    /// folder, and the open fails with <see cref="ErrorSharingViolation"/> while another handle with data or DELETE
+    /// access lacks share-delete (for example a terminal whose current directory is the folder) or holds DELETE access.
+    /// </summary>
+    public static SafeFileHandle? OpenLock(string path, out int error) =>
+        OpenPath(path, Delete | FileReadAttributes | Synchronize, ShareRead | ShareWrite, out error);
+
+    private static SafeFileHandle? OpenPath(string path, uint access, uint share, out int error)
     {
-        var handle = CreateFileW(path, Delete | ReadControl | WriteDac | WriteOwner | FileReadAttributes | Synchronize, ShareRead | ShareWrite,
-            IntPtr.Zero, OpenExisting, BackupSemantics | OpenReparsePoint, IntPtr.Zero);
+        var handle = CreateFileW(path, access, share, IntPtr.Zero, OpenExisting, BackupSemantics | OpenReparsePoint, IntPtr.Zero);
         if (handle.IsInvalid)
         {
             error = Marshal.GetLastPInvokeError();
@@ -90,10 +101,21 @@ internal static class NativeFolder
         return handle;
     }
 
+    /// <summary>True when both handles refer to the same file system object (volume serial and file index).</summary>
+    public static bool SameObject(SafeFileHandle a, SafeFileHandle b)
+    {
+        var x = Info(a);
+        var y = Info(b);
+        return x.VolumeSerialNumber == y.VolumeSerialNumber && x.IndexHigh == y.IndexHigh && x.IndexLow == y.IndexLow;
+    }
+
+    private static ByHandleFileInformation Info(SafeFileHandle handle) =>
+        GetFileInformationByHandle(handle, out var info) ? info : throw new Win32Exception(Marshal.GetLastPInvokeError());
+
     /// <summary>True for a real directory: not a link, not a file.</summary>
     public static bool IsPlainDirectory(SafeFileHandle handle)
     {
-        if (!GetFileInformationByHandle(handle, out var info)) throw new Win32Exception(Marshal.GetLastPInvokeError());
+        var info = Info(handle);
         return (info.Attributes & ReparseAttribute) == 0 && (info.Attributes & DirectoryAttribute) != 0;
     }
 
@@ -124,9 +146,6 @@ internal static class NativeFolder
         if (!SetKernelObjectSecurity(handle, OwnerInfo | DaclInfo | ProtectedDacl, descriptor)) throw new Win32Exception(Marshal.GetLastPInvokeError());
     }
 
-    /// <summary>Renames the path itself (a link is renamed, never its target).</summary>
-    public static void Rename(string from, string to)
-    {
-        if (!MoveFileExW(from, to, 0)) throw new Win32Exception(Marshal.GetLastPInvokeError());
-    }
+    /// <summary>Renames the path itself (a link is renamed, never its target). Returns 0 or the Win32 error.</summary>
+    public static int TryRename(string from, string to) => MoveFileExW(from, to, 0) ? 0 : Marshal.GetLastPInvokeError();
 }

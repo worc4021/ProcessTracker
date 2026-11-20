@@ -78,6 +78,37 @@ public sealed class DataFolderSetup(string dataDirArg)
     /// </summary>
     public static bool TryCreateSecured(string path) => NativeFolder.TryCreate(path, BuildSecurity().GetSecurityDescriptorBinaryForm());
 
+    public enum BusyStep { Inspect, Lock, MoveAside }
+    public enum BusyOutcome { Succeeded, Retry, ContinueUnlocked, Fail }
+    public const int BusyTries = 5;
+    private static readonly TimeSpan BusyDelay = TimeSpan.FromMilliseconds(200);
+
+    /// <summary>
+    /// What to do after try <paramref name="attempt"/> (1-based) of <paramref name="step"/> ended with Win32
+    /// <paramref name="error"/> (0 = success). A sharing violation only means another program has the folder open,
+    /// which says nothing about trust: it is retried, then the lock is given up (the folder is already secured, which is
+    /// the real protection) while inspecting or moving aside fails closed. Nothing is ever moved aside because of it.
+    /// </summary>
+    public static BusyOutcome Decide(BusyStep step, int error, int attempt) => error switch
+    {
+        0 => BusyOutcome.Succeeded,
+        NativeFolder.ErrorSharingViolation when attempt < BusyTries => BusyOutcome.Retry,
+        NativeFolder.ErrorSharingViolation when step == BusyStep.Lock => BusyOutcome.ContinueUnlocked,
+        _ => BusyOutcome.Fail,
+    };
+
+    /// <summary>Runs <paramref name="tryOnce"/> (returns 0 or a Win32 error) as <see cref="Decide"/> says, sleeping between retries.</summary>
+    public static BusyOutcome RunWhileBusy(BusyStep step, Func<int> tryOnce, out int error, Action<TimeSpan>? sleep = null)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            error = tryOnce();
+            var outcome = Decide(step, error, attempt);
+            if (outcome != BusyOutcome.Retry) return outcome;
+            (sleep ?? Thread.Sleep)(BusyDelay);
+        }
+    }
+
     public SetupResult Prepare()
     {
         var handles = new List<SafeFileHandle>();
@@ -89,12 +120,12 @@ public sealed class DataFolderSetup(string dataDirArg)
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dataDir))!);
             var notes = new List<string>();
 
-            // Data folder: created secure from birth, or an existing trusted one verified and re-secured through a handle
-            // that stays open (no share-delete) until we are done, or an untrusted one renamed aside.
-            var keptExisting = Acquire(dataDir, moveAside: true, notes, handles);
-            // With the data folder locked only administrators can add entries, so history\ cannot be raced. An
-            // untrusted history\ is therefore an administrator's doing: refuse rather than move things around inside.
-            Acquire(HistoryDir, moveAside: false, notes, handles);
+            // Data folder: created secure from birth, or an existing trusted one re-secured through a handle, or an
+            // untrusted one renamed aside. history\ is left to its own Acquire, so it is walked once.
+            var keptExisting = Acquire(dataDir, moveAside: true, skipChild: "history", notes, handles);
+            // Once the data folder is secured only administrators can add or rename entries in it, so history\ cannot be
+            // raced. An untrusted history\ is therefore an administrator's doing: refuse rather than move things around inside.
+            Acquire(HistoryDir, moveAside: false, skipChild: null, notes, handles);
 
             var readFailed = keptExisting ? CarryOverSettings() : WriteSettings(SettingsCarryOver.Rewrite(null));
             if (readFailed) notes.Add("existing settings could not be read and were reset");
@@ -110,67 +141,97 @@ public sealed class DataFolderSetup(string dataDirArg)
         }
     }
 
+    private static IOException InUse(string path) =>
+        new($"{path} is in use by another program; close it and retry.");
+
     /// <summary>
-    /// Returns true when an existing trusted folder was kept, false when a fresh one was created. Either way a handle
-    /// opened with DELETE access and without share-delete is held (added to <paramref name="handles"/>), so the folder
-    /// cannot be renamed or replaced until Prepare finishes. Residual risk, accepted: a handle with DELETE or WRITE_DAC
-    /// that a user opened before an earlier version took ownership; the DELETE open then fails with a sharing violation
-    /// and the folder is treated as untrusted (moved aside, or exit 1 after the retry bound).
+    /// Returns true when an existing trusted folder was kept, false when a fresh one was created.
+    /// Trust is decided, and the protected DACL and owner applied, through a handle without DELETE access, so other
+    /// programs holding the folder open never get in the way. A trusted folder (Administrators/SYSTEM owner, nobody else
+    /// may add, delete or take over) cannot be renamed, replaced or added to by users: that is the protection.
+    /// A DELETE-access lock handle is then taken as a best effort and held until Prepare ends; it only adds detection of
+    /// a user DELETE handle opened before the folder was secured. While any handle without share-delete is open (a
+    /// terminal in the folder, say) the lock cannot be taken; after <see cref="BusyTries"/> tries Prepare goes on
+    /// without it and says so. Residual risk, accepted: a handle with DELETE or WRITE_DAC that a user opened before the
+    /// folder was secured stays usable (access is checked only at open).
     /// </summary>
-    private static bool Acquire(string path, bool moveAside, List<string> notes, List<SafeFileHandle> handles)
+    private static bool Acquire(string path, bool moveAside, string? skipChild, List<string> notes, List<SafeFileHandle> handles)
     {
         for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
             var created = TryCreateSecured(path);
-            var handle = NativeFolder.Open(path, out var error);
-            if (handle is null && error is NativeFolder.ErrorFileNotFound or NativeFolder.ErrorPathNotFound) continue; // vanished: retry the create
-            if (created)
+            SafeFileHandle? handle = null;
+            var opened = RunWhileBusy(BusyStep.Inspect, () => { handle = NativeFolder.OpenForSecurity(path, out var e); return e; }, out var error);
+            if (opened == BusyOutcome.Fail)
             {
-                if (handle is null) throw new IOException($"Could not open the new folder {path} (Win32 error {error}).");
-                handles.Add(handle);
-                return false;
+                if (error is NativeFolder.ErrorFileNotFound or NativeFolder.ErrorPathNotFound) continue; // vanished: retry the create
+                if (error == NativeFolder.ErrorSharingViolation) throw InUse(path);
+                // We cannot even read or re-secure it (a user-made DACL can lock SYSTEM out): never trusted.
+                if (created || error != NativeFolder.ErrorAccessDenied) throw new IOException($"Could not open {path} (Win32 error {error}).");
             }
-            if (handle is not null)
+
+            using (handle)
             {
-                var keep = false;
-                try
+                if (handle is not null && IsTrusted(handle))
                 {
-                    var (owner, aces) = NativeFolder.ReadSecurity(handle);
-                    if (Classify(owner, !NativeFolder.IsPlainDirectory(handle), aces) == FolderTrust.Trusted)
-                    {
-                        NativeFolder.WriteSecurity(handle, BuildSecurity().GetSecurityDescriptorBinaryForm());
-                        ResetChildren(new DirectoryInfo(path));
-                        handles.Add(handle);
-                        keep = true;
-                        return true;
-                    }
-                }
-                finally
-                {
-                    if (!keep) handle.Dispose();
+                    NativeFolder.WriteSecurity(handle, BuildSecurity().GetSecurityDescriptorBinaryForm());
+                    ResetChildren(new DirectoryInfo(path), skipChild);
+                    TakeLock(path, handle, notes, handles);
+                    return !created;
                 }
             }
 
             if (!moveAside)
-                throw new IOException($"{path} exists but is not trusted (a file or link, not owned by Administrators/SYSTEM, writable by others, or held open by another program); remove it and try again.");
+                throw new IOException($"{path} exists but is not trusted (a file or link, not owned by Administrators/SYSTEM, or writable by others); remove it and try again.");
             var aside = $"{path}.untrusted-{DateTime.Now:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
-            NativeFolder.Rename(path, aside);
-            notes.Add($"{path} was not trusted (file or link, not owned by Administrators/SYSTEM, writable by others, or held open) and was moved to {aside}; its contents were not used");
+            if (RunWhileBusy(BusyStep.MoveAside, () => NativeFolder.TryRename(path, aside), out var renameError) != BusyOutcome.Succeeded)
+            {
+                if (renameError is NativeFolder.ErrorFileNotFound or NativeFolder.ErrorPathNotFound) continue; // vanished: retry the create
+                if (renameError == NativeFolder.ErrorSharingViolation) throw InUse(path);
+                throw new Win32Exception(renameError);
+            }
+            notes.Add($"{path} was not trusted (file or link, not owned by Administrators/SYSTEM, or writable by others) and was moved to {aside}; its contents were not used");
         }
         throw new IOException($"{path} kept being replaced while it was being secured ({MaxAttempts} attempts); stopped.");
     }
 
+    private static bool IsTrusted(SafeFileHandle handle)
+    {
+        var (owner, aces) = NativeFolder.ReadSecurity(handle);
+        return Classify(owner, !NativeFolder.IsPlainDirectory(handle), aces) == FolderTrust.Trusted;
+    }
+
+    /// <summary>Best-effort DELETE lock on the folder already secured through <paramref name="secured"/> (see <see cref="Acquire"/>).</summary>
+    private static void TakeLock(string path, SafeFileHandle secured, List<string> notes, List<SafeFileHandle> handles)
+    {
+        SafeFileHandle? lockHandle = null;
+        var outcome = RunWhileBusy(BusyStep.Lock, () => { lockHandle = NativeFolder.OpenLock(path, out var e); return e; }, out var error);
+        if (outcome == BusyOutcome.ContinueUnlocked)
+        {
+            notes.Add($"could not take an exclusive lock on {path}; another program has the folder open");
+            return;
+        }
+        if (outcome != BusyOutcome.Succeeded) throw new IOException($"Could not lock {path} (Win32 error {error}).");
+        if (!NativeFolder.SameObject(lockHandle!, secured))
+        {
+            lockHandle!.Dispose();
+            throw new IOException($"{path} was replaced while it was being secured; stopped.");
+        }
+        handles.Add(lockHandle!);
+    }
+
     /// <summary>
     /// SetKernelObjectSecurity does not propagate: existing children keep explicit ACEs and owners. Reset each (never
-    /// following links) to inherit-only with owner Administrators. The folder is locked by now, so only administrators
-    /// can add or swap entries.
+    /// following links) to inherit-only with owner Administrators. The folder is secured by now, so only administrators
+    /// can add or swap entries. <paramref name="skipChild"/> (top level only) is left to its own Acquire.
     /// </summary>
-    private static void ResetChildren(DirectoryInfo dir)
+    private static void ResetChildren(DirectoryInfo dir, string? skipChild = null)
     {
         var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
         foreach (var entry in dir.EnumerateFileSystemInfos("*", new EnumerationOptions { AttributesToSkip = 0 }).ToList())
         {
             if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint) || entry.LinkTarget is not null) continue;
+            if (skipChild is not null && string.Equals(entry.Name, skipChild, StringComparison.OrdinalIgnoreCase)) continue;
             if (entry is DirectoryInfo sub)
             {
                 var ds = new DirectorySecurity();
@@ -194,6 +255,8 @@ public sealed class DataFolderSetup(string dataDirArg)
         if (!purge) return new SetupResult(true, $"Kept {dataDir} (use --purge to delete it).");
         try
         {
+            if (File.Exists(dataDir))
+                return new SetupResult(false, $"{dataDir} is a file, not a folder; remove it yourself. Nothing was deleted.");
             foreach (var dir in new[] { dataDir, HistoryDir })
             {
                 var info = new DirectoryInfo(dir);
@@ -203,12 +266,11 @@ public sealed class DataFolderSetup(string dataDirArg)
             if (Directory.Exists(dataDir))
             {
                 // Never walk a tree a user could still modify: the folder must pass the same trust check as in Prepare.
-                using (var handle = NativeFolder.Open(dataDir, out var error))
+                using (var handle = NativeFolder.OpenForSecurity(dataDir, out var error))
                 {
                     if (handle is null)
                         return new SetupResult(false, $"Could not open {dataDir} to verify it (Win32 error {error}). Nothing was deleted.");
-                    var (owner, aces) = NativeFolder.ReadSecurity(handle);
-                    if (Classify(owner, !NativeFolder.IsPlainDirectory(handle), aces) != FolderTrust.Trusted)
+                    if (!IsTrusted(handle))
                         return new SetupResult(false, $"{dataDir} is not trusted (not owned by Administrators/SYSTEM, or writable by others); delete it yourself. Nothing was deleted.");
                 }
                 DeleteTree(new DirectoryInfo(dataDir));
@@ -223,7 +285,7 @@ public sealed class DataFolderSetup(string dataDirArg)
 
     /// <summary>
     /// Deletes a tree without ever following a link: link entries are removed as links. Safety against a link being
-    /// swapped in mid-delete relies on the folder being locked by Prepare (only administrators can add children).
+    /// swapped in mid-delete relies on the folder being trusted (only administrators can add or rename children).
     /// </summary>
     private static void DeleteTree(DirectoryInfo dir)
     {

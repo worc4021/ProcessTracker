@@ -214,7 +214,7 @@ public sealed class DataFolderSetupTests : IDisposable
     [Fact]
     public void Remove_WithPurge_NestedJunction_TargetKept()
     {
-        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned, locked) folder, which needs elevation.");
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned) folder, which needs elevation.");
         var target = Path.Combine(_root, "target");
         Directory.CreateDirectory(target);
         File.WriteAllText(Path.Combine(target, "keep.txt"), "x");
@@ -283,7 +283,7 @@ public sealed class DataFolderSetupTests : IDisposable
     [Fact]
     public void Remove_WithPurge_DeletesTrustedFolder()
     {
-        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned, locked) folder, which needs elevation.");
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned) folder, which needs elevation.");
         CreateTrustedDataDir();
         Directory.CreateDirectory(Path.Combine(DataDir, "history"));
         File.WriteAllText(Path.Combine(DataDir, "state.db"), "x");
@@ -324,5 +324,126 @@ public sealed class DataFolderSetupTests : IDisposable
     public void Remove_MissingFolder_IsOk()
     {
         Assert.True(new DataFolderSetup(DataDir).Remove(purge: true).Ok);
+    }
+
+    [Fact]
+    public void Remove_WithPurge_PathIsAFile_RefusedAndKept()
+    {
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(DataDir, "x");
+
+        var result = new DataFolderSetup(DataDir).Remove(purge: true);
+
+        Assert.False(result.Ok);
+        Assert.Contains("not a folder", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.True(File.Exists(DataDir));
+    }
+
+    [Fact]
+    public void Prepare_TrustedFolder_ResetsChildAcls_AndDoesNotFollowChildJunction()
+    {
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned) folder, which needs elevation.");
+
+        var target = Path.Combine(_root, "target");
+        Directory.CreateDirectory(target);
+        CreateTrustedDataDir();
+        var targetBefore = new DirectoryInfo(target).GetAccessControl().GetSecurityDescriptorSddlForm(AccessControlSections.Access | AccessControlSections.Owner);
+        MakeJunction(Path.Combine(DataDir, "linked"), target);
+
+        var me = WindowsIdentity.GetCurrent().User!;
+        var child = Path.Combine(DataDir, "state.db");
+        File.WriteAllText(child, "x");
+        var planted = new FileInfo(child).GetAccessControl();
+        planted.SetOwner(me);
+        planted.AddAccessRule(new FileSystemAccessRule(Everyone, FileSystemRights.FullControl, AccessControlType.Allow));
+        new FileInfo(child).SetAccessControl(planted);
+
+        var result = new DataFolderSetup(DataDir).Prepare();
+
+        Assert.True(result.Ok, result.Message);
+        var reset = new FileInfo(child).GetAccessControl();
+        Assert.Equal(Admins, reset.GetOwner(typeof(SecurityIdentifier)));
+        Assert.DoesNotContain(reset.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>(),
+            r => r.IdentityReference == Everyone);
+        var targetAfter = new DirectoryInfo(target).GetAccessControl().GetSecurityDescriptorSddlForm(AccessControlSections.Access | AccessControlSections.Owner);
+        Assert.Equal(targetBefore, targetAfter);
+    }
+
+    [Theory]
+    [InlineData(DataFolderSetup.BusyStep.Inspect)]
+    [InlineData(DataFolderSetup.BusyStep.Lock)]
+    [InlineData(DataFolderSetup.BusyStep.MoveAside)]
+    public void Decide_SharingViolation_RetriesBeforeTheLastTry(DataFolderSetup.BusyStep step)
+    {
+        for (var attempt = 1; attempt < DataFolderSetup.BusyTries; attempt++)
+            Assert.Equal(DataFolderSetup.BusyOutcome.Retry, DataFolderSetup.Decide(step, ErrorSharingViolation, attempt));
+    }
+
+    [Fact]
+    public void Decide_SharingViolationOnLastTry_LockContinuesUnlocked_OthersFail()
+    {
+        Assert.Equal(5, DataFolderSetup.BusyTries);
+        Assert.Equal(DataFolderSetup.BusyOutcome.ContinueUnlocked, DataFolderSetup.Decide(DataFolderSetup.BusyStep.Lock, ErrorSharingViolation, 5));
+        Assert.Equal(DataFolderSetup.BusyOutcome.Fail, DataFolderSetup.Decide(DataFolderSetup.BusyStep.MoveAside, ErrorSharingViolation, 5));
+        Assert.Equal(DataFolderSetup.BusyOutcome.Fail, DataFolderSetup.Decide(DataFolderSetup.BusyStep.Inspect, ErrorSharingViolation, 5));
+    }
+
+    [Theory]
+    [InlineData(DataFolderSetup.BusyStep.Inspect)]
+    [InlineData(DataFolderSetup.BusyStep.Lock)]
+    [InlineData(DataFolderSetup.BusyStep.MoveAside)]
+    public void Decide_SuccessAndOtherErrors_AreNotRetried(DataFolderSetup.BusyStep step)
+    {
+        Assert.Equal(DataFolderSetup.BusyOutcome.Succeeded, DataFolderSetup.Decide(step, 0, 1));
+        Assert.Equal(DataFolderSetup.BusyOutcome.Fail, DataFolderSetup.Decide(step, 5 /*ACCESS_DENIED*/, 1));
+        Assert.Equal(DataFolderSetup.BusyOutcome.Fail, DataFolderSetup.Decide(step, 2 /*FILE_NOT_FOUND*/, 1));
+    }
+
+    private const int ErrorSharingViolation = 32;
+
+    [Fact]
+    public void RunWhileBusy_LockAlwaysBusy_TriesFiveTimes200MsApart_ThenContinuesUnlocked()
+    {
+        var tries = 0;
+        var sleeps = new List<TimeSpan>();
+
+        var outcome = DataFolderSetup.RunWhileBusy(DataFolderSetup.BusyStep.Lock, () => { tries++; return ErrorSharingViolation; }, out var error, sleeps.Add);
+
+        Assert.Equal(DataFolderSetup.BusyOutcome.ContinueUnlocked, outcome);
+        Assert.Equal(ErrorSharingViolation, error);
+        Assert.Equal(5, tries);
+        Assert.Equal(Enumerable.Repeat(TimeSpan.FromMilliseconds(200), 4), sleeps);
+    }
+
+    [Fact]
+    public void RunWhileBusy_MoveAsideAlwaysBusy_Fails()
+    {
+        var tries = 0;
+        var outcome = DataFolderSetup.RunWhileBusy(DataFolderSetup.BusyStep.MoveAside, () => { tries++; return ErrorSharingViolation; }, out _, _ => { });
+
+        Assert.Equal(DataFolderSetup.BusyOutcome.Fail, outcome);
+        Assert.Equal(5, tries);
+    }
+
+    [Fact]
+    public void RunWhileBusy_BusyThenFree_Succeeds()
+    {
+        var tries = 0;
+        var outcome = DataFolderSetup.RunWhileBusy(DataFolderSetup.BusyStep.Lock, () => ++tries < 3 ? ErrorSharingViolation : 0, out var error, _ => { });
+
+        Assert.Equal(DataFolderSetup.BusyOutcome.Succeeded, outcome);
+        Assert.Equal(0, error);
+        Assert.Equal(3, tries);
+    }
+
+    [Fact]
+    public void RunWhileBusy_OtherError_StopsAtOnce()
+    {
+        var tries = 0;
+        var outcome = DataFolderSetup.RunWhileBusy(DataFolderSetup.BusyStep.Lock, () => { tries++; return 5; }, out var error, _ => { });
+
+        Assert.Equal(DataFolderSetup.BusyOutcome.Fail, outcome);
+        Assert.Equal(5, error);
+        Assert.Equal(1, tries);
     }
 }
