@@ -100,7 +100,7 @@ public static class RestEndpoints
 
     /// <summary>
     /// A session (<paramref name="unit"/>) or process (<paramref name="key"/>) series. The range defaults to the
-    /// 30 minutes before <paramref name="to"/> (default now) and is clamped to [now - retention, now].
+    /// 30 minutes before <paramref name="to"/> (default now); both ends are clamped to [now - retention, now].
     /// </summary>
     public static IResult History(
         ITrackerHost host, TimeSpan retention, DateTime now, string? unit, string? key, string? from, string? to)
@@ -108,14 +108,17 @@ public static class RestEndpoints
         if ((unit is null) == (key is null)) return TypedResults.BadRequest("specify exactly one of unit or key");
         ProcessKey processKey = default;
         if (key is not null && !ProcessKey.TryParse(key, out processKey)) return TypedResults.BadRequest("key must be pid@ticks");
-        if (!TryParseUtc(to, now, out var toUtc) || !TryParseUtc(from, toUtc - DefaultHistoryWindow, out var fromUtc))
+        if (!TryParseUtc(to, out var toArg) || !TryParseUtc(from, out var fromArg))
             return TypedResults.BadRequest("from and to must be ISO-8601 timestamps");
+        var toUtc = toArg ?? now;
+        var fromUtc = fromArg ?? (toUtc.Ticks > DefaultHistoryWindow.Ticks ? toUtc - DefaultHistoryWindow : MinUtc);
         if (fromUtc > toUtc) return TypedResults.BadRequest("from must not be after to");
 
+        // Clamp both ends into the retention window; a range entirely outside it becomes an empty instant.
         var floor = now - retention;
-        if (fromUtc < floor) fromUtc = floor;
-        if (toUtc > now) toUtc = now;
-        IEnumerable<SegmentRecord> Records() => fromUtc <= toUtc ? host.History(fromUtc, toUtc) : [];
+        fromUtc = Clamp(fromUtc, floor, now);
+        toUtc = Clamp(toUtc, floor, now);
+        IEnumerable<SegmentRecord> Records() => host.History(fromUtc, toUtc);
         var view = host.View;
 
         if (unit is not null)
@@ -152,14 +155,18 @@ public static class RestEndpoints
         return TypedResults.Ok(new HistorySeriesDto(null, processKey.ToString(), name, fromUtc, toUtc, processPoints));
     }
 
-    private static bool TryParseUtc(string? s, DateTime fallback, out DateTime utc)
+    private static readonly DateTime MinUtc = new(0, DateTimeKind.Utc);
+
+    private static DateTime Clamp(DateTime t, DateTime min, DateTime max) => t < min ? min : t > max ? max : t;
+
+    private static bool TryParseUtc(string? s, out DateTime? utc)
     {
-        if (string.IsNullOrWhiteSpace(s))
-        {
-            utc = fallback;
-            return true;
-        }
-        return DateTime.TryParse(s, CultureInfo.InvariantCulture,
-            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out utc);
+        utc = null;
+        if (string.IsNullOrWhiteSpace(s)) return true;
+        if (!DateTime.TryParse(s, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+            return false;
+        utc = parsed;
+        return true;
     }
 }

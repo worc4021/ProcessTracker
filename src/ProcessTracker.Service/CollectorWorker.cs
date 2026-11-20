@@ -1,8 +1,8 @@
 namespace ProcessTracker.Service;
 
 /// <summary>
-/// Drives the tracker: one <see cref="TrackerHost.Restore"/>, then a tick every 2 s. On stop it waits for the
-/// in-flight tick, then disposes the host, which flushes the segment writer and closes the state store.
+/// Drives the tracker: one <see cref="TrackerHost.Restore"/>, then a tick every 2 s. On stop it waits (bounded) for
+/// the in-flight tick, then disposes the host, which flushes the segment writer and closes the state store.
 /// </summary>
 public sealed class CollectorWorker(TrackerHost host, TimeProvider time, ILogger<CollectorWorker> log) : BackgroundService
 {
@@ -45,21 +45,30 @@ public sealed class CollectorWorker(TrackerHost host, TimeProvider time, ILogger
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        await base.StopAsync(cancellationToken);
-
-        // base.StopAsync gives up when the host's shutdown token fires; the tracker must not be disposed mid-tick.
-        if (ExecuteTask is { IsCompleted: false } loop)
+        try
         {
-            try { await loop.WaitAsync(InFlightTickWait, CancellationToken.None); }
-            catch (TimeoutException)
-            {
-                log.LogError("Collector tick still running after {Seconds} s; state not flushed", InFlightTickWait.TotalSeconds);
-                return;
-            }
+            await base.StopAsync(cancellationToken);
         }
+        finally
+        {
+            // base.StopAsync gives up when the host's shutdown token fires; give the in-flight tick a bounded wait.
+            if (ExecuteTask is { IsCompleted: false } loop)
+            {
+                try { await loop.WaitAsync(InFlightTickWait, CancellationToken.None); }
+                catch (TimeoutException)
+                {
+                    log.LogError("Collector tick still running after {Seconds} s", InFlightTickWait.TotalSeconds);
+                }
+                catch (Exception e) when (IsNonFatal(e))
+                {
+                    log.LogError(e, "Collector loop failed");
+                }
+            }
 
-        host.Dispose();
-        log.LogInformation("Collector stopped; history and state flushed");
+            // A faulted loop still gets flushed. Dispose itself refuses to run while a tick is in flight.
+            host.Dispose();
+            log.LogInformation("Collector stopped");
+        }
     }
 
     private static bool IsNonFatal(Exception e) => e is not (OutOfMemoryException or AccessViolationException);

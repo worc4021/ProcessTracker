@@ -9,6 +9,8 @@ public sealed class ServiceOptions
     public const int ProductionPort = 47811;
     public const int DevPort = 47812;
     private const double MinRetentionHours = 2;
+    private const double MaxRetentionHours = 24 * 30;
+    private const double MaxOrphanIdleAlertMinutes = 7 * 24 * 60;
 
     /// <summary>Loopback port; 0 means the mode default (47811, or 47812 with --dev).</summary>
     public int Port { get; set; }
@@ -27,6 +29,18 @@ public sealed class ServiceOptions
     public TimeSpan Retention => TimeSpan.FromHours(Math.Max(MinRetentionHours, RetentionHours));
 
     public TimeSpan OrphanIdleAlert => TimeSpan.FromMinutes(OrphanIdleAlertMinutes);
+
+    /// <summary>Problems with the resolved values; empty when the options are usable.</summary>
+    public IReadOnlyList<string> Validate()
+    {
+        var errors = new List<string>();
+        if (Port is < 1 or > 65535) errors.Add($"Port must be 1-65535 (was {Port})");
+        if (!double.IsFinite(RetentionHours) || RetentionHours <= 0 || RetentionHours > MaxRetentionHours)
+            errors.Add($"RetentionHours must be > 0 and <= {MaxRetentionHours} (was {RetentionHours}); values below {MinRetentionHours} are raised to {MinRetentionHours}");
+        if (!double.IsFinite(OrphanIdleAlertMinutes) || OrphanIdleAlertMinutes <= 0 || OrphanIdleAlertMinutes > MaxOrphanIdleAlertMinutes)
+            errors.Add($"OrphanIdleAlertMinutes must be > 0 and <= {MaxOrphanIdleAlertMinutes} (was {OrphanIdleAlertMinutes})");
+        return errors;
+    }
 
     public static ServiceOptions Resolve(IConfiguration config, bool dev)
     {

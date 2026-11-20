@@ -1,11 +1,15 @@
 using System.Diagnostics;
 using System.Net;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using ProcessTracker.Core.Contracts;
 using ProcessTracker.Service;
 using ProcessTracker.Service.Api;
 
 // Flags: --console (run as a console app instead of a Windows service) and --dev (port 47812, dev data dir,
 // no single-instance mutex). Both are also accepted as configuration keys Console/Dev, e.g. "--Dev=true".
+// Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running,
+// 3 the server ended up listening on a non-loopback address.
 var configArgs = args.Select(a => a switch
 {
     "--dev" => "--Dev=true",
@@ -13,8 +17,17 @@ var configArgs = args.Select(a => a switch
     _ => a,
 }).ToArray();
 var mode = new ConfigurationBuilder().AddCommandLine(configArgs).Build();
+
+// The API is unauthenticated and runs as SYSTEM, so no configuration may add or replace listeners. The command line
+// is re-emitted without listener keys (the host reads urls etc. from the arguments it is created with), a last
+// configuration source blanks them for the JSON files, Kestrel's own "Kestrel" section is ignored, and a startup
+// check stops the host if it is listening anywhere but loopback anyway.
+var hostArgs = mode.AsEnumerable()
+    .Where(kv => kv.Value is not null && !LoopbackGuard.IsListenerKey(kv.Key))
+    .Select(kv => $"--{kv.Key}={kv.Value}")
+    .ToArray();
 var dev = mode.GetValue<bool>("Dev");
-var console = mode.GetValue<bool>("Console");
+var asConsole = mode.GetValue<bool>("Console");
 
 using var mutex = dev ? null : SingleInstance.TryAcquire();
 if (!dev && mutex is null)
@@ -25,7 +38,7 @@ if (!dev && mutex is null)
 
 try
 {
-    var builder = WebApplication.CreateBuilder(configArgs);
+    var builder = WebApplication.CreateBuilder(hostArgs);
 
     // Configuration: appsettings.json next to the exe, then %ProgramData%\ProcessTracker\appsettings.json
     // (production only), then the command line.
@@ -38,12 +51,28 @@ try
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ProcessTracker", "appsettings.json"),
             optional: true, reloadOnChange: false);
     }
-    config.AddCommandLine(configArgs);
+    config.AddCommandLine(hostArgs);
+    config.AddInMemoryCollection(LoopbackGuard.NeutralizedHostingKeys);
 
-    var options = ServiceOptions.Resolve(config, dev);
+    ServiceOptions options;
+    try { options = ServiceOptions.Resolve(config, dev); }
+    catch (InvalidOperationException e) // a value that does not convert, e.g. RetentionHours=abc
+    {
+        Console.Error.WriteLine("Invalid configuration: " + e.Message);
+        return 1;
+    }
+    if (options.Validate() is { Count: > 0 } errors)
+    {
+        Console.Error.WriteLine("Invalid configuration: " + string.Join("; ", errors));
+        return 1;
+    }
 
-    if (!console) builder.Services.AddWindowsService(o => o.ServiceName = "ProcessTracker");
-    builder.WebHost.ConfigureKestrel(k => k.Listen(IPAddress.Loopback, options.Port));
+    if (!asConsole) builder.Services.AddWindowsService(o => o.ServiceName = "ProcessTracker");
+    builder.WebHost.ConfigureKestrel(k =>
+    {
+        k.Configure(new ConfigurationBuilder().Build(), reloadOnChange: false); // drop Kestrel:Endpoints etc.
+        k.Listen(IPAddress.Loopback, options.Port);
+    });
     builder.Services.ConfigureHttpJsonOptions(o => ContractJson.Configure(o.SerializerOptions));
 
     builder.Services.AddSingleton(options);
@@ -56,11 +85,28 @@ try
     var app = builder.Build();
     app.MapRestEndpoints();
 
+    // Fail fast if the server is listening anywhere but loopback, and log what it actually bound.
+    var exposed = false;
+    app.Lifetime.ApplicationStarted.Register(() =>
+    {
+        var addresses = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()?.Addresses
+                        ?? (ICollection<string>)[];
+        if (addresses.FirstOrDefault(a => !LoopbackGuard.IsLoopback(a)) is { } bad)
+        {
+            exposed = true;
+            app.Logger.LogCritical("Listening on non-loopback address {Address} (all: {Addresses}); stopping",
+                bad, string.Join(", ", addresses));
+            app.Lifetime.StopApplication();
+            return;
+        }
+        app.Logger.LogInformation("ProcessTracker {Version} listening on {Addresses}, data in {DataDir}, GC heap limit {HeapMb} MB{Dev}",
+            RestEndpoints.Version, string.Join(", ", addresses), options.DataDir,
+            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20, dev ? " (dev)" : "");
+    });
+
     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
-    app.Logger.LogInformation("ProcessTracker {Version} listening on 127.0.0.1:{Port}, data in {DataDir}, GC heap limit {HeapMb} MB{Dev}",
-        RestEndpoints.Version, options.Port, options.DataDir, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20, dev ? " (dev)" : "");
     app.Run(); // synchronous, so the mutex is released on the thread that acquired it
-    return 0;
+    return exposed ? 3 : 0;
 }
 finally
 {
@@ -88,6 +134,35 @@ internal static class SingleInstance
         }
         m.Dispose();
         return null;
+    }
+}
+
+/// <summary>Keeps the API on loopback whatever the configuration says.</summary>
+public static class LoopbackGuard
+{
+    /// <summary>Host settings that could add or replace listeners, forced to harmless values.</summary>
+    public static IReadOnlyDictionary<string, string?> NeutralizedHostingKeys { get; } = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["urls"] = "",
+        ["preferHostingUrls"] = "false",
+        ["http_ports"] = "",
+        ["https_ports"] = "",
+    };
+
+    /// <summary>True for configuration keys that configure listeners: the hosting URL keys and Kestrel's section.</summary>
+    public static bool IsListenerKey(string key) =>
+        NeutralizedHostingKeys.ContainsKey(key)
+        || key.Equals("Kestrel", StringComparison.OrdinalIgnoreCase)
+        || key.StartsWith("Kestrel:", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when a server address (e.g. "http://127.0.0.1:47811") is a loopback address or "localhost".</summary>
+    public static bool IsLoopback(string address)
+    {
+        string host;
+        try { host = BindingAddress.Parse(address).Host; }
+        catch (FormatException) { return false; }
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        return IPAddress.TryParse(host.Trim('[', ']'), out var ip) && IPAddress.IsLoopback(ip);
     }
 }
 

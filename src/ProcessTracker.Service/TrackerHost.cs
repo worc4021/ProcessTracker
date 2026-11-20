@@ -26,11 +26,17 @@ public interface ITrackerHost
 /// </summary>
 public sealed class TrackerHost : ITrackerHost, IDisposable
 {
+    private static readonly TimeSpan DisposeWait = TimeSpan.FromSeconds(5);
+
     private readonly Tracker _tracker;
     private readonly string _historyDir;
+    private readonly ILogger<TrackerHost> _log;
+    private readonly object _tickGate = new(); // held by Restore/Tick, so Dispose never runs mid-tick
+    private bool _disposed;
 
-    public TrackerHost(ServiceOptions options, TimeProvider time, ILogger<Tracker> log)
+    public TrackerHost(ServiceOptions options, TimeProvider time, ILogger<Tracker> log, ILogger<TrackerHost> hostLog)
     {
+        _log = hostLog;
         _tracker = new Tracker(new NtSnapshotSource(), new PebProcessInspector(), new TrackerOptions
         {
             DataDir = options.DataDir,
@@ -46,9 +52,18 @@ public sealed class TrackerHost : ITrackerHost, IDisposable
 
     public TrackerView View => _tracker.View;
 
-    public void Restore() => _tracker.Restore();
+    public void Restore()
+    {
+        lock (_tickGate)
+            if (!_disposed) _tracker.Restore();
+    }
 
-    public void Tick() => _tracker.Tick();
+    /// <summary>Runs one tick; does nothing once disposed.</summary>
+    public void Tick()
+    {
+        lock (_tickGate)
+            if (!_disposed) _tracker.Tick();
+    }
 
     public IReadOnlyList<TickFrame> Recent(int n)
     {
@@ -82,6 +97,26 @@ public sealed class TrackerHost : ITrackerHost, IDisposable
 
     public void RecordKill(KillAudit a) => _tracker.State.RecordKill(a);
 
-    /// <summary>Flushes history segments and closes the state store. Idempotent.</summary>
-    public void Dispose() => _tracker.Dispose();
+    /// <summary>
+    /// Flushes history segments and closes the state store. Idempotent. Waits up to 5 s for an in-flight tick and
+    /// refuses (leaving the tracker open) if it is still running, since disposing mid-tick would corrupt its state.
+    /// </summary>
+    public void Dispose()
+    {
+        if (!Monitor.TryEnter(_tickGate, DisposeWait))
+        {
+            _log.LogError("A tick is still running after {Seconds} s; history and state not flushed", DisposeWait.TotalSeconds);
+            return;
+        }
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _tracker.Dispose();
+        }
+        finally
+        {
+            Monitor.Exit(_tickGate);
+        }
+    }
 }

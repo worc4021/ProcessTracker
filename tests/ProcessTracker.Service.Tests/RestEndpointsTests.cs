@@ -188,19 +188,87 @@ public sealed class RestEndpointsTests : IDisposable
     }
 
     [Fact]
-    public async Task ListensOnLoopbackOnly()
+    public async Task History_RangeBeforeRetention_IsEmptyNot500()
+    {
+        _app.Tracker.View = View(T0, [], Session(UnitA));
+        var ct = TestContext.Current.CancellationToken;
+
+        var response = await _http.GetAsync($"/api/history?unit={UnitA}&to=0001-01-01T00:00:00Z", ct);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var series = await response.Content.ReadFromJsonAsync<HistorySeriesDto>(ContractJson.Options, ct);
+        Assert.NotNull(series);
+        Assert.Empty(series.Points);
+        Assert.Equal(T0.AddHours(-24), series.FromUtc);
+        Assert.Equal(T0.AddHours(-24), series.ToUtc);
+
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await _http.GetAsync("/api/history?key=1@2&to=0001-01-01T00:10:00Z", ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await _http.GetAsync($"/api/history?unit={UnitA}&from=2026-11-20T12:00:00Z&to=2026-11-20T11:00:00Z", ct)).StatusCode);
+    }
+
+    [Fact]
+    public Task ListensOnLoopbackOnly() =>
+        RunRealHostAsync([], allowExit: false, (lan, port) => AssertRefusedAsync(lan, port));
+
+    [Fact]
+    public Task ConfiguredKestrelEndpoint_CannotWidenBinding()
+    {
+        var extra = FreePort();
+        return RunRealHostAsync([$"--Kestrel:Endpoints:Lan:Url=http://0.0.0.0:{extra}"], allowExit: true, async (lan, port) =>
+        {
+            await AssertRefusedAsync(lan, port);
+            await AssertRefusedAsync(lan, extra);
+        });
+    }
+
+    [Fact]
+    public Task HostingUrls_CannotWidenBinding()
+    {
+        var extra = FreePort();
+        return RunRealHostAsync(["--urls", $"http://0.0.0.0:{extra}", "--preferHostingUrls", "true"], allowExit: true,
+            async (lan, port) =>
+            {
+                await AssertRefusedAsync(lan, port);
+                await AssertRefusedAsync(lan, extra);
+            });
+    }
+
+    private static int FreePort()
+    {
+        using var l = new TcpListener(IPAddress.Loopback, 0);
+        l.Start();
+        return ((IPEndPoint)l.LocalEndpoint).Port;
+    }
+
+    private static async Task AssertRefusedAsync(IPAddress lan, int port)
+    {
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        var refused = await Assert.ThrowsAsync<SocketException>(
+            async () => await socket.ConnectAsync(new IPEndPoint(lan, port), TestContext.Current.CancellationToken));
+        Assert.Equal(SocketError.ConnectionRefused, refused.SocketErrorCode);
+    }
+
+    /// <summary>
+    /// Starts the real exe with --console --dev on a free port and a temp data dir, waits until 127.0.0.1 answers,
+    /// then runs <paramref name="assertLan"/> against the machine's first LAN IPv4 address (skipped, with a message,
+    /// when there is none). With <paramref name="allowExit"/>, a host that refuses to run (non-zero exit) also passes.
+    /// </summary>
+    private static async Task RunRealHostAsync(string[] extraArgs, bool allowExit, Func<IPAddress, int, Task> assertLan)
     {
         var ct = TestContext.Current.CancellationToken;
+        var port = FreePort();
         var exe = Path.Combine(AppContext.BaseDirectory, "ProcessTracker.Service.exe");
         var dataDir = Path.Combine(Path.GetTempPath(), "ProcessTracker-test-" + Guid.NewGuid().ToString("N"));
         var psi = new ProcessStartInfo(exe)
         {
-            ArgumentList = { "--console", "--dev", "--DataDir", dataDir },
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+        foreach (var a in (string[])["--console", "--dev", "--DataDir", dataDir, "--Port", port.ToString(), .. extraArgs])
+            psi.ArgumentList.Add(a);
         var output = new System.Collections.Concurrent.ConcurrentQueue<string>();
         using var host = Process.Start(psi)!;
         host.OutputDataReceived += (_, e) => { if (e.Data is not null) output.Enqueue(e.Data); };
@@ -214,12 +282,18 @@ public sealed class RestEndpointsTests : IDisposable
             var deadline = DateTime.UtcNow.AddSeconds(30);
             while (!answered && DateTime.UtcNow < deadline && !host.HasExited)
             {
-                try { answered = (await http.GetAsync($"http://127.0.0.1:{ServiceOptions.DevPort}/api/health", ct)).IsSuccessStatusCode; }
+                try { answered = (await http.GetAsync($"http://127.0.0.1:{port}/api/health", ct)).IsSuccessStatusCode; }
                 catch (HttpRequestException) { }
+                catch (TaskCanceledException) when (!ct.IsCancellationRequested) { } // probe timed out
                 if (!answered) await Task.Delay(250, ct);
             }
+            if (allowExit && host.HasExited)
+            {
+                Assert.NotEqual(0, host.ExitCode);
+                return;
+            }
             Assert.True(answered, "127.0.0.1 did not answer. Host output:\n" + string.Join("\n", output));
-            Assert.False(host.HasExited, "the dev host exited (port taken by another instance?)");
+            Assert.False(host.HasExited, "the dev host exited. Host output:\n" + string.Join("\n", output));
 
             var lan = NetworkInterface.GetAllNetworkInterfaces()
                 .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
@@ -232,10 +306,7 @@ public sealed class RestEndpointsTests : IDisposable
                 return;
             }
 
-            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            var refused = await Assert.ThrowsAsync<SocketException>(
-                async () => await socket.ConnectAsync(new IPEndPoint(lan, ServiceOptions.DevPort), ct));
-            Assert.Equal(SocketError.ConnectionRefused, refused.SocketErrorCode);
+            await assertLan(lan, port);
         }
         finally
         {
