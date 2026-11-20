@@ -32,7 +32,6 @@ public sealed class UpgradeTask(IProcessRunner runner)
                 new XElement(Ns + "Principals",
                     new XElement(Ns + "Principal", new XAttribute("id", "Author"),
                         new XElement(Ns + "UserId", "S-1-5-18"),
-                        new XElement(Ns + "LogonType", "ServiceAccount"),
                         new XElement(Ns + "RunLevel", "HighestAvailable"))),
                 new XElement(Ns + "Settings",
                     new XElement(Ns + "MultipleInstancesPolicy", "IgnoreNew"),
