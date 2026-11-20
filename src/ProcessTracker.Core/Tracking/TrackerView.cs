@@ -1,4 +1,4 @@
-using System.Collections.Frozen;
+using System.Collections.ObjectModel;
 using ProcessTracker.Core.Activity;
 using ProcessTracker.Core.Model;
 using ProcessTracker.Core.Orphans;
@@ -22,5 +22,5 @@ public sealed record TrackerView(
     IReadOnlyList<SessionView> Sessions)
 {
     public static TrackerView Empty { get; } =
-        new(DateTime.MinValue, default, FrozenDictionary<ProcessKey, ProcessView>.Empty, Array.Empty<SessionView>());
+        new(DateTime.MinValue, default, ReadOnlyDictionary<ProcessKey, ProcessView>.Empty, Array.Empty<SessionView>());
 }

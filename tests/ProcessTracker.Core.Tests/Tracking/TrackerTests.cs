@@ -179,6 +179,105 @@ public sealed class TrackerTests : IDisposable
     }
 
     [Fact]
+    public void Tick_LiveCountersPersistedEvery30s_RecordsEveryTick()
+    {
+        AddAnchor();
+        var matlab = _src.Add(11, 200, 10, "MATLAB.exe", cpuTicks: 1_000);
+        var t = NewTracker();
+        t.Tick();
+        Assert.Equal(T0, t.State.Load().LastTickUtc);
+
+        // Ticks inside the 30 s window: new records are saved at once, counters and last tick are not.
+        Step();
+        _src.SetCpu(matlab, 2_000);
+        var late = _src.Add(12, 300, 10, "cmd.exe");
+        t.Tick();
+        var st = t.State.Load();
+        Assert.Equal(T0, st.LastTickUtc);
+        Assert.Equal(1_000, st.Live[matlab].Counters.KernelTime + st.Live[matlab].Counters.UserTime);
+        Assert.Contains(st.Processes, r => r.Key == late);
+        Assert.False(st.Live.ContainsKey(late));
+
+        while (_src.Now < T0 + TimeSpan.FromSeconds(28))
+        {
+            Step();
+            t.Tick();
+        }
+        Assert.Equal(T0, t.State.Load().LastTickUtc);
+
+        Step(); // T0 + 30 s
+        t.Tick();
+        st = t.State.Load();
+        Assert.Equal(T0 + TimeSpan.FromSeconds(30), st.LastTickUtc);
+        Assert.Equal(2_000, st.Live[matlab].Counters.KernelTime + st.Live[matlab].Counters.UserTime);
+        Assert.True(st.Live.ContainsKey(late));
+    }
+
+    [Fact]
+    public void Dispose_PersistsLatestLiveCounters()
+    {
+        var matlab = _src.Add(11, 200, 1, "MATLAB.exe", cpuTicks: 1_000);
+        var t = NewTracker();
+        t.Tick();
+        Step();
+        _src.SetCpu(matlab, 5_000);
+        t.Tick();
+        t.Dispose();
+
+        using var store = new ProcessTracker.Core.Storage.StateStore(Path.Combine(_dir, "state.db"));
+        var st = store.Load();
+        Assert.Equal(T0 + TickInterval, st.LastTickUtc);
+        Assert.Equal(5_000, st.Live[matlab].Counters.KernelTime + st.Live[matlab].Counters.UserTime);
+    }
+
+    [Fact]
+    public void Restore_AfterCrash_FirstDeltaSpansFromLastCounterSave()
+    {
+        AddAnchor();
+        var matlab = _src.Add(11, 200, 10, "MATLAB.exe", cpuTicks: 1_000_000_000);
+        var t1 = NewTracker();
+        t1.Tick(); // counters saved at T0
+        Step();
+        _src.SetCpu(matlab, 1_000_000_000 + 20_000_000); // one core for 2 s; not persisted (throttled)
+        t1.Tick();
+        // Crash: t1 is never disposed before the restart.
+
+        Step(TimeSpan.FromSeconds(5));
+        _time.Advance(TimeSpan.FromSeconds(7));
+        _src.SetCpu(matlab, 1_000_000_000 + 70_000_000); // one core throughout the 7 s since the last save
+        var t2 = NewTracker(new FakeInspector());
+        t2.Restore();
+        var v = t2.Tick();
+
+        Assert.Equal(1.0, v.Processes[matlab].Latest.CpuCores, 0.001);
+    }
+
+    [Fact]
+    public void Restore_LoadFails_FirstTickStillClosesRecordsOfVanishedProcesses()
+    {
+        var keep = _src.Add(41, 510, 1, "keep.exe");
+        var gone = _src.Add(42, 520, 1, "dymosim.exe");
+        var t1 = NewTracker();
+        t1.Tick();
+        t1.Dispose();
+
+        ExecRaw("ALTER TABLE live_counters RENAME TO live_hidden"); // Load fails, process records stay writable
+        _src.Remove(gone);
+        _time.Advance(TimeSpan.FromSeconds(5));
+        var restoredAt = _time.UtcNow;
+        Step(TimeSpan.FromSeconds(7));
+        var t2 = NewTracker(new FakeInspector());
+        t2.Restore(); // logs, does not throw
+        var v = t2.Tick();
+        ExecRaw("ALTER TABLE live_hidden RENAME TO live_counters");
+
+        Assert.True(v.Processes.ContainsKey(keep));
+        var records = t2.State.Load().Processes;
+        Assert.Equal(restoredAt, records.Single(r => r.Key == gone).ExitedUtc);
+        Assert.Null(records.Single(r => r.Key == keep).ExitedUtc);
+    }
+
+    [Fact]
     public void Restore_PidReusedWithDifferentCreateTime_TreatsAsNewProcess()
     {
         var old = _src.Add(40, 500, 1, "MATLAB.exe");

@@ -68,18 +68,28 @@ public static class SegmentFormat
 
     // ---- encoding ----
 
-    public static void WriteRecord(Stream s, byte type, Action<BinaryWriter> payload)
+    /// <summary>
+    /// Writes a record header with a placeholder length; write the payload with <paramref name="w"/>, then call
+    /// <see cref="EndRecord"/> with the returned position. The writer's stream must be seekable.
+    /// </summary>
+    public static long BeginRecord(BinaryWriter w, byte type)
     {
-        var ms = new MemoryStream(128);
-        using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true)) payload(bw);
-        var buf = ms.GetBuffer();
-        var len = (int)ms.Length;
+        var start = w.BaseStream.Position;
+        w.Write(type);
+        w.Write((ushort)0);
+        return start;
+    }
+
+    /// <summary>Patches the payload length of the record started at <paramref name="start"/>.</summary>
+    public static void EndRecord(BinaryWriter w, long start)
+    {
+        var s = w.BaseStream;
+        var end = s.Position;
+        var len = end - start - RecordHeaderLength;
         if (len > ushort.MaxValue) throw new InvalidOperationException("Record payload too large.");
-        Span<byte> head = stackalloc byte[RecordHeaderLength];
-        head[0] = type;
-        BinaryPrimitives.WriteUInt16LittleEndian(head[1..], (ushort)len);
-        s.Write(head);
-        s.Write(buf, 0, len);
+        s.Position = start + 1;
+        w.Write((ushort)len);
+        s.Position = end;
     }
 
     private static void Ticks(BinaryWriter w, DateTime t) => w.Write(t.Ticks);

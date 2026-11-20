@@ -1,3 +1,4 @@
+using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using ProcessTracker.Core.Model;
@@ -24,6 +25,8 @@ public sealed class SegmentWriter : IDisposable
     private readonly Task _drain;
     private readonly Dictionary<ProcessKey, Seen> _seen = new();
     private readonly HashSet<string> _loggedFailures = new();
+    private readonly MemoryStream _frame = new(64 * 1024); // used by the drain task only
+    private readonly BinaryWriter _frameWriter;
     private long _enqueued;
     private long _completed;
     private FileStream? _stream;
@@ -35,6 +38,7 @@ public sealed class SegmentWriter : IDisposable
         _dir = dir;
         _retention = retention < MinRetention ? MinRetention : retention;
         _log = log;
+        _frameWriter = new BinaryWriter(_frame, Encoding.UTF8, leaveOpen: true);
         _channel = Channel.CreateBounded(
             new BoundedChannelOptions(64)
             {
@@ -101,18 +105,34 @@ public sealed class SegmentWriter : IDisposable
         var f = item.Frame;
         var stream = OpenSegment(SegmentFormat.FloorToSegment(f.TimestampUtc));
 
-        using var buf = new MemoryStream(4096);
-        SegmentFormat.WriteRecord(buf, SegmentFormat.TypeSystem, w => SegmentFormat.WriteSystem(w, f.System));
+        // One buffer and writer for every frame: the frame is assembled in memory, then written with one call.
+        _frame.SetLength(0);
+        var w = _frameWriter;
+        var at = SegmentFormat.BeginRecord(w, SegmentFormat.TypeSystem);
+        SegmentFormat.WriteSystem(w, f.System);
+        SegmentFormat.EndRecord(w, at);
         foreach (var info in item.NewProcesses)
-            SegmentFormat.WriteRecord(buf, SegmentFormat.TypeProcessInfo, w => SegmentFormat.WriteProcessInfo(w, info));
+        {
+            at = SegmentFormat.BeginRecord(w, SegmentFormat.TypeProcessInfo);
+            SegmentFormat.WriteProcessInfo(w, info);
+            SegmentFormat.EndRecord(w, at);
+        }
         foreach (var s in f.Samples)
-            if (ShouldWrite(s, f.TimestampUtc))
-                SegmentFormat.WriteRecord(buf, SegmentFormat.TypeProcess, w => SegmentFormat.WriteProcess(w, s));
+        {
+            if (!ShouldWrite(s, f.TimestampUtc)) continue;
+            at = SegmentFormat.BeginRecord(w, SegmentFormat.TypeProcess);
+            SegmentFormat.WriteProcess(w, s);
+            SegmentFormat.EndRecord(w, at);
+        }
         foreach (var a in f.Sessions)
-            SegmentFormat.WriteRecord(buf, SegmentFormat.TypeSession, w => SegmentFormat.WriteSession(w, a));
+        {
+            at = SegmentFormat.BeginRecord(w, SegmentFormat.TypeSession);
+            SegmentFormat.WriteSession(w, a);
+            SegmentFormat.EndRecord(w, at);
+        }
         PruneSeen(f.TimestampUtc);
 
-        stream.Write(buf.GetBuffer(), 0, (int)buf.Length);
+        stream.Write(_frame.GetBuffer(), 0, (int)_frame.Length);
         stream.Flush(false);
     }
 

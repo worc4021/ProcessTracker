@@ -136,10 +136,15 @@ public sealed class StateStore : IDisposable
         r.IsDBNull(i) ? null : new DateTime(r.GetInt64(i), DateTimeKind.Utc);
     private static string? ReadString(SqliteDataReader r, int i) => r.IsDBNull(i) ? null : r.GetString(i);
 
+    /// <summary>
+    /// Upserts process records and sessions in one transaction. When <paramref name="live"/> is given, the live
+    /// counters are replaced by it and <c>last_tick_ticks</c> is set to <paramref name="ts"/> in the same transaction,
+    /// so a restore always pairs counters with the time they were taken; when null, both are left as they are.
+    /// </summary>
     public void SaveTick(
         DateTime ts,
         IReadOnlyList<ProcessRecord> upserts,
-        IReadOnlyList<(ProcessKey, ActivityState, RawProcessCounters)> live,
+        IEnumerable<(ProcessKey, ActivityState, RawProcessCounters)>? live,
         IReadOnlyList<SessionInfo> sessions)
     {
         lock (_lock)
@@ -178,58 +183,7 @@ public sealed class StateStore : IDisposable
                 proc.ExecuteNonQuery();
             }
 
-            using (var del = _db.CreateCommand())
-            {
-                del.Transaction = tx;
-                del.CommandText = "DELETE FROM live_counters";
-                del.ExecuteNonQuery();
-            }
-
-            var lc = Prepare(ref _insertLive,
-                """
-                INSERT INTO live_counters(pid,create_ticks,parent_pid,image_name,kernel_time,user_time,private_bytes,working_set,
-                                          read_ops,write_ops,other_ops,read_bytes,write_bytes,other_bytes,
-                                          context_switches,handle_count,thread_count,
-                                          last_cpu_ticks,last_io_ticks,last_write_ticks,last_wake_ticks)
-                VALUES(@pid,@ct,@ppid,@img,@kt,@ut,@pb,@ws,@ro,@wo,@oo,@rb,@wb,@ob,@cs,@hc,@tc,@lcpu,@lio,@lwr,@lwk)
-                ON CONFLICT(pid,create_ticks) DO UPDATE SET
-                  parent_pid=excluded.parent_pid, image_name=excluded.image_name, kernel_time=excluded.kernel_time,
-                  user_time=excluded.user_time, private_bytes=excluded.private_bytes, working_set=excluded.working_set,
-                  read_ops=excluded.read_ops, write_ops=excluded.write_ops, other_ops=excluded.other_ops,
-                  read_bytes=excluded.read_bytes, write_bytes=excluded.write_bytes, other_bytes=excluded.other_bytes,
-                  context_switches=excluded.context_switches, handle_count=excluded.handle_count, thread_count=excluded.thread_count,
-                  last_cpu_ticks=excluded.last_cpu_ticks, last_io_ticks=excluded.last_io_ticks,
-                  last_write_ticks=excluded.last_write_ticks, last_wake_ticks=excluded.last_wake_ticks
-                """,
-                "@pid", "@ct", "@ppid", "@img", "@kt", "@ut", "@pb", "@ws", "@ro", "@wo", "@oo", "@rb", "@wb", "@ob",
-                "@cs", "@hc", "@tc", "@lcpu", "@lio", "@lwr", "@lwk");
-            lc.Transaction = tx;
-            foreach (var (key, act, raw) in live)
-            {
-                var v = lc.Parameters;
-                v["@pid"].Value = key.Pid;
-                v["@ct"].Value = key.CreateTimeTicks;
-                v["@ppid"].Value = raw.ParentPid;
-                v["@img"].Value = raw.ImageName;
-                v["@kt"].Value = raw.KernelTime;
-                v["@ut"].Value = raw.UserTime;
-                v["@pb"].Value = raw.PrivateBytes;
-                v["@ws"].Value = raw.WorkingSet;
-                v["@ro"].Value = raw.ReadOps;
-                v["@wo"].Value = raw.WriteOps;
-                v["@oo"].Value = raw.OtherOps;
-                v["@rb"].Value = raw.ReadBytes;
-                v["@wb"].Value = raw.WriteBytes;
-                v["@ob"].Value = raw.OtherBytes;
-                v["@cs"].Value = raw.ContextSwitches;
-                v["@hc"].Value = raw.HandleCount;
-                v["@tc"].Value = raw.ThreadCount;
-                v["@lcpu"].Value = Ticks(act.LastCpuAt);
-                v["@lio"].Value = Ticks(act.LastIoAt);
-                v["@lwr"].Value = Ticks(act.LastWriteAt);
-                v["@lwk"].Value = Ticks(act.LastWakeAt);
-                lc.ExecuteNonQuery();
-            }
+            if (live is not null) SaveLive(tx, ts, live);
 
             var ses = Prepare(ref _upsertSession,
                 """
@@ -272,14 +226,71 @@ public sealed class StateStore : IDisposable
                 }
             }
 
-            var meta = Prepare(ref _setMeta,
-                "INSERT INTO meta(key,value) VALUES('last_tick_ticks',@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value", "@v");
-            meta.Transaction = tx;
-            meta.Parameters["@v"].Value = ts.ToUniversalTime().Ticks.ToString();
-            meta.ExecuteNonQuery();
-
             tx.Commit();
         }
+    }
+
+    /// <summary>Replaces every live-counter row and sets <c>last_tick_ticks</c>, inside the caller's transaction.</summary>
+    private void SaveLive(SqliteTransaction tx, DateTime ts, IEnumerable<(ProcessKey, ActivityState, RawProcessCounters)> live)
+    {
+        using (var del = _db.CreateCommand())
+        {
+            del.Transaction = tx;
+            del.CommandText = "DELETE FROM live_counters";
+            del.ExecuteNonQuery();
+        }
+
+        var lc = Prepare(ref _insertLive,
+            """
+            INSERT INTO live_counters(pid,create_ticks,parent_pid,image_name,kernel_time,user_time,private_bytes,working_set,
+                                      read_ops,write_ops,other_ops,read_bytes,write_bytes,other_bytes,
+                                      context_switches,handle_count,thread_count,
+                                      last_cpu_ticks,last_io_ticks,last_write_ticks,last_wake_ticks)
+            VALUES(@pid,@ct,@ppid,@img,@kt,@ut,@pb,@ws,@ro,@wo,@oo,@rb,@wb,@ob,@cs,@hc,@tc,@lcpu,@lio,@lwr,@lwk)
+            ON CONFLICT(pid,create_ticks) DO UPDATE SET
+              parent_pid=excluded.parent_pid, image_name=excluded.image_name, kernel_time=excluded.kernel_time,
+              user_time=excluded.user_time, private_bytes=excluded.private_bytes, working_set=excluded.working_set,
+              read_ops=excluded.read_ops, write_ops=excluded.write_ops, other_ops=excluded.other_ops,
+              read_bytes=excluded.read_bytes, write_bytes=excluded.write_bytes, other_bytes=excluded.other_bytes,
+              context_switches=excluded.context_switches, handle_count=excluded.handle_count, thread_count=excluded.thread_count,
+              last_cpu_ticks=excluded.last_cpu_ticks, last_io_ticks=excluded.last_io_ticks,
+              last_write_ticks=excluded.last_write_ticks, last_wake_ticks=excluded.last_wake_ticks
+            """,
+            "@pid", "@ct", "@ppid", "@img", "@kt", "@ut", "@pb", "@ws", "@ro", "@wo", "@oo", "@rb", "@wb", "@ob",
+            "@cs", "@hc", "@tc", "@lcpu", "@lio", "@lwr", "@lwk");
+        lc.Transaction = tx;
+        foreach (var (key, act, raw) in live)
+        {
+            var v = lc.Parameters;
+            v["@pid"].Value = key.Pid;
+            v["@ct"].Value = key.CreateTimeTicks;
+            v["@ppid"].Value = raw.ParentPid;
+            v["@img"].Value = raw.ImageName;
+            v["@kt"].Value = raw.KernelTime;
+            v["@ut"].Value = raw.UserTime;
+            v["@pb"].Value = raw.PrivateBytes;
+            v["@ws"].Value = raw.WorkingSet;
+            v["@ro"].Value = raw.ReadOps;
+            v["@wo"].Value = raw.WriteOps;
+            v["@oo"].Value = raw.OtherOps;
+            v["@rb"].Value = raw.ReadBytes;
+            v["@wb"].Value = raw.WriteBytes;
+            v["@ob"].Value = raw.OtherBytes;
+            v["@cs"].Value = raw.ContextSwitches;
+            v["@hc"].Value = raw.HandleCount;
+            v["@tc"].Value = raw.ThreadCount;
+            v["@lcpu"].Value = Ticks(act.LastCpuAt);
+            v["@lio"].Value = Ticks(act.LastIoAt);
+            v["@lwr"].Value = Ticks(act.LastWriteAt);
+            v["@lwk"].Value = Ticks(act.LastWakeAt);
+            lc.ExecuteNonQuery();
+        }
+
+        var meta = Prepare(ref _setMeta,
+            "INSERT INTO meta(key,value) VALUES('last_tick_ticks',@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value", "@v");
+        meta.Transaction = tx;
+        meta.Parameters["@v"].Value = ts.ToUniversalTime().Ticks.ToString();
+        meta.ExecuteNonQuery();
     }
 
     public PersistedState Load()
@@ -390,6 +401,44 @@ public sealed class StateStore : IDisposable
             c.CommandText = "DELETE FROM processes WHERE exited_ticks IS NOT NULL AND exited_ticks < @t";
             c.Parameters.AddWithValue("@t", utc.ToUniversalTime().Ticks);
             c.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Marks every record that is still open (no exit time) and not in <paramref name="running"/> as exited at
+    /// <paramref name="exitedUtc"/>. Used when the persisted state could not be loaded, so stale records still close.
+    /// </summary>
+    public void CloseOpenRecordsExcept(ICollection<ProcessKey> running, DateTime exitedUtc)
+    {
+        lock (_lock)
+        {
+            var stale = new List<ProcessKey>();
+            using (var c = _db.CreateCommand())
+            {
+                c.CommandText = "SELECT pid,create_ticks FROM processes WHERE exited_ticks IS NULL";
+                using var r = c.ExecuteReader();
+                while (r.Read())
+                {
+                    var key = new ProcessKey(r.GetInt32(0), r.GetInt64(1));
+                    if (!running.Contains(key)) stale.Add(key);
+                }
+            }
+            if (stale.Count == 0) return;
+
+            using var tx = _db.BeginTransaction();
+            using var u = _db.CreateCommand();
+            u.Transaction = tx;
+            u.CommandText = "UPDATE processes SET exited_ticks=@t WHERE pid=@pid AND create_ticks=@ct AND exited_ticks IS NULL";
+            var pid = u.Parameters.Add(new SqliteParameter("@pid", DBNull.Value));
+            var ct = u.Parameters.Add(new SqliteParameter("@ct", DBNull.Value));
+            u.Parameters.AddWithValue("@t", exitedUtc.ToUniversalTime().Ticks);
+            foreach (var k in stale)
+            {
+                pid.Value = k.Pid;
+                ct.Value = k.CreateTimeTicks;
+                u.ExecuteNonQuery();
+            }
+            tx.Commit();
         }
     }
 

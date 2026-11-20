@@ -1,4 +1,4 @@
-using System.Collections.Frozen;
+using System.Collections.ObjectModel;
 using Microsoft.Extensions.Logging;
 using ProcessTracker.Core.Activity;
 using ProcessTracker.Core.Attribution;
@@ -25,6 +25,12 @@ public sealed class Tracker : IDisposable
     private static readonly TimeSpan MinRetention = TimeSpan.FromHours(2);
     private static readonly TimeSpan FlushTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// How often live counters (and the last tick time) are saved; also saved on <see cref="Dispose"/>. Counters are
+    /// cumulative, so after a crash the first delta simply spans from the last save to the first new tick.
+    /// </summary>
+    private static readonly TimeSpan LiveCountersInterval = TimeSpan.FromSeconds(30);
+
     /// <summary>Per live process: its record and the counters of the previous tick.</summary>
     private sealed class LiveProcess(ProcessRecord record)
     {
@@ -34,9 +40,12 @@ public sealed class Tracker : IDisposable
     }
 
     /// <summary>Persisted state loaded by <see cref="Restore"/>, applied against the first snapshot.</summary>
+    /// <remarks><paramref name="LoadFailed"/>: nothing could be loaded, so the first tick only closes the records the
+    /// previous run left open whose processes are gone.</remarks>
     private sealed record Pending(
         DateTime RestoredUtc, DateTime? LastTickUtc, Dictionary<ProcessKey, ProcessRecord> Open,
-        IReadOnlyDictionary<ProcessKey, (ActivityState Activity, RawProcessCounters Counters)> Live);
+        IReadOnlyDictionary<ProcessKey, (ActivityState Activity, RawProcessCounters Counters)> Live,
+        bool LoadFailed = false);
 
     private readonly ISnapshotSource _source;
     private readonly IProcessInspector _inspector;
@@ -62,6 +71,8 @@ public sealed class Tracker : IDisposable
     private SystemCounters? _prevSystem;
     private Pending? _pending;
     private bool _ticked;
+    private DateTime _lastTickUtc;
+    private DateTime? _liveSavedUtc;
     private bool _persistFailing;
     private DateTime _nextMaintenanceUtc = DateTime.MinValue;
     private bool _disposed;
@@ -109,7 +120,16 @@ public sealed class Tracker : IDisposable
     {
         if (_ticked || _pending is not null) throw new InvalidOperationException("Restore must be called once, before the first tick.");
 
-        var st = State.Load();
+        PersistedState st;
+        try { st = State.Load(); }
+        catch (Exception e) when (IsNonFatal(e))
+        {
+            _log.LogError(e, "Loading persisted tracker state failed; starting without it (records of processes that " +
+                             "exited meanwhile are closed on the first tick)");
+            _pending = new Pending(_time.GetUtcNow().UtcDateTime, null, new(),
+                new Dictionary<ProcessKey, (ActivityState, RawProcessCounters)>(), LoadFailed: true);
+            return;
+        }
         var open = st.Processes.Where(p => p.ExitedUtc is null).ToDictionary(p => p.Key);
         _sessions.Restore(st.Sessions);
         foreach (var s in st.Sessions)
@@ -139,6 +159,7 @@ public sealed class Tracker : IDisposable
         if (_pending is { } pending) ApplyRestore(pending, current, upserts);
         _pending = null;
         _ticked = true;
+        _lastTickUtc = now;
 
         // New processes, oldest first so a parent is recorded before its children.
         var newRecords = new List<ProcessRecord>();
@@ -161,7 +182,6 @@ public sealed class Tracker : IDisposable
 
         // Samples and activity.
         var samples = new List<ProcessSample>(_live.Count);
-        var liveRows = new List<(ProcessKey, ActivityState, RawProcessCounters)>(_live.Count);
         foreach (var (key, lp) in _live)
         {
             var raw = current[key];
@@ -170,7 +190,6 @@ public sealed class Tracker : IDisposable
             lp.Prev = raw;
             lp.PrevTs = now;
             samples.Add(s);
-            liveRows.Add((key, _activity.Get(key), raw));
         }
         _table.SetLive(_live.Select(kv => (kv.Key, kv.Value.Record.Parent)));
 
@@ -210,9 +229,10 @@ public sealed class Tracker : IDisposable
         var frame = new TickFrame(now, system, samples.ToArray(), totals.Values.ToArray());
         Ring.Add(frame);
         _writer.Enqueue(frame, newRecords);
-        Persist(now, upserts, liveRows, allSessions);
+        Persist(now, upserts, allSessions, forceLive: false);
 
-        var view = new TrackerView(now, system, processViews.ToFrozenDictionary(), sessionViews);
+        // A fresh dictionary per tick, never touched again once published: readers see an immutable snapshot.
+        var view = new TrackerView(now, system, new ReadOnlyDictionary<ProcessKey, ProcessView>(processViews), sessionViews);
         Volatile.Write(ref _view, view);
 
         RunMaintenanceIfDue();
@@ -221,6 +241,13 @@ public sealed class Tracker : IDisposable
 
     private void ApplyRestore(Pending pending, Dictionary<ProcessKey, RawProcessCounters> current, List<ProcessRecord> upserts)
     {
+        if (pending.LoadFailed)
+        {
+            try { State.CloseOpenRecordsExcept(current.Keys, pending.RestoredUtc); }
+            catch (Exception e) when (IsNonFatal(e)) { _log.LogError(e, "Closing records left open by the previous run failed"); }
+            return;
+        }
+
         foreach (var (key, rec) in pending.Open)
         {
             if (current.ContainsKey(key))
@@ -330,22 +357,25 @@ public sealed class Tracker : IDisposable
     }
 
     /// <summary>
-    /// Saves new and exited records, all live counters, and only the sessions that changed. Records from a failed
-    /// save are kept (last write per key wins) and retried with the next tick.
+    /// Saves new and exited records and only the sessions that changed, every tick; the live counters (with the tick
+    /// time) every <see cref="LiveCountersInterval"/>, or when <paramref name="forceLive"/>. Whatever a failed save
+    /// held is kept (last write per key wins) and retried with the next tick.
     /// </summary>
-    private void Persist(
-        DateTime now, List<ProcessRecord> upserts, List<(ProcessKey, ActivityState, RawProcessCounters)> liveRows,
-        IReadOnlyList<SessionInfo> sessions)
+    private void Persist(DateTime now, List<ProcessRecord> upserts, IReadOnlyList<SessionInfo> sessions, bool forceLive)
     {
         var changed = sessions
             .Where(s => !_savedSessions.TryGetValue(s.UnitId, out var saved) || !saved.Equals(s))
             .ToList();
         foreach (var r in upserts) _unsavedRecords[r.Key] = r;
+        var saveLive = forceLive || _liveSavedUtc is not { } last || now < last || now - last >= LiveCountersInterval;
         try
         {
-            State.SaveTick(now, _unsavedRecords.Values.ToList(), liveRows, changed);
+            // _live holds this tick's counters (Prev was just set to them) and _activity this tick's state.
+            var live = saveLive ? _live.Select(kv => (kv.Key, _activity.Get(kv.Key), kv.Value.Prev!)) : null;
+            State.SaveTick(now, _unsavedRecords.Values.ToList(), live, changed);
             _unsavedRecords.Clear();
             foreach (var s in changed) _savedSessions[s.UnitId] = s;
+            if (saveLive) _liveSavedUtc = now;
             if (_persistFailing) _log.LogInformation("State database writes recovered");
             _persistFailing = false;
         }
@@ -373,6 +403,7 @@ public sealed class Tracker : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        if (_ticked) Persist(_lastTickUtc, [], _sessions.All(), forceLive: true);
         try { _writer.FlushAsync().Wait(FlushTimeout); }
         catch (AggregateException e) { _log.LogWarning(e, "Flushing history segments on shutdown failed"); }
         _writer.Dispose();

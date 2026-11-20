@@ -84,6 +84,42 @@ public sealed class StateStoreTests : IDisposable
     }
 
     [Fact]
+    public void SaveTick_NullLive_KeepsLiveCountersAndLastTick_StillUpsertsRecordsAndSessions()
+    {
+        using var s = new StateStore(DbPath);
+        var a = Rec(1);
+        var raw = Raw(a.Key);
+        s.SaveTick(T0, new[] { a }, new[] { (a.Key, default(ActivityState), raw) }, NoSessions);
+
+        var b = Rec(2);
+        var session = new SessionInfo("u9", null, new[] { "c9" }, null, T0, null, null, null, null);
+        s.SaveTick(T0.AddSeconds(2), new[] { b }, null, new[] { session });
+
+        var st = s.Load();
+        Assert.Equal(T0, st.LastTickUtc);
+        Assert.Equal(raw, Assert.Single(st.Live).Value.Counters);
+        Assert.Equal(new[] { 1, 2 }, st.Processes.Select(p => p.Key.Pid).OrderBy(p => p).ToArray());
+        Assert.Equal("u9", Assert.Single(st.Sessions).UnitId);
+    }
+
+    [Fact]
+    public void CloseOpenRecordsExcept_SetsExitOnlyOnOpenRecordsNotListed()
+    {
+        using var s = new StateStore(DbPath);
+        var running = Rec(1);
+        var gone = Rec(2);
+        var exited = Rec(3, T0.AddMinutes(-1));
+        s.SaveTick(T0, new[] { running, gone, exited }, NoLive, NoSessions);
+
+        s.CloseOpenRecordsExcept(new HashSet<ProcessKey> { running.Key }, T0.AddMinutes(5));
+
+        var recs = s.Load().Processes.ToDictionary(p => p.Key.Pid);
+        Assert.Null(recs[1].ExitedUtc);
+        Assert.Equal(T0.AddMinutes(5), recs[2].ExitedUtc);
+        Assert.Equal(T0.AddMinutes(-1), recs[3].ExitedUtc);
+    }
+
+    [Fact]
     public void RecordKill_Persists()
     {
         using (var s = new StateStore(DbPath))
