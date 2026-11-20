@@ -60,16 +60,96 @@ public sealed class DataFolderSetupTests : IDisposable
         Assert.Equal(FileSystemRights.ReadAndExecute, userRights & ~FileSystemRights.Synchronize);
     }
 
+    private const int ReadExec = 0x1200A9, FullControlMask = 0x1F01FF, AddFile = 0x2;
+
+    private static AceInfo Allow(SecurityIdentifier sid, int mask) => new(sid, mask, true);
+
+    private static DataFolderSetup.FolderTrust Classify(SecurityIdentifier? owner, bool reparse, params AceInfo[] aces) =>
+        DataFolderSetup.Classify(owner, reparse, aces);
+
     [Fact]
-    public void Classify_TrustsOnlyAdministratorsAndSystemOwnedNonLinks()
+    public void Classify_Phase1InstallAcl_IsTrusted()
     {
         var me = WindowsIdentity.GetCurrent().User!;
-        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(Admins, false));
-        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(SystemSid, false));
-        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(me, false));
-        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(Users, false));
-        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(null, false));
-        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(Admins, true));
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted,
+            Classify(Admins, false, Allow(SystemSid, FullControlMask), Allow(Admins, FullControlMask), Allow(me, ReadExec)));
+    }
+
+    [Fact]
+    public void Classify_OurOwnAcl_IsTrusted_ForAdminsAndSystemOwners()
+    {
+        AceInfo[] aces = [Allow(SystemSid, FullControlMask), Allow(Admins, FullControlMask), Allow(Users, ReadExec)];
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(Admins, false, aces));
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(SystemSid, false, aces));
+    }
+
+    [Fact]
+    public void Classify_WrongOwnerLinkOrNoOwner_IsUntrusted()
+    {
+        var me = WindowsIdentity.GetCurrent().User!;
+        var safe = Allow(Admins, FullControlMask);
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, Classify(me, false, safe));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, Classify(Users, false, safe));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, Classify(null, false, safe));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, Classify(Admins, true, safe));
+    }
+
+    [Theory]
+    [InlineData(0x2)]        // FILE_ADD_FILE / WRITE_DATA
+    [InlineData(0x4)]        // FILE_ADD_SUBDIRECTORY / APPEND_DATA
+    [InlineData(0x40)]       // FILE_DELETE_CHILD
+    [InlineData(0x10000)]    // DELETE
+    [InlineData(0x40000)]    // WRITE_DAC
+    [InlineData(0x80000)]    // WRITE_OWNER
+    [InlineData(0x40000000)] // GENERIC_WRITE
+    [InlineData(0x10000000)] // GENERIC_ALL
+    public void Classify_AdminOwnedButOthersCanWrite_IsUntrusted(int mask)
+    {
+        var creatorOwner = new SecurityIdentifier("S-1-3-0");
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, Classify(Admins, false, Allow(Admins, FullControlMask), Allow(Users, mask)));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, Classify(Admins, false, Allow(Admins, FullControlMask), Allow(creatorOwner, mask)));
+    }
+
+    [Fact]
+    public void Classify_DenyAcesAndReadOnlyRights_DoNotMakeUntrusted()
+    {
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted,
+            Classify(Admins, false, Allow(Admins, FullControlMask), new AceInfo(Users, AddFile, false), Allow(Users, ReadExec)));
+    }
+
+    [Fact]
+    public void TryCreateSecured_ExistingPath_ReportsExisting_AndChangesNothing()
+    {
+        Directory.CreateDirectory(DataDir);
+        var before = new DirectoryInfo(DataDir).GetAccessControl().GetSecurityDescriptorSddlForm(AccessControlSections.Access | AccessControlSections.Owner);
+
+        Assert.False(DataFolderSetup.TryCreateSecured(DataDir));
+
+        var after = new DirectoryInfo(DataDir).GetAccessControl().GetSecurityDescriptorSddlForm(AccessControlSections.Access | AccessControlSections.Owner);
+        Assert.Equal(before, after);
+    }
+
+    [Fact]
+    public void Prepare_AdminOwnedFolderWithInheritedUsersAddFile_IsMovedAside()
+    {
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs an elevated process.");
+
+        // Elevated: folders created here are owned by Administrators; give Users the %ProgramData%-style AddFile right.
+        Directory.CreateDirectory(DataDir);
+        File.WriteAllText(Path.Combine(DataDir, "state.db"), "planted");
+        var acl = new DirectoryInfo(DataDir).GetAccessControl();
+        acl.SetOwner(Admins);
+        acl.AddAccessRule(new FileSystemAccessRule(Users, FileSystemRights.CreateFiles | FileSystemRights.AppendData,
+            InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow));
+        new DirectoryInfo(DataDir).SetAccessControl(acl);
+
+        var result = new DataFolderSetup(DataDir).Prepare();
+
+        Assert.True(result.Ok, result.Message);
+        Assert.Contains("untrusted", result.Message, StringComparison.OrdinalIgnoreCase);
+        var aside = Assert.Single(Directory.GetDirectories(_root, "ProcessTracker.untrusted-*"));
+        Assert.True(File.Exists(Path.Combine(aside, "state.db")));
+        Assert.False(File.Exists(Path.Combine(DataDir, "state.db")));
     }
 
     [Fact]

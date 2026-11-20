@@ -1,6 +1,8 @@
+using System.ComponentModel;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace ProcessTracker.Cli.Admin;
 
@@ -8,11 +10,16 @@ public sealed record SetupResult(bool Ok, string Message);
 
 /// <summary>
 /// Creates and secures the service's data folder (called by the installer as SYSTEM). Any user can create folders
-/// under %ProgramData%, so a pre-planted junction or file must not redirect or survive what SYSTEM writes here.
+/// under %ProgramData%, so a pre-planted junction, folder or file must not redirect or survive what SYSTEM writes here.
 /// </summary>
 public sealed class DataFolderSetup(string dataDir)
 {
     private const string SettingsFile = "appsettings.json";
+    private const int MaxAttempts = 3;
+
+    // Rights that let a principal add entries to the folder, delete it or its entries, or take it over.
+    private const int Danger = 0x2 /*ADD_FILE*/ | 0x4 /*ADD_SUBDIRECTORY*/ | 0x40 /*DELETE_CHILD*/ | 0x10000 /*DELETE*/
+        | 0x40000 /*WRITE_DAC*/ | 0x80000 /*WRITE_OWNER*/ | 0x40000000 /*GENERIC_WRITE*/ | 0x10000000 /*GENERIC_ALL*/;
 
     private string HistoryDir => Path.Combine(dataDir, "history");
 
@@ -49,49 +56,99 @@ public sealed class DataFolderSetup(string dataDir)
 
     public enum FolderTrust { Trusted, Untrusted }
 
-    /// <summary>An existing folder is kept only when it is not a link and Administrators or SYSTEM own it.</summary>
-    public static FolderTrust Classify(SecurityIdentifier? owner, bool isReparse) =>
-        !isReparse && owner is not null
-        && (owner.Equals(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null))
-            || owner.Equals(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null)))
-            ? FolderTrust.Trusted
-            : FolderTrust.Untrusted;
+    /// <summary>
+    /// An existing folder is kept only when it is not a link, Administrators or SYSTEM own it, and no allow ACE gives
+    /// anyone else (CREATOR OWNER included) a right to add to, delete from or take over the folder. Owner alone is not
+    /// enough: an Administrators-owned folder with the inherited %ProgramData% DACL still lets Users plant children.
+    /// </summary>
+    public static FolderTrust Classify(SecurityIdentifier? owner, bool isReparse, IReadOnlyList<AceInfo> aces)
+    {
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        if (isReparse || owner is null || !(owner.Equals(admins) || owner.Equals(system))) return FolderTrust.Untrusted;
+        return aces.Any(a => a.IsAllow && (a.Mask & Danger) != 0 && !a.Sid.Equals(system) && !a.Sid.Equals(admins))
+            ? FolderTrust.Untrusted
+            : FolderTrust.Trusted;
+    }
+
+    /// <summary>
+    /// Creates the folder with the protected ACL and Administrators owner from birth. False when something already
+    /// exists at the path (never assumed to be ours; nothing is applied to it).
+    /// </summary>
+    public static bool TryCreateSecured(string path) => NativeFolder.TryCreate(path, BuildSecurity().GetSecurityDescriptorBinaryForm());
 
     public SetupResult Prepare()
     {
+        var handles = new List<SafeFileHandle>();
         try
         {
             if (!IsElevated())
                 return new SetupResult(false, "prepare-data must run elevated (as an administrator or SYSTEM) to set the data folder owner. Nothing was changed.");
 
-            // Never adopt an untrusted folder: a user may hold handles (e.g. DELETE) opened while they owned it, and
-            // explicit ACEs/owners on pre-planted children survive a DACL change on the parent. Move it aside instead.
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dataDir))!);
             var notes = new List<string>();
-            var dataTrusted = Existing(dataDir) && EnsureFolder(dataDir, notes);
-            if (!Existing(dataDir)) CreateSecured(dataDir);
-            if (Existing(HistoryDir)) EnsureFolder(HistoryDir, notes);
-            if (!Existing(HistoryDir)) CreateSecured(HistoryDir);
 
-            var readFailed = false;
-            if (dataTrusted)
-            {
-                // Trusted (Administrators/SYSTEM-owned) folders are re-secured by path; no user can have rights in them.
-                foreach (var dir in new[] { dataDir, HistoryDir })
-                    new DirectoryInfo(dir).SetAccessControl(BuildSecurity());
-                readFailed = CarryOverSettings();
-            }
-            else
-            {
-                WriteSettings(SettingsCarryOver.Rewrite(null));
-            }
+            // Data folder: created secure from birth, or an existing trusted one verified and re-secured through a handle
+            // that stays open (no share-delete) until we are done, or an untrusted one renamed aside.
+            var keptExisting = Acquire(dataDir, moveAside: true, notes, handles);
+            // With the data folder locked only administrators can add entries, so history\ cannot be raced. An
+            // untrusted history\ is therefore an administrator's doing: refuse rather than move things around inside.
+            Acquire(HistoryDir, moveAside: false, notes, handles);
 
+            var readFailed = keptExisting ? CarryOverSettings() : WriteSettings(SettingsCarryOver.Rewrite(null));
             if (readFailed) notes.Add("existing settings could not be read and were reset");
             return new SetupResult(true, $"Prepared {dataDir}." + (notes.Count > 0 ? " " + string.Join("; ", notes) + "." : ""));
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or PrivilegeNotHeldException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or PrivilegeNotHeldException or Win32Exception)
         {
             return new SetupResult(false, $"Could not prepare {dataDir}: {e.Message}");
         }
+        finally
+        {
+            foreach (var h in handles) h.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Returns true when an existing trusted folder was kept, false when a fresh one was created. Residual risk,
+    /// accepted: a handle with DELETE or WRITE_DAC that a user opened on a folder before an earlier version took
+    /// ownership of it; such a folder is not trusted by the owner check unless an administrator owns it.
+    /// </summary>
+    private static bool Acquire(string path, bool moveAside, List<string> notes, List<SafeFileHandle> handles)
+    {
+        for (var attempt = 1; attempt <= MaxAttempts; attempt++)
+        {
+            if (TryCreateSecured(path)) return false;
+
+            var handle = NativeFolder.Open(path, out var error);
+            if (handle is null && error is NativeFolder.ErrorFileNotFound or NativeFolder.ErrorPathNotFound) continue; // vanished: retry the create
+            if (handle is not null)
+            {
+                var keep = false;
+                try
+                {
+                    var (owner, aces) = NativeFolder.ReadSecurity(handle);
+                    if (Classify(owner, NativeFolder.IsReparsePoint(handle), aces) == FolderTrust.Trusted)
+                    {
+                        NativeFolder.WriteSecurity(handle, BuildSecurity().GetSecurityDescriptorBinaryForm());
+                        handles.Add(handle);
+                        keep = true;
+                        return true;
+                    }
+                }
+                finally
+                {
+                    if (!keep) handle.Dispose();
+                }
+            }
+
+            if (!moveAside)
+                throw new IOException($"{path} exists but is not trusted (a link, not owned by Administrators/SYSTEM, or writable by others); remove it and try again.");
+            var aside = $"{path}.untrusted-{DateTime.Now:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
+            NativeFolder.Rename(path, aside);
+            notes.Add($"{path} was not trusted (link, not owned by Administrators/SYSTEM, or writable by others) and was moved to {aside}; its contents were not used");
+        }
+        throw new IOException($"{path} kept being replaced while it was being secured ({MaxAttempts} attempts); stopped.");
     }
 
     public SetupResult Remove(bool purge)
@@ -105,7 +162,7 @@ public sealed class DataFolderSetup(string dataDir)
                 if (info.Exists && info.Attributes.HasFlag(FileAttributes.ReparsePoint))
                     return new SetupResult(false, $"{dir} is a junction or symbolic link; remove it yourself. Nothing was deleted.");
             }
-            if (Directory.Exists(dataDir)) Directory.Delete(dataDir, recursive: true);
+            if (Directory.Exists(dataDir)) DeleteTree(new DirectoryInfo(dataDir));
             return new SetupResult(true, $"Removed {dataDir}.");
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -114,27 +171,23 @@ public sealed class DataFolderSetup(string dataDir)
         }
     }
 
-    /// <summary>True if something (folder, file or link, even a dangling one) is at the path.</summary>
-    private static bool Existing(string path) => Directory.Exists(path) || File.Exists(path) || new DirectoryInfo(path).LinkTarget is not null;
-
-    /// <summary>Checks an existing folder; an untrusted one is renamed aside (the link itself, for a junction). True when kept.</summary>
-    private static bool EnsureFolder(string dir, List<string> notes)
+    /// <summary>
+    /// Deletes a tree without ever following a link: link entries are removed as links. Safety against a link being
+    /// swapped in mid-delete relies on the folder being locked by Prepare (only administrators can add children).
+    /// </summary>
+    private static void DeleteTree(DirectoryInfo dir)
     {
-        var info = new DirectoryInfo(dir);
-        var isReparse = info.Attributes.HasFlag(FileAttributes.ReparsePoint) || info.LinkTarget is not null;
-        SecurityIdentifier? owner = null;
-        if (!isReparse && info.Exists)
-            owner = info.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-        if (Classify(owner, isReparse) == FolderTrust.Trusted) return true;
-
-        var aside = $"{dir}.untrusted-{DateTime.Now:yyyyMMddHHmmss}";
-        if (info.Exists || isReparse) Directory.Move(dir, aside); else File.Move(dir, aside);
-        notes.Add($"{dir} was not trusted (link or not owned by Administrators/SYSTEM) and was moved to {aside}; its contents were not used");
-        return false;
+        foreach (var entry in dir.EnumerateFileSystemInfos("*", new EnumerationOptions { AttributesToSkip = 0 }).ToList())
+        {
+            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint) || entry.LinkTarget is not null)
+            {
+                if (entry is DirectoryInfo) Directory.Delete(entry.FullName, recursive: false); else File.Delete(entry.FullName);
+            }
+            else if (entry is DirectoryInfo sub) DeleteTree(sub);
+            else File.Delete(entry.FullName);
+        }
+        Directory.Delete(dir.FullName, recursive: false);
     }
-
-    /// <summary>Creates the folder atomically with the protected ACL and Administrators owner (no window for a user to hold rights).</summary>
-    private static void CreateSecured(string dir) => new DirectoryInfo(dir).Create(BuildSecurity());
 
     /// <summary>
     /// Replaces any existing settings with a freshly created file: the old one may carry an attacker's ACL or content,
@@ -155,11 +208,12 @@ public sealed class DataFolderSetup(string dataDir)
         return readFailed;
     }
 
-    private void WriteSettings(string json)
+    private bool WriteSettings(string json)
     {
         var path = Path.Combine(dataDir, SettingsFile);
         File.Delete(path); // no-op when missing; removes a link itself, never its target
         using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         stream.Write(new UTF8Encoding(false).GetBytes(json));
+        return false;
     }
 }
