@@ -49,11 +49,25 @@ public static class DashboardEndpoints
     private static IResult Serve(HttpContext ctx, string file)
     {
         if (!Files.TryGetValue(file, out var f)) return Results.NotFound();
-        var h = ctx.Response.Headers;
-        h.ContentSecurityPolicy = Csp;
-        h.XContentTypeOptions = "nosniff";
-        h["Referrer-Policy"] = "no-referrer";
-        h.CacheControl = "no-store";
         return Results.Bytes(f.Body, f.ContentType);
     }
+
+    /// <summary>
+    /// Security headers for every response under <c>/</c> (exact) and <c>/dashboard*</c>, 404s and redirects included.
+    /// Register after the Host/Origin guard and before the endpoints.
+    /// </summary>
+    public static IApplicationBuilder UseDashboardHeaders(this IApplicationBuilder app) =>
+        app.Use((ctx, next) =>
+        {
+            var path = ctx.Request.Path;
+            if (path == "/" || path.StartsWithSegments("/dashboard", StringComparison.OrdinalIgnoreCase))
+            {
+                var h = ctx.Response.Headers;
+                h.ContentSecurityPolicy = Csp;
+                h.XContentTypeOptions = "nosniff";
+                h["Referrer-Policy"] = "no-referrer";
+                h.CacheControl = "no-store";
+            }
+            return next(ctx);
+        });
 }

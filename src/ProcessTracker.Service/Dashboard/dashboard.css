@@ -30,7 +30,7 @@ main { padding: 8px 12px 24px; }
 .scroll { overflow-x: auto; }
 .grid { min-width: 760px; }
 .hdr, .row { display: grid; grid-template-columns: minmax(180px, 1fr) 64px 70px 78px 78px 70px 70px 64px 78px; gap: 0 8px; align-items: center; padding: 2px 4px; }
-.hdr { color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); }
+.hdr { color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
 .hdr span { cursor: pointer; user-select: none; }
 .hdr span.num, .row .num { text-align: right; font-variant-numeric: tabular-nums; }
 .hdr span.sorted::after { content: " \25BE"; }

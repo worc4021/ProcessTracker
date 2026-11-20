@@ -134,7 +134,8 @@ public sealed record SessionTreeDto(SessionViewDto Session, IReadOnlyList<Proces
 /// the sessions of <c>/api/sessions</c> each with its process tree, and the orphans of <c>/api/orphans</c>.
 /// </summary>
 public sealed record OverviewDto(
-    Load.LoadReport Load, IReadOnlyList<SessionTreeDto> Sessions, IReadOnlyList<ProcessViewDto> Orphans, DateTime TimestampUtc);
+    Load.LoadReport Load, IReadOnlyList<SessionTreeDto> Sessions, IReadOnlyList<ProcessViewDto> Orphans, DateTime TimestampUtc,
+    double SampleIntervalSeconds);
 
 /// <summary>One history point. ProcessCount is set for session series only.</summary>
 public sealed record HistoryPointDto(

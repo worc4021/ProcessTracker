@@ -39,8 +39,12 @@
   }
   function gb(bytes) { return (bytes / GB).toFixed(2); }
   function cores(c) { return c.toFixed(2); }
-  function mbps(bytes) { return (bytes / MB / (POLL_MS / 1000) >= 0.05) ? (bytes / MB / (POLL_MS / 1000)).toFixed(1) : '0'; }
-  function time(ms) { return ms == null ? NaN : ms; }
+  // Byte deltas cover one collector tick; the service reports its length.
+  function mbps(bytes) {
+    var sec = (snap && snap.sampleIntervalSeconds > 0) ? snap.sampleIntervalSeconds : 2;
+    var v = bytes / MB / sec;
+    return v >= 0.05 ? v.toFixed(1) : '0';
+  }
   function idleText(sec) {
     if (sec == null || !isFinite(sec)) return '-';
     if (sec < 60) return Math.max(0, Math.floor(sec)) + 's';
@@ -219,6 +223,16 @@
       sortSiblings(n.children).forEach(function (c) { addRow(parent, c, depth + 1, q); });
     }
   }
+  // Forget expand/collapse state of sessions and processes that are no longer in the snapshot.
+  function pruneState(sessions) {
+    var ids = {};
+    (function walk(list) { list.forEach(function (n) { ids[n.id] = true; walk(n.children); }); })(sessions);
+    var changed = false;
+    ['expanded', 'collapsed'].forEach(function (k) {
+      Object.keys(ui[k]).forEach(function (id) { if (!ids[id]) { delete ui[k][id]; changed = true; } });
+    });
+    if (changed) saveUi();
+  }
   function renderSessions() {
     var pane = $('tab-sessions');
     pane.textContent = '';
@@ -226,6 +240,7 @@
     var nowMs = parseMs(snap.timestampUtc) || Date.now();
     var q = ui.filter.trim().toLowerCase();
     var sessions = snap.sessions.map(function (t) { return sessionNode(t, nowMs); });
+    pruneState(sessions);
     if (q) sessions = sessions.map(function (s) { return pruneTree(s, q, false); }).filter(Boolean);
     // live first, then by memory (the column sort applies within each session's tree)
     sessions.sort(function (a, b) { return (b.live ? 1 : 0) - (a.live ? 1 : 0) || b.priv - a.priv; });
@@ -239,11 +254,21 @@
   }
 
   // ---- orphans tab ----
-  function copyText(text, btn) {
+  var copied = { pid: null, ok: false }; // survives re-renders for the 1.5 s the button shows its result
+  function paintCopy(btn, pid) {
+    var on = copied.pid === pid;
+    btn.textContent = on ? (copied.ok ? 'copied' : 'copy failed') : 'copy kill command';
+    btn.className = 'copy' + (on && copied.ok ? ' done' : '');
+  }
+  function copyText(pid, btn) {
+    var text = 'proctrack kill ' + pid + ' --tree';
     function done(ok) {
-      btn.textContent = ok ? 'copied' : 'copy failed';
-      btn.className = 'copy' + (ok ? ' done' : '');
-      setTimeout(function () { btn.textContent = 'copy kill command'; btn.className = 'copy'; }, 1500);
+      copied = { pid: pid, ok: ok };
+      paintCopy(btn, pid);
+      setTimeout(function () {
+        if (copied.pid === pid) { copied = { pid: null, ok: false }; }
+        if (btn.isConnected) paintCopy(btn, pid);
+      }, 1500);
     }
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -293,7 +318,8 @@
       var td = el('td');
       var btn = el('button', 'copy', 'copy kill command');
       btn.type = 'button';
-      btn.addEventListener('click', function () { copyText('proctrack kill ' + p.pid + ' --tree', btn); });
+      paintCopy(btn, p.pid);
+      btn.addEventListener('click', function () { copyText(p.pid, btn); });
       td.appendChild(btn);
       tr.appendChild(td);
       tb.appendChild(tr);
@@ -372,7 +398,7 @@
     timer = setTimeout(poll, ms);
   }
   function poll() {
-    timer = null;
+    if (timer) { clearTimeout(timer); timer = null; } // never two timer chains
     if (document.visibilityState === 'hidden') return; // resumed by visibilitychange
     if (inFlight) { schedule(POLL_MS); return; }
     inFlight = true;
@@ -380,12 +406,16 @@
     var abort = ctl ? setTimeout(function () { ctl.abort(); }, 8000) : null;
     fetch('/api/overview', { cache: 'no-store', credentials: 'same-origin', signal: ctl ? ctl.signal : undefined })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function (o) { snap = o; snapAt = Date.now(); fetchFailed = false; })
-      .catch(function () { fetchFailed = true; })
-      .then(function () {
+      .then(function (o) {
+        var same = snap && snap.timestampUtc === o.timestampUtc;
+        snap = o; snapAt = Date.now(); fetchFailed = false;
+        return !same;
+      })
+      .catch(function () { fetchFailed = true; return false; })
+      .then(function (changed) {
         if (abort) clearTimeout(abort);
         inFlight = false;
-        render();
+        if (changed) render(); else renderHeader(); // same tick: nothing to repaint
         schedule(POLL_MS);
       });
   }
@@ -406,6 +436,8 @@
       if (document.visibilityState === 'visible') { if (!inFlight) poll(); }
       else if (timer) { clearTimeout(timer); timer = null; }
     });
+    // The stale badge must react even when no fetch completes (service hung or gone).
+    setInterval(function () { if (document.visibilityState === 'visible') renderHeader(); }, 1000);
     showTab(ui.tab);
     render();
     poll();

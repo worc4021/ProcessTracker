@@ -70,8 +70,48 @@ public sealed class DashboardTests : IDisposable
         Assert.Equal("no-referrer", Assert.Single(response.Headers.GetValues("Referrer-Policy")));
         var html = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
         Assert.Contains("dashboard.js", html);
-        Assert.DoesNotContain("<script>", html); // CSP forbids inline scripts
+        // CSP forbids inline script and style: exactly one external script, no handler attributes, no style.
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "<script", System.Text.RegularExpressions.RegexOptions.IgnoreCase));
+        Assert.Matches(@"<script src=""dashboard\.js""></script>", html);
+        Assert.DoesNotMatch(@"(?i)\son\w+\s*=", html);
         Assert.DoesNotContain("style=", html);
+        Assert.DoesNotContain("<style", html);
+        Assert.DoesNotContain("javascript:", html);
+    }
+
+    [Fact]
+    public void EmbeddedResources_AreExactlyTheThreeDashboardFiles()
+    {
+        var names = typeof(Program).Assembly.GetManifestResourceNames().Where(n => n.StartsWith("dashboard/")).Order();
+
+        Assert.Equal(["dashboard/dashboard.css", "dashboard/dashboard.js", "dashboard/index.html"], names);
+    }
+
+    private static void AssertSecurityHeaders(HttpResponseMessage r)
+    {
+        Assert.Contains("default-src 'none'", Assert.Single(r.Headers.GetValues("Content-Security-Policy")));
+        Assert.Equal("nosniff", Assert.Single(r.Headers.GetValues("X-Content-Type-Options")));
+        Assert.Equal("no-referrer", Assert.Single(r.Headers.GetValues("Referrer-Policy")));
+    }
+
+    [Theory]
+    [InlineData("/", HttpStatusCode.Redirect)]
+    [InlineData("/dashboard", HttpStatusCode.Redirect)]
+    [InlineData("/dashboard/nope.js", HttpStatusCode.NotFound)]
+    [InlineData("/dashboard/a/b", HttpStatusCode.NotFound)]
+    public async Task RedirectsAndNotFound_CarrySecurityHeaders(string path, HttpStatusCode expected)
+    {
+        using var client = _app.CreateClient(new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = new Uri($"http://localhost:{_app.Port()}"),
+        });
+
+        using var response = await client.GetAsync(path, TestContext.Current.CancellationToken);
+
+        Assert.Equal(expected, response.StatusCode);
+        AssertSecurityHeaders(response);
+        if (expected == HttpStatusCode.Redirect) Assert.Equal("/dashboard/", response.Headers.Location!.OriginalString);
     }
 
     [Theory]
@@ -112,6 +152,22 @@ public sealed class DashboardTests : IDisposable
     }
 
     [Fact]
+    public async Task Overview_IsServedFromCachePerView_AndRebuiltForANewView()
+    {
+        _app.Tracker.View = new TrackerView(T0, default, FrozenDictionary<ProcessKey, ProcessView>.Empty, []);
+        var ct = TestContext.Current.CancellationToken;
+
+        var first = await _http.GetStringAsync("/api/overview", ct);
+        var second = await _http.GetStringAsync("/api/overview", ct);
+        _app.Tracker.View = new TrackerView(T0.AddSeconds(2), default, FrozenDictionary<ProcessKey, ProcessView>.Empty, []);
+        var third = await _http.GetStringAsync("/api/overview", ct);
+
+        Assert.Equal(first, second);
+        Assert.NotEqual(first, third);
+        Assert.Contains("2026-11-20T12:00:02", third);
+    }
+
+    [Fact]
     public async Task Overview_HasLoadSessionTreesAndOrphansFromOneView()
     {
         _app.Tracker.View = new TrackerView(T0, default,
@@ -128,6 +184,7 @@ public sealed class DashboardTests : IDisposable
 
         Assert.NotNull(o);
         Assert.Equal(T0, o.TimestampUtc);
+        Assert.Equal(CollectorWorker.Interval.TotalSeconds, o.SampleIntervalSeconds);
         Assert.NotNull(o.Load);
         Assert.Equal(2, o.Sessions.Count);
         var a = o.Sessions.Single(s => s.Session.UnitId == UnitA);
