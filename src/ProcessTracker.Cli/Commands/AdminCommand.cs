@@ -26,7 +26,17 @@ public static class AdminCommand
 
         var installDir = new Option<string>("--install-dir") { Description = "Install folder holding upgrade.ps1.", Required = true };
         var registerTask = new Command("register-task", "Register the SYSTEM auto-upgrade scheduled task (requires elevation).") { installDir };
-        registerTask.SetAction(pr => RunTask(t => t.Register(pr.GetValue(installDir)!), "registered"));
+        registerTask.SetAction(pr =>
+        {
+            var dir = InstallDirCheck.Normalize(pr.GetValue(installDir)!);
+            if (RefuseUnlessElevated()) return CommandSupport.Refused;
+            if (InstallDirCheck.Validate(dir) is { } problem)
+            {
+                Console.Error.WriteLine($"{problem} Nothing was changed.");
+                return CommandSupport.Refused;
+            }
+            return RunTask(t => t.Register(dir), "registered");
+        });
 
         var removeTask = new Command("remove-task", "Remove the auto-upgrade scheduled task (requires elevation).");
         removeTask.SetAction(_ => RunTask(t => t.Remove(), "removed"));
@@ -34,13 +44,16 @@ public static class AdminCommand
         return new Command("admin", "Installer helpers.") { Hidden = true, Subcommands = { prepare, remove, registerTask, removeTask } };
     }
 
+    private static bool RefuseUnlessElevated()
+    {
+        if (DataFolderSetup.IsElevated()) return false;
+        Console.Error.WriteLine("This command must run elevated. Nothing was changed.");
+        return true;
+    }
+
     private static int RunTask(Func<UpgradeTask, int> action, string doneWord)
     {
-        if (!DataFolderSetup.IsElevated())
-        {
-            Console.Error.WriteLine("This command must run elevated. Nothing was changed.");
-            return CommandSupport.Refused;
-        }
+        if (RefuseUnlessElevated()) return CommandSupport.Refused;
         if (action(new UpgradeTask(new ProcessRunner())) != 0) return CommandSupport.Refused;
         Console.WriteLine($"Scheduled task {UpgradeTask.TaskName} {doneWord}.");
         return CommandSupport.Ok;

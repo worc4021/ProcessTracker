@@ -13,6 +13,9 @@ public sealed class ProcessRunner : IProcessRunner
 {
     /// <summary>Exit code reported when the process had to be killed after the timeout.</summary>
     public const int TimedOut = -1;
+    /// <summary>Exit code reported when the program could not be started at all.</summary>
+    public const int NotStarted = -2;
+    private static readonly TimeSpan FlushWait = TimeSpan.FromSeconds(5);
 
     public (int ExitCode, string Output) Run(string exe, IReadOnlyList<string> args, TimeSpan timeout)
     {
@@ -47,17 +50,21 @@ public sealed class ProcessRunner : IProcessRunner
             if (!process.WaitForExit(timeout))
             {
                 try { process.Kill(entireProcessTree: true); } catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { }
-                process.WaitForExit();
+                Flush(process);
                 Append($"Timed out after {timeout.TotalSeconds:0} s and was killed.");
                 lock (gate) return (TimedOut, output.ToString());
             }
 
-            process.WaitForExit(); // flush the async output readers
+            Flush(process); // let the async output readers finish
             lock (gate) return (process.ExitCode, output.ToString());
         }
         catch (System.ComponentModel.Win32Exception e)
         {
-            return (TimedOut, $"Could not start {exe}: {e.Message}");
+            return (NotStarted, $"Could not start {exe}: {e.Message}");
         }
     }
+
+    // The parameterless WaitForExit also waits for EOF on the redirected pipes, which a grandchild that inherited
+    // them can hold open forever; bound it.
+    private static void Flush(Process process) => Task.Run(() => process.WaitForExit()).Wait(FlushWait);
 }

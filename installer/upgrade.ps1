@@ -60,6 +60,35 @@ function Find-Winget {
     catch [System.UnauthorizedAccessException] { return @{ Path = $null; Denied = $true } }
 }
 
+function Invoke-Native {
+    # Runs a native program and returns its exit code and combined output. Windows PowerShell 5.1 turns the first
+    # stderr line of "2>&1" into a terminating error while $ErrorActionPreference is 'Stop', which would lose the real
+    # exit code; so the call runs with 'Continue' locally.
+    param([string]$Exe, [string[]]$Arguments)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $text = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" } | Out-String
+        $code = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $saved }
+    return @{ Code = $code; Output = $text }
+}
+
+function Get-Outcome {
+    param([int]$Code, [string]$Output)
+    $tail = if ($Output.Length -gt 2000) { $Output.Substring($Output.Length - 2000) } else { $Output }
+    if ($Code -eq 0) { return @{ EventId = 1001; Type = 'Information'; Message = 'ProcessTracker upgraded (or reinstalled) through winget.' } }
+    if ($Code -eq $noUpdateCode) { return @{ EventId = 1000; Type = 'Information'; Message = 'ProcessTracker is up to date.' } }
+    if ($Code -eq $noPackageCode) {
+        return @{ EventId = 1002; Type = 'Warning'; Message = "ProcessTracker auto-upgrade failed with code ${Code}: winget found no installed package '$packageId' matching the input criteria (was it installed with the MSI and not through winget, or for another scope?)." }
+    }
+    return @{ EventId = 1002; Type = 'Warning'; Message = "ProcessTracker auto-upgrade failed with code ${Code}. winget output (last 2000 characters): $($tail.Trim())" }
+}
+
+# Dot-sourcing (tests/upgrade-script.tests.ps1) only loads the functions.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 try {
     $found = Find-Winget
     if ($null -eq $found.Path) {
@@ -78,16 +107,10 @@ try {
         exit 0
     }
 
-    $output = & $winget @wingetArgs 2>&1 | Out-String
-    $code = $LASTEXITCODE
-    Write-Output $output
-
-    if ($code -eq 0) { Write-Outcome 1001 "ProcessTracker upgraded (or reinstalled) through winget." }
-    elseif ($code -eq $noUpdateCode) { Write-Outcome 1000 'ProcessTracker is up to date.' }
-    elseif ($code -eq $noPackageCode) {
-        Write-Outcome 1002 "ProcessTracker auto-upgrade failed with code ${code}: winget found no installed package '$packageId' matching the input criteria (was it installed with the MSI and not through winget, or for another scope?)." 'Warning'
-    }
-    else { Write-Outcome 1002 "ProcessTracker auto-upgrade failed with code $code. winget output: $($output.Trim())" 'Warning' }
+    $run = Invoke-Native $winget $wingetArgs
+    Write-Output $run.Output
+    $outcome = Get-Outcome $run.Code $run.Output
+    Write-Outcome $outcome.EventId $outcome.Message $outcome.Type
     exit 0
 }
 catch {

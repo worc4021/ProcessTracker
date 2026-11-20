@@ -7,6 +7,8 @@ namespace ProcessTracker.Cli.Admin;
 public sealed class UpgradeTask(IProcessRunner runner)
 {
     public const string TaskName = @"\ProcessTracker\AutoUpgrade";
+    /// <summary>Full path: this runs elevated, and a bare name would be searched in the current directory first.</summary>
+    public static string SchtasksPath => Path.Combine(Environment.SystemDirectory, "schtasks.exe");
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
     private static readonly XNamespace Ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 
@@ -30,6 +32,7 @@ public sealed class UpgradeTask(IProcessRunner runner)
                 new XElement(Ns + "Principals",
                     new XElement(Ns + "Principal", new XAttribute("id", "Author"),
                         new XElement(Ns + "UserId", "S-1-5-18"),
+                        new XElement(Ns + "LogonType", "ServiceAccount"),
                         new XElement(Ns + "RunLevel", "HighestAvailable"))),
                 new XElement(Ns + "Settings",
                     new XElement(Ns + "MultipleInstancesPolicy", "IgnoreNew"),
@@ -67,13 +70,13 @@ public sealed class UpgradeTask(IProcessRunner runner)
     /// <summary>schtasks' verbose listing for the task; the text says so when it does not exist.</summary>
     public string Query()
     {
-        var (code, output) = runner.Run("schtasks", ["/Query", "/TN", TaskName, "/V", "/FO", "LIST"], Timeout);
+        var (code, output) = runner.Run(SchtasksPath, ["/Query", "/TN", TaskName, "/V", "/FO", "LIST"], Timeout);
         return code == 0 ? output : $"The scheduled task {TaskName} is not registered (schtasks exit {code}).";
     }
 
     private int Run(params string[] args)
     {
-        var (code, output) = runner.Run("schtasks", args, Timeout);
+        var (code, output) = runner.Run(SchtasksPath, args, Timeout);
         if (code != 0) Console.Error.WriteLine(output.Trim());
         return code;
     }

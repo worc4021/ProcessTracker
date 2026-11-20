@@ -36,7 +36,7 @@ public sealed class McpRegistrar(Func<string?> locateClaude, IProcessRunner runn
     public McpResult Register()
     {
         if (locateClaude() is not { } claude) return McpResult.Skipped;
-        if (runner.Run(claude, ["mcp", "get", ServerName], Timeout).ExitCode == 0) return McpResult.AlreadyInState;
+        if (InUserScope(claude)) return McpResult.AlreadyInState; // an entry in another scope does not count: still add ours
         var (code, output) = runner.Run(claude,
             ["mcp", "add", "--transport", "http", "--scope", "user", ServerName, Url, "--header", Header], Timeout);
         if (code != 0) throw new InvalidOperationException($"claude mcp add failed with exit code {code}: {output.Trim()}");
@@ -46,9 +46,18 @@ public sealed class McpRegistrar(Func<string?> locateClaude, IProcessRunner runn
     public McpResult Unregister()
     {
         if (locateClaude() is not { } claude) return McpResult.Skipped;
-        if (runner.Run(claude, ["mcp", "get", ServerName], Timeout).ExitCode != 0) return McpResult.AlreadyInState;
+        if (!InUserScope(claude)) return McpResult.AlreadyInState;
         var (code, output) = runner.Run(claude, ["mcp", "remove", "--scope", "user", ServerName], Timeout);
         if (code != 0) throw new InvalidOperationException($"claude mcp remove failed with exit code {code}: {output.Trim()}");
         return McpResult.Done;
+    }
+
+    /// <summary>True when `claude mcp get` finds the server and (as far as its output says) in user scope.</summary>
+    private bool InUserScope(string claude)
+    {
+        var (code, output) = runner.Run(claude, ["mcp", "get", ServerName], Timeout);
+        if (code != 0) return false;
+        var m = System.Text.RegularExpressions.Regex.Match(output, @"^\s*Scope:\s*(\S+)", System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return !m.Success || m.Groups[1].Value.Equals("User", StringComparison.OrdinalIgnoreCase); // no scope line: assume user
     }
 }

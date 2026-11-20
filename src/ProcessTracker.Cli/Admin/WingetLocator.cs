@@ -24,12 +24,4 @@ public static partial class WingetLocator
         }
         return best is null ? null : Path.Combine(best, "winget.exe");
     }
-
-    /// <summary>Enumerates the WindowsApps folder (denied for non-admin users: returns null then).</summary>
-    public static string? Locate()
-    {
-        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        try { return Pick(Directory.EnumerateDirectories(Path.Combine(programFiles, "WindowsApps"))); }
-        catch (Exception e) when (e is UnauthorizedAccessException or IOException) { return null; }
-    }
 }

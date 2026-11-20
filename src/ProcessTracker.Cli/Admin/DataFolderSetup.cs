@@ -62,12 +62,13 @@ public sealed class DataFolderSetup(string dataDirArg)
     /// anyone else (CREATOR OWNER included) a right to add to, delete from or take over the folder. Owner alone is not
     /// enough: an Administrators-owned folder with the inherited %ProgramData% DACL still lets Users plant children.
     /// </summary>
-    public static FolderTrust Classify(SecurityIdentifier? owner, bool isReparse, IReadOnlyList<AceInfo> aces)
+    public static FolderTrust Classify(SecurityIdentifier? owner, bool isReparse, IReadOnlyList<AceInfo> aces, IReadOnlyCollection<SecurityIdentifier>? alsoTrusted = null)
     {
+        bool Trusted(SecurityIdentifier sid) => alsoTrusted?.Contains(sid) == true;
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-        if (isReparse || owner is null || !(owner.Equals(admins) || owner.Equals(system))) return FolderTrust.Untrusted;
-        return aces.Any(a => a.IsAllow && (a.Mask & Danger) != 0 && !a.Sid.Equals(system) && !a.Sid.Equals(admins))
+        if (isReparse || owner is null || !(owner.Equals(admins) || owner.Equals(system) || Trusted(owner))) return FolderTrust.Untrusted;
+        return aces.Any(a => a.IsAllow && (a.Mask & Danger) != 0 && !a.Sid.Equals(system) && !a.Sid.Equals(admins) && !Trusted(a.Sid))
             ? FolderTrust.Untrusted
             : FolderTrust.Trusted;
     }

@@ -34,6 +34,7 @@ public class UpgradeTaskTests
         Assert.Equal("1.4", task.Attribute("version")!.Value);
         var principal = task.Element(Ns + "Principals")!.Element(Ns + "Principal")!;
         Assert.Equal("S-1-5-18", principal.Element(Ns + "UserId")!.Value);
+        Assert.Equal("ServiceAccount", principal.Element(Ns + "LogonType")!.Value);
         Assert.Equal("HighestAvailable", principal.Element(Ns + "RunLevel")!.Value);
 
         var exec = task.Element(Ns + "Actions")!.Element(Ns + "Exec")!;
@@ -67,7 +68,8 @@ public class UpgradeTaskTests
         var runner = new FakeRunner();
         Assert.Equal(0, new UpgradeTask(runner).Register(InstallDir));
         var call = runner.Calls.Single();
-        Assert.Equal("schtasks", call.Exe);
+        Assert.Equal(Path.Combine(Environment.SystemDirectory, "schtasks.exe"), call.Exe);
+        Assert.True(Path.IsPathFullyQualified(call.Exe));
         Assert.Equal(["/Create", "/TN", @"\ProcessTracker\AutoUpgrade", "/XML"], call.Args.Take(4));
         Assert.Equal("/F", call.Args[^1]);
         Assert.Contains("S-1-5-18", runner.XmlSeen);
@@ -85,5 +87,6 @@ public class UpgradeTaskTests
         Assert.Equal(["/Change", "/TN", @"\ProcessTracker\AutoUpgrade", "/ENABLE"], runner.Calls[1].Args);
         Assert.Equal(["/Change", "/TN", @"\ProcessTracker\AutoUpgrade", "/DISABLE"], runner.Calls[2].Args);
         Assert.Equal("/Query", runner.Calls[3].Args[0]);
+        Assert.All(runner.Calls, c => Assert.Equal(UpgradeTask.SchtasksPath, c.Exe));
     }
 }
