@@ -28,7 +28,7 @@ public sealed class RestEndpointsTests : IDisposable
     private readonly TestApp _app = new();
     private readonly HttpClient _http;
 
-    public RestEndpointsTests() => _http = _app.CreateClient();
+    public RestEndpointsTests() => _http = _app.CreateLocalClient();
 
     public void Dispose()
     {

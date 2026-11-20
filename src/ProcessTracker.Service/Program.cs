@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.Extensions.Primitives;
 using ProcessTracker.Core.Contracts;
 using ProcessTracker.Service;
 using ProcessTracker.Service.Api;
@@ -88,6 +89,17 @@ try
     builder.Services.AddHostedService<CollectorWorker>();
 
     var app = builder.Build();
+
+    // DNS-rebinding protection (ruling R7): a web page may get a browser to send requests to 127.0.0.1 under its own
+    // host name, so only loopback Host names on our port are served, and a browser Origin must be ourselves.
+    // Requests without an Origin (the CLI, Claude Code) are fine. Runs before every endpoint, /api and /mcp alike.
+    app.Use((ctx, next) =>
+    {
+        if (LoopbackGuard.IsLocalRequest(ctx.Request.Host, ctx.Request.Headers.Origin, options.Port)) return next(ctx);
+        ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return Task.CompletedTask;
+    });
+
     app.MapRestEndpoints();
     app.MapMcp("/mcp");
 
@@ -160,6 +172,25 @@ public static class LoopbackGuard
         NeutralizedHostingKeys.ContainsKey(key)
         || key.Equals("Kestrel", StringComparison.OrdinalIgnoreCase)
         || key.StartsWith("Kestrel:", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when the Host header is <c>127.0.0.1:port</c> or <c>localhost:port</c> and there is either no Origin header
+    /// or exactly one that is <c>http://127.0.0.1:port</c> or <c>http://localhost:port</c>.
+    /// </summary>
+    public static bool IsLocalRequest(HostString host, StringValues origin, int port)
+    {
+        if (host.Port != port || !IsLoopbackName(host.Host)) return false;
+        return origin.Count switch
+        {
+            0 => true,
+            1 => origin[0] is { } o && (o.Equals($"http://127.0.0.1:{port}", StringComparison.OrdinalIgnoreCase)
+                                        || o.Equals($"http://localhost:{port}", StringComparison.OrdinalIgnoreCase)),
+            _ => false,
+        };
+    }
+
+    private static bool IsLoopbackName(string host) =>
+        host.Equals("127.0.0.1", StringComparison.Ordinal) || host.Equals("localhost", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>True when a server address (e.g. "http://127.0.0.1:47811") is a loopback address or "localhost".</summary>
     public static bool IsLoopback(string address)

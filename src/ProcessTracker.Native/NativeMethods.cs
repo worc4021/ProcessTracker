@@ -100,7 +100,7 @@ internal static partial class NativeMethods
         public uint ContextSwitches, ThreadState, WaitReason;
     }
 
-    public const uint AfInet = 2, TcpTableOwnerPidConnections = 4, ErrorInsufficientBuffer = 122;
+    public const uint AfInet = 2, TcpTableOwnerPidConnections = 4, ErrorInsufficientBuffer = 122, MibTcpStateEstablished = 5;
 
     /// <summary>Writes a MIB_TCPTABLE_OWNER_PID (a DWORD row count, then the rows) for the given table class.</summary>
     [LibraryImport("iphlpapi.dll")]

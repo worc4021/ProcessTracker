@@ -1,10 +1,5 @@
 using System.Collections.Frozen;
 using System.Text.Json;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using ProcessTracker.Core.Contracts;
@@ -22,33 +17,14 @@ public sealed class McpToolsTests : IDisposable
     private static readonly DateTime T0 = new(2026, 11, 20, 12, 0, 0, DateTimeKind.Utc);
     private const long Gb = 1L << 30;
 
-    private readonly TestApp _app = new();
+    private readonly TestApp _app = new(T0);
 
     public void Dispose() => _app.Dispose();
-
-    /// <summary>The real Program with the tracker, clock and collector replaced. Dev mode: no single-instance mutex.</summary>
-    private sealed class TestApp : WebApplicationFactory<Program>
-    {
-        public FakeTrackerHost Tracker { get; } = new();
-
-        protected override void ConfigureWebHost(IWebHostBuilder builder)
-        {
-            builder.UseSetting("Dev", "true");
-            builder.ConfigureTestServices(s =>
-            {
-                s.RemoveAll<ITrackerHost>();
-                s.AddSingleton<ITrackerHost>(Tracker);
-                s.RemoveAll<TimeProvider>();
-                s.AddSingleton<TimeProvider>(new FixedTimeProvider(T0));
-                foreach (var d in s.Where(d => d.ImplementationType == typeof(CollectorWorker)).ToList()) s.Remove(d);
-            });
-        }
-    }
 
     /// <summary>An MCP client over the in-memory test server, optionally sending an X-Claude-Session header.</summary>
     private async Task<McpClient> Connect(string? sessionHeader = null)
     {
-        var http = _app.CreateClient();
+        var http = _app.CreateLocalClient();
         var options = new HttpClientTransportOptions
         {
             Endpoint = new Uri(http.BaseAddress!, "/mcp"),
