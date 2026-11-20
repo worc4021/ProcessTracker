@@ -9,6 +9,8 @@
     <PackageVersion Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
     <PackageVersion Include="ModelContextProtocol" Version="2.4.0" />
     <PackageVersion Include="System.CommandLine" Version="2.0.15" />
+    <!-- Updater: stop/start the service. Already in the graph via Microsoft.Extensions.Hosting.WindowsServices. -->
+    <PackageVersion Include="System.ServiceProcess.ServiceController" Version="10.0.15" />
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.15" />
     <PackageVersion Include="xunit.v3" Version="4.0.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1" />
