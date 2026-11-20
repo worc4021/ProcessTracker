@@ -1,0 +1,337 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using ProcessTracker.Core.Model;
+using ProcessTracker.Core.Orphans;
+using ProcessTracker.Core.Tests.Fakes;
+using ProcessTracker.Core.Tracking;
+using Attr = ProcessTracker.Core.Model.Attribution;
+
+namespace ProcessTracker.Core.Tests.Tracking;
+
+public sealed class TrackerTests : IDisposable
+{
+    private static readonly DateTime T0 = new(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+    private static readonly TimeSpan TickInterval = TimeSpan.FromSeconds(2);
+    private const string ClaudePath = @"C:\Users\u\.local\bin\claude.exe";
+
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "pt-tracker-" + Guid.NewGuid().ToString("N"));
+    private readonly FakeSnapshotSource _src = new(T0);
+    private readonly FakeInspector _insp = new();
+    private readonly ManualTimeProvider _time = new(T0);
+    private readonly List<Tracker> _trackers = new();
+
+    public void Dispose()
+    {
+        foreach (var t in _trackers) t.Dispose();
+        try { if (Directory.Exists(_dir)) Directory.Delete(_dir, true); } catch (IOException) { }
+    }
+
+    private Tracker NewTracker(FakeInspector? inspector = null, string userProfile = "")
+    {
+        var t = new Tracker(_src, inspector ?? _insp,
+            new TrackerOptions { DataDir = _dir, UserProfilePath = userProfile },
+            NullLogger<Tracker>.Instance, _time);
+        _trackers.Add(t);
+        return t;
+    }
+
+    /// <summary>Desktop session anchor: claude.exe with only the host session id.</summary>
+    private ProcessKey AddAnchor(int pid = 10, long create = 100, string host = "h1")
+    {
+        var k = _src.Add(pid, create, 1, "claude.exe");
+        _insp.Set(k, FakeInspector.Ok(hostSessionId: host, imagePath: ClaudePath));
+        return k;
+    }
+
+    private void Step(TimeSpan? by = null) => _src.Advance(by ?? TickInterval);
+
+    [Fact]
+    public void Tick_NewSessionProcess_AppearsWithAttribution()
+    {
+        var claude = AddAnchor();
+        var t = NewTracker();
+
+        var v = t.Tick();
+
+        var p = v.Processes[claude];
+        Assert.Equal(new Attr(AttributionKind.Session, "host:h1", null, true), p.Record.Attribution);
+        Assert.Equal(ProcessState.Normal, p.State);
+        Assert.Equal(T0, p.Record.FirstSeenUtc);
+        Assert.Equal(ClaudePath, p.Record.ImagePath);
+        var s = Assert.Single(v.Sessions);
+        Assert.Equal("host:h1", s.Info.UnitId);
+        Assert.Equal(claude, s.Info.Anchor);
+        Assert.True(s.IsLive);
+        Assert.Equal(1, s.ProcessCount);
+        Assert.Same(v, t.View);
+    }
+
+    [Fact]
+    public void Tick_ChildInheritsFromParentInSameSnapshot()
+    {
+        // Child listed before its parent: new processes must be handled in create-time order.
+        var child = _src.Add(11, 200, 10, "cmd.exe");
+        var claude = AddAnchor();
+        var t = NewTracker();
+
+        var v = t.Tick();
+
+        var c = v.Processes[child];
+        Assert.Equal(claude, c.Record.Parent);
+        Assert.Equal(new Attr(AttributionKind.Session, "host:h1", null, false), c.Record.Attribution);
+        Assert.Equal(ProcessState.Normal, c.State);
+        Assert.Equal(2, Assert.Single(v.Sessions).ProcessCount);
+    }
+
+    [Fact]
+    public void Tick_AnchorExits_ChildrenBecomeOrphans()
+    {
+        var claude = AddAnchor();
+        var matlab = _src.Add(11, 200, 10, "MATLAB.exe");
+        var t = NewTracker();
+        Assert.Equal(ProcessState.Normal, t.Tick().Processes[matlab].State);
+
+        _src.Remove(claude);
+        Step();
+        var v = t.Tick();
+
+        Assert.False(v.Processes.ContainsKey(claude));
+        Assert.Equal(ProcessState.Orphan, v.Processes[matlab].State);
+        var s = Assert.Single(v.Sessions);
+        Assert.False(s.IsLive);
+        Assert.Equal(T0 + TickInterval, s.Info.EndedUtc);
+        Assert.Equal(1, s.ProcessCount);
+        Assert.Equal(T0 + TickInterval, t.State.Load().Processes.Single(r => r.Key == claude).ExitedUtc);
+    }
+
+    [Fact]
+    public void Tick_Gone_SkippedAndRetriedNextTick()
+    {
+        var p = _src.Add(20, 300, 1, "node.exe");
+        _insp.Set(p, FakeInspector.Status(InspectStatus.Gone), FakeInspector.Ok(sessionId: "s1"));
+        var t = NewTracker();
+
+        var v1 = t.Tick();
+        Assert.False(v1.Processes.ContainsKey(p));
+        Assert.Equal(1, _insp.Calls(p));
+        Assert.DoesNotContain(t.State.Load().Processes, r => r.Key == p);
+
+        Step();
+        var v2 = t.Tick();
+        Assert.Equal(2, _insp.Calls(p));
+        Assert.Equal(new Attr(AttributionKind.Session, "sid:s1", "s1", false), v2.Processes[p].Record.Attribution);
+        Assert.Equal(T0 + TickInterval, v2.Processes[p].Record.FirstSeenUtc);
+    }
+
+    [Theory]
+    [InlineData(InspectStatus.AccessDenied)]
+    [InlineData(InspectStatus.Unsupported)]
+    public void Tick_AccessDenied_InspectedOnlyOnce(InspectStatus status)
+    {
+        var p = _src.Add(30, 400, 1, "svc.exe");
+        _insp.Set(p, FakeInspector.Status(status));
+        var t = NewTracker();
+
+        Assert.Equal(Attr.Unattributed, t.Tick().Processes[p].Record.Attribution);
+        for (var i = 0; i < 2; i++)
+        {
+            Step();
+            Assert.True(t.Tick().Processes.ContainsKey(p));
+        }
+
+        Assert.Equal(1, _insp.Calls(p));
+    }
+
+    [Fact]
+    public void Restore_ContinuesDeltasAcrossDowntime()
+    {
+        AddAnchor();
+        var matlab = _src.Add(11, 200, 10, "MATLAB.exe", cpuTicks: 1_000_000_000);
+        var t1 = NewTracker();
+        t1.Tick();
+        t1.Dispose();
+
+        // Service down for 5 s, during which MATLAB burned 5 s of CPU (one full core).
+        Step(TimeSpan.FromSeconds(5));
+        _time.Advance(TimeSpan.FromSeconds(5));
+        _src.SetCpu(matlab, 1_000_000_000 + 50_000_000);
+        var insp2 = new FakeInspector();
+        var t2 = NewTracker(insp2);
+        t2.Restore();
+        var v = t2.Tick();
+
+        var p = v.Processes[matlab];
+        Assert.Equal(1.0, p.Latest.CpuCores, 0.001);
+        Assert.Equal(T0 + TimeSpan.FromSeconds(5), p.Activity.LastCpuAt);
+        Assert.Equal(T0, p.Record.FirstSeenUtc);
+        Assert.Equal("host:h1", p.Record.Attribution.UnitId);
+        Assert.Equal(0, insp2.Calls(matlab));
+        Assert.True(Assert.Single(v.Sessions).IsLive);
+    }
+
+    [Fact]
+    public void Restore_PidReusedWithDifferentCreateTime_TreatsAsNewProcess()
+    {
+        var old = _src.Add(40, 500, 1, "MATLAB.exe");
+        _insp.Set(old, FakeInspector.Ok(sessionId: "s1"));
+        var t1 = NewTracker();
+        t1.Tick();
+        t1.Dispose();
+
+        _src.Remove(old);
+        var reused = _src.Add(40, 900, 1, "notepad.exe");
+        _time.Advance(TimeSpan.FromSeconds(5));
+        var restoredAt = _time.UtcNow;
+        Step(TimeSpan.FromSeconds(7));
+        var insp2 = new FakeInspector();
+        var t2 = NewTracker(insp2);
+        t2.Restore();
+        var v = t2.Tick();
+
+        Assert.False(v.Processes.ContainsKey(old));
+        var p = v.Processes[reused];
+        Assert.Equal(1, insp2.Calls(reused));
+        Assert.Equal(Attr.Unattributed, p.Record.Attribution);
+        Assert.Equal(T0 + TimeSpan.FromSeconds(7), p.Record.FirstSeenUtc);
+        Assert.Equal(0f, p.Latest.CpuCores);
+        Assert.Equal(restoredAt, t2.State.Load().Processes.Single(r => r.Key == old).ExitedUtc);
+    }
+
+    [Fact]
+    public void Restore_ProcessGoneDuringDowntime_MarkedExited()
+    {
+        var p = _src.Add(41, 510, 1, "dymosim.exe");
+        var keep = _src.Add(42, 520, 1, "keep.exe");
+        var t1 = NewTracker();
+        t1.Tick();
+        t1.Dispose();
+
+        _src.Remove(p);
+        _time.Advance(TimeSpan.FromSeconds(5));
+        var restoredAt = _time.UtcNow;
+        Step(TimeSpan.FromSeconds(7));
+        var t2 = NewTracker(new FakeInspector());
+        t2.Restore();
+        var v = t2.Tick();
+
+        Assert.False(v.Processes.ContainsKey(p));
+        Assert.True(v.Processes.ContainsKey(keep));
+        var st = t2.State.Load();
+        Assert.Equal(restoredAt, st.Processes.Single(r => r.Key == p).ExitedUtc);
+        Assert.Null(st.Processes.Single(r => r.Key == keep).ExitedUtc);
+        Assert.False(st.Live.ContainsKey(p));
+    }
+
+    [Fact]
+    public void Restore_AnchorDiedDuringDowntime_SessionEnded()
+    {
+        var claude = AddAnchor();
+        var matlab = _src.Add(11, 200, 10, "MATLAB.exe");
+        var t1 = NewTracker();
+        Assert.True(Assert.Single(t1.Tick().Sessions).IsLive);
+        t1.Dispose();
+
+        _src.Remove(claude);
+        _time.Advance(TimeSpan.FromSeconds(5));
+        var restoredAt = _time.UtcNow;
+        Step(TimeSpan.FromSeconds(7));
+        var t2 = NewTracker(new FakeInspector());
+        t2.Restore();
+        var v = t2.Tick();
+
+        var s = Assert.Single(v.Sessions);
+        Assert.False(s.IsLive);
+        Assert.Equal(restoredAt, s.Info.EndedUtc);
+        Assert.Equal(ProcessState.Orphan, v.Processes[matlab].State);
+    }
+
+    [Fact]
+    public void Tick_PreexistingOrphan_AnchorNeverSeen_IsOrphanFirstTick()
+    {
+        var matlab = _src.Add(50, 600, 4, "MATLAB.exe");
+        _insp.Set(matlab, FakeInspector.Ok(sessionId: "ended-session"));
+        var t = NewTracker();
+
+        var v = t.Tick();
+
+        var p = v.Processes[matlab];
+        Assert.Equal(ProcessState.Orphan, p.State);
+        Assert.False(p.Alertable);
+        var s = Assert.Single(v.Sessions);
+        Assert.False(s.IsLive);
+        Assert.Null(s.Info.Anchor);
+
+        // Idle for longer than the alert threshold: a watched orphan becomes alertable.
+        Step(TimeSpan.FromMinutes(31));
+        Assert.True(t.Tick().Processes[matlab].Alertable);
+    }
+
+    [Fact]
+    public void View_IsReplacedNotMutated()
+    {
+        var a = _src.Add(60, 700, 1, "a.exe");
+        var b = _src.Add(61, 701, 1, "b.exe");
+        var t = NewTracker();
+        Assert.Same(TrackerView.Empty, t.View);
+
+        var v1 = t.Tick();
+        var aView = v1.Processes[a];
+
+        _src.Remove(b);
+        var c = _src.Add(62, 702, 1, "c.exe");
+        _insp.Set(c, FakeInspector.Ok(sessionId: "s1"));
+        _src.SetCpu(a, 10_000_000);
+        Step();
+        var v2 = t.Tick();
+
+        Assert.NotSame(v1, v2);
+        Assert.Same(v2, t.View);
+        Assert.Equal(T0, v1.TimestampUtc);
+        Assert.Equal(new HashSet<ProcessKey> { a, b }, v1.Processes.Keys.ToHashSet());
+        Assert.Same(aView, v1.Processes[a]);
+        Assert.Equal(0f, v1.Processes[a].Latest.CpuCores);
+        Assert.Empty(v1.Sessions);
+        Assert.Equal(new HashSet<ProcessKey> { a, c }, v2.Processes.Keys.ToHashSet());
+        Assert.Single(v2.Sessions);
+        Assert.Throws<NotSupportedException>(() => ((IDictionary<ProcessKey, ProcessView>)v1.Processes).Remove(a));
+    }
+
+    [Fact]
+    public void Tick_NewClaudeSessionId_ReadsTranscriptMetadata()
+    {
+        var profile = Path.Combine(_dir, "profile");
+        var project = Path.Combine(profile, ".claude", "projects", "C--work");
+        Directory.CreateDirectory(project);
+        File.WriteAllText(Path.Combine(project, "s1.jsonl"),
+            """{"type":"user","cwd":"C:\\work","message":{"content":"fix the bug"}}""" + "\n");
+        var p = _src.Add(70, 800, 1, "node.exe");
+        _insp.Set(p, FakeInspector.Ok(sessionId: "s1"));
+        var t = NewTracker(userProfile: profile);
+
+        var s = Assert.Single(t.Tick().Sessions);
+
+        Assert.Equal(@"C:\work", s.Info.Cwd);
+        Assert.Equal("fix the bug", s.Info.Title);
+        Assert.NotNull(s.Info.LastTranscriptWriteUtc);
+    }
+
+    [Fact]
+    public void Tick_Maintenance_RunsHourly()
+    {
+        // Snapshot clock far behind the wall clock, so the exited record is past retention as soon as it exits.
+        _src.Now = T0 - TimeSpan.FromHours(30);
+        var p = _src.Add(80, 900, 1, "x.exe");
+        var t = NewTracker();
+        t.Tick();
+
+        _src.Remove(p);
+        Step();
+        _time.Advance(TimeSpan.FromMinutes(30));
+        t.Tick();
+        Assert.Contains(t.State.Load().Processes, r => r.Key == p && r.ExitedUtc is not null);
+
+        Step();
+        _time.Advance(TimeSpan.FromMinutes(31));
+        t.Tick();
+        Assert.DoesNotContain(t.State.Load().Processes, r => r.Key == p);
+    }
+}
