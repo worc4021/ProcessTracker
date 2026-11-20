@@ -142,6 +142,52 @@ public sealed class StateStoreTests : IDisposable
     }
 
     [Fact]
+    public void DesktopMetadata_RoundTrips_AndAbsentStaysNull()
+    {
+        var desktop = new DesktopSessionInfo("Sidebar", "feat/x", "wt", @"C:\r\.claude\worktrees\wt", @"C:\r", "summary",
+            T0.AddMinutes(3));
+        var withDesktop = new SessionInfo("host:local_a", "local_a", ["c1"], null, T0, null, @"C:\w", "prompt", null, desktop);
+        var without = new SessionInfo("term:1@2", null, [], null, T0, null, null, null, null);
+
+        using (var s = new StateStore(DbPath))
+            s.SaveTick(T0, [], NoLive, [withDesktop, without]);
+
+        using var s2 = new StateStore(DbPath);
+        var st = s2.Load();
+        var a = st.Sessions.Single(x => x.UnitId == "host:local_a");
+        Assert.Equal(desktop, a.Desktop);
+        Assert.Equal(DateTimeKind.Utc, a.Desktop!.LastFocusedUtc!.Value.Kind);
+        Assert.Null(st.Sessions.Single(x => x.UnitId == "term:1@2").Desktop);
+    }
+
+    [Fact]
+    public void SchemaV1Database_IsMigratedAdditively_AndOldRowsLoadWithoutDesktop()
+    {
+        using (var s = new StateStore(DbPath))
+            s.SaveTick(T0, [], NoLive, [new SessionInfo("u1", null, ["c1"], null, T0, null, @"C:\w", "t", null)]);
+        using (var c = OpenRaw())
+        {
+            // Turn the database back into what a version-1 binary wrote.
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = string.Concat(
+                new[] { "title", "branch", "worktree", "cwd", "origin_cwd", "summary", "focused_ticks" }
+                    .Select(col => $"ALTER TABLE sessions DROP COLUMN desktop_{col};"))
+                + "UPDATE meta SET value='1' WHERE key='schema_version';";
+            cmd.ExecuteNonQuery();
+        }
+
+        using var s2 = new StateStore(DbPath);
+        var loaded = Assert.Single(s2.Load().Sessions);
+        Assert.Equal("t", loaded.Title);
+        Assert.Null(loaded.Desktop);
+
+        using var c2 = OpenRaw();
+        using var chk = c2.CreateCommand();
+        chk.CommandText = "SELECT value FROM meta WHERE key='schema_version'";
+        Assert.Equal("2", (string)chk.ExecuteScalar()!);
+    }
+
+    [Fact]
     public void OpeningDbWithHigherSchemaVersion_DoesNotThrow()
     {
         var rec = Rec(1);

@@ -50,5 +50,5 @@ public static class LoadAssessor
     }
 
     private static SessionUsage ToUsage(SessionView s) =>
-        new(s.Info.UnitId, s.Info.Title, s.Info.Cwd, s.CpuCores, s.PrivateBytes / BytesPerGb, s.ProcessCount);
+        new(s.Info.UnitId, s.Info.DisplayTitle, s.Info.EffectiveCwd, s.CpuCores, s.PrivateBytes / BytesPerGb, s.ProcessCount);
 }

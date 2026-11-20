@@ -39,7 +39,9 @@ main { padding: 8px 12px 24px; }
 .row.session { background: var(--row); font-weight: 600; margin-top: 4px; }
 .row .name { display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; }
 .row .name { padding-left: calc(var(--depth, 0) * var(--indent, 16px)); }
-.row .name .t { overflow: hidden; text-overflow: ellipsis; }
+.row .name .t { overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 3em; }
+.row .name .sub { color: var(--muted); font-size: 12px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.row.group { color: var(--muted); font-weight: 600; margin-top: 12px; border-top: 1px solid var(--line); }
 .row .name .pid { color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 400; }
 .tw { background: none; border: 0; color: var(--muted); font: inherit; width: 1.4em; padding: 0; cursor: pointer; flex: none; }
 .tw.leaf { visibility: hidden; cursor: default; }

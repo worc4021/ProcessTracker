@@ -79,7 +79,13 @@ public sealed record ProcessViewDto(
     }
 }
 
-/// <summary>A session unit with the totals of its live processes in the latest tick.</summary>
+/// <summary>
+/// A session unit with the totals of its live processes in the latest tick. <see cref="Title"/> is the best known
+/// name (the desktop app's sidebar title, else the first prompt, else the project folder, else the unit id) and
+/// <see cref="TitleSource"/> says which ("desktop", "transcript", "folder", "id"). <see cref="Project"/> is the leaf
+/// folder of the session's origin folder (the repository of a worktree session) or cwd; <see cref="Branch"/> and
+/// <see cref="Summary"/> (of the last turn) come from the desktop app and are null for terminal sessions.
+/// </summary>
 public sealed record SessionViewDto(
     string UnitId,
     string? HostSessionId,
@@ -93,15 +99,20 @@ public sealed record SessionViewDto(
     bool IsLive,
     float CpuCores,
     long PrivateBytes,
-    int ProcessCount)
+    int ProcessCount,
+    string? TitleSource = null,
+    string? Project = null,
+    string? Branch = null,
+    string? Summary = null)
 {
     public static SessionViewDto From(SessionView v)
     {
         var i = v.Info;
         return new SessionViewDto(
             i.UnitId, i.HostSessionId, i.ClaudeSessionIds, i.Anchor?.ToString(),
-            ContractJson.AsUtc(i.FirstSeenUtc), ContractJson.AsUtc(i.EndedUtc), i.Cwd, i.Title,
-            ContractJson.AsUtc(i.LastTranscriptWriteUtc), v.IsLive, v.CpuCores, v.PrivateBytes, v.ProcessCount);
+            ContractJson.AsUtc(i.FirstSeenUtc), ContractJson.AsUtc(i.EndedUtc), i.EffectiveCwd, i.DisplayTitle,
+            ContractJson.AsUtc(i.LastTranscriptWriteUtc), v.IsLive, v.CpuCores, v.PrivateBytes, v.ProcessCount,
+            i.TitleSource, i.Project, i.Branch, i.Summary);
     }
 }
 
@@ -178,7 +189,7 @@ public sealed record HistoryPointDto(
     DateTime TimestampUtc, float CpuCores, long PrivateBytes, long ReadBytesDelta, long WriteBytesDelta, int? ProcessCount);
 
 /// <summary>
-/// A time series for one session unit (UnitId set) or one process (Key set). Name is the session title or the
+/// A time series for one session unit (UnitId set) or one process (Key set). Name is the session's display title or the
 /// process image name when known. Idle processes are sampled every 60 s on disk, active ones every tick.
 /// </summary>
 public sealed record HistorySeriesDto(

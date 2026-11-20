@@ -65,4 +65,9 @@ public sealed class SessionRegistry
             LastTranscriptWriteUtc = t.LastWriteUtc,
         };
     }
+
+    public void ApplyDesktop(string unitId, DesktopSessionInfo d)
+    {
+        if (_sessions.TryGetValue(unitId, out var s)) _sessions[unitId] = s with { Desktop = d };
+    }
 }

@@ -97,6 +97,85 @@ public sealed class TrackerProfileTests : IDisposable
         Assert.Null(s.Info.Title);
     }
 
+    private const string DesktopHost = "local_86e91a8f-0885-4afb-8fbd-fe1b4050213b";
+
+    private static string WriteDesktop(string profile, string title, string branch = "main")
+    {
+        var dir = Path.Combine(profile, "AppData", "Local", "Claude-Data", "claude_x", "claude-code-sessions", "a", "b");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, DesktopHost + ".json");
+        File.WriteAllText(path,
+            $$"""{"sessionId":"{{DesktopHost}}","title":"{{title}}","branch":"{{branch}}","originCwd":"C:\\repos\\Widget","postTurnSummary":"did it"}""");
+        return path;
+    }
+
+    [Fact]
+    public void Tracker_DesktopSession_TakesDesktopTitle_RefreshedAtMostEvery60s()
+    {
+        var anchor = _src.Add(10, 100, 1, "claude.exe");
+        _insp.Set(anchor, FakeInspector.Ok(hostSessionId: DesktopHost, imagePath: ClaudePath));
+        var resolver = new FakeResolver();
+        var profile = MakeProfile("owner", "first prompt");
+        resolver.Map[anchor] = profile;
+        var file = WriteDesktop(profile, "FSI module boundaries planning");
+        var t = NewTracker(resolver);
+
+        var s = Assert.Single(t.Tick().Sessions).Info;
+        Assert.Equal("FSI module boundaries planning", s.DisplayTitle);
+        Assert.Equal(TitleSources.Desktop, s.TitleSource);
+        Assert.Equal("Widget", s.Project);
+        Assert.Equal("main", s.Branch);
+        Assert.Equal("did it", s.Summary);
+
+        WriteDesktop(profile, "Renamed", branch: "feat/y");
+        File.SetLastWriteTimeUtc(file, DateTime.UtcNow.AddMinutes(1));
+        _src.Advance(TimeSpan.FromSeconds(30));
+        Assert.Equal("FSI module boundaries planning", Assert.Single(t.Tick().Sessions).Info.DisplayTitle);
+
+        _src.Advance(TimeSpan.FromSeconds(31));
+        var after = Assert.Single(t.Tick().Sessions).Info;
+        Assert.Equal("Renamed", after.DisplayTitle);
+        Assert.Equal("feat/y", after.Branch);
+    }
+
+    [Fact]
+    public void Tracker_DesktopTitle_SurvivesRestart()
+    {
+        var anchor = _src.Add(10, 100, 1, "claude.exe");
+        _insp.Set(anchor, FakeInspector.Ok(hostSessionId: DesktopHost, imagePath: ClaudePath));
+        var resolver = new FakeResolver();
+        var profile = Path.Combine(_dir, "owner2");
+        resolver.Map[anchor] = profile;
+        WriteDesktop(profile, "Persisted title");
+        var t = NewTracker(resolver);
+        t.Tick();
+        t.Dispose();
+
+        resolver.Map[anchor] = null; // nothing readable after the restart
+        Directory.Delete(profile, true);
+        var t2 = NewTracker(resolver);
+        t2.Restore();
+        var s = Assert.Single(t2.Tick().Sessions).Info;
+        Assert.Equal("Persisted title", s.DisplayTitle);
+        Assert.Equal(TitleSources.Desktop, s.TitleSource);
+    }
+
+    [Fact]
+    public void Tracker_NoDesktopFile_FallsBackToTranscriptTitle()
+    {
+        var anchor = _src.Add(10, 100, 1, "claude.exe");
+        _insp.Set(anchor, FakeInspector.Ok(hostSessionId: DesktopHost, imagePath: ClaudePath));
+        var node = _src.Add(11, 200, 10, "node.exe");
+        _insp.Set(node, FakeInspector.Ok(sessionId: "s1", hostSessionId: DesktopHost));
+        var resolver = new FakeResolver();
+        resolver.Map[anchor] = MakeProfile("owner", "first prompt");
+
+        var s = Assert.Single(NewTracker(resolver).Tick().Sessions).Info;
+        Assert.Equal("first prompt", s.DisplayTitle);
+        Assert.Equal(TitleSources.Transcript, s.TitleSource);
+        Assert.Equal("work", s.Project);
+    }
+
     [Fact]
     public void Tracker_ResolverLosesAnchor_KeepsLastResolvedProfile()
     {

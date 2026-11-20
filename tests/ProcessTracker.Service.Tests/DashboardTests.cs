@@ -179,6 +179,52 @@ public sealed class DashboardTests : IDisposable
     private static string Expand(params string[] ids) => "?expand=" + Uri.EscapeDataString(string.Join(',', ids));
 
     [Fact]
+    public async Task Overview_SessionSummary_CarriesTitleSourceProjectBranchSummary()
+    {
+        var desktop = new DesktopSessionInfo("FSI module boundaries planning", "feat/x", "wt",
+            @"C:\repos\FSI\.claude\worktrees\wt", @"C:\repos\FSI", "Planned the split.", null);
+        var desk = new SessionView(
+            new SessionInfo(UnitA, "local_a", [], null, T0, null, null, "first prompt", null, desktop), true, 1f, 100, 1);
+        var bare = new SessionView(new SessionInfo(UnitB, null, [], null, T0, T0, null, null, null), false, 0f, 0, 0);
+        _app.Tracker.View = new TrackerView(T0, default, new Dictionary<ProcessKey, ProcessView>(), [desk, bare]);
+
+        var o = await Overview();
+
+        var a = o!.Sessions.Single(s => s.Session.UnitId == UnitA).Session;
+        Assert.Equal("FSI module boundaries planning", a.Title);
+        Assert.Equal("desktop", a.TitleSource);
+        Assert.Equal("FSI", a.Project);
+        Assert.Equal("feat/x", a.Branch);
+        Assert.Equal("Planned the split.", a.Summary);
+        Assert.Equal(@"C:\repos\FSI\.claude\worktrees\wt", a.Cwd);
+        var b = o.Sessions.Single(s => s.Session.UnitId == UnitB).Session;
+        Assert.Equal(UnitB, b.Title);
+        Assert.Equal("id", b.TitleSource);
+        Assert.Null(b.Project);
+        Assert.Null(b.Branch);
+
+        var raw = await _http.GetStringAsync("/api/overview", TestContext.Current.CancellationToken);
+        Assert.Contains("\"titleSource\":\"desktop\"", raw);
+        Assert.Contains("\"project\":\"FSI\"", raw);
+        Assert.Contains("\"branch\":\"feat/x\"", raw);
+        Assert.Contains("\"summary\":\"Planned the split.\"", raw);
+    }
+
+    [Fact]
+    public async Task DashboardJs_RendersNewFieldsWithTextContentOnly()
+    {
+        var js = await _http.GetStringAsync("/dashboard/dashboard.js", TestContext.Current.CancellationToken);
+        Assert.Contains("s.project", js);
+        Assert.Contains("s.branch", js);
+        Assert.Contains("s.summary", js);
+        Assert.Contains("Ended (", js);
+        Assert.DoesNotContain(".innerHTML", js);
+        Assert.DoesNotContain(".outerHTML", js);
+        Assert.DoesNotContain("insertAdjacentHTML", js);
+        Assert.DoesNotContain(".style.cssText", js);
+    }
+
+    [Fact]
     public async Task Overview_HasLoadSessionSummariesFlatRowsForExpandedOnlyAndOrphans()
     {
         SetView(T0,

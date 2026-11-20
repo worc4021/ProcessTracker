@@ -55,6 +55,18 @@ public static class Format
         return sb.ToString();
     }
 
+    /// <summary>The console's width in columns; null when output is redirected or the width is unknown.</summary>
+    public static int? ConsoleWidth()
+    {
+        try { return Console.IsOutputRedirected || Console.WindowWidth <= 0 ? null : Console.WindowWidth; }
+        catch (IOException) { return null; }
+        catch (PlatformNotSupportedException) { return null; }
+    }
+
+    /// <summary>The length of the longest line of rendered text.</summary>
+    public static int MaxLineLength(string text) =>
+        text.Split('\n').Select(l => l.TrimEnd('\r').Length).DefaultIfEmpty(0).Max();
+
     public static string Json<T>(T value) => JsonSerializer.Serialize(value, ContractJson.Options);
 
     public static string[] ProcessRow(ProcessViewDto p, DateTime nowUtc) =>

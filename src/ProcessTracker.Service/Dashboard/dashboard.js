@@ -9,7 +9,7 @@
   var KEY = 'processtracker.dashboard.v1';
 
   // ---- persisted UI state (every storage access is guarded) ----
-  var ui = { tab: 'sessions', expanded: {}, collapsed: {}, sort: { key: 'priv', dir: -1 }, filter: '' };
+  var ui = { tab: 'sessions', expanded: {}, collapsed: {}, sort: { key: 'priv', dir: -1 }, filter: '', endedOpen: false };
   function loadUi() {
     try {
       var raw = window.localStorage.getItem(KEY);
@@ -21,6 +21,7 @@
           if (o.collapsed && typeof o.collapsed === 'object') ui.collapsed = o.collapsed;
           if (o.sort && typeof o.sort.key === 'string' && (o.sort.dir === 1 || o.sort.dir === -1)) ui.sort = o.sort;
           if (typeof o.filter === 'string') ui.filter = o.filter;
+          if (o.endedOpen === true) ui.endedOpen = true;
         }
       }
     } catch (e) { /* storage unavailable or corrupt: keep defaults */ }
@@ -92,8 +93,14 @@
     var s = o.session;
     var kids = buildForest(rowsByUnit[s.unitId] || [], nowMs);
     var idle = o.lastActiveUtc ? idleOf(o.lastActiveUtc, nowMs) : idleOf(s.lastTranscriptWriteUtc, nowMs);
+    // Secondary line: project and branch; the tooltip carries the full cwd, the unit id and the last-turn summary.
+    var sub = [s.project, s.branch].filter(function (x) { return !!x; }).join(' · ');
+    var tip = [s.title || s.unitId];
+    if (s.cwd) tip.push(s.cwd);
+    tip.push(s.unitId);
+    if (s.summary) tip.push(s.summary);
     return {
-      kind: 'session', id: s.unitId, name: s.title || s.unitId, pid: null, unit: s.unitId,
+      kind: 'session', id: s.unitId, name: s.title || s.unitId, sub: sub, tip: tip.join('\n'), pid: null, unit: s.unitId,
       cpu: s.cpuCores, priv: s.privateBytes, ws: null, read: null, write: null,
       idle: idle, state: s.isLive ? 'live' : 'ended', live: s.isLive, procs: s.processCount, children: kids
     };
@@ -126,6 +133,7 @@
   function matches(n, q) {
     if (!q) return true;
     if ((n.name || '').toLowerCase().indexOf(q) >= 0) return true;
+    if (n.sub && n.sub.toLowerCase().indexOf(q) >= 0) return true;
     return n.pid != null && String(n.pid).indexOf(q) >= 0;
   }
   // A node is shown when it, a descendant, or (for sessions) the session itself matches.
@@ -210,9 +218,10 @@
     }
     name.appendChild(tw);
     name.appendChild(el('span', 't', n.name));
+    if (n.sub) name.appendChild(el('span', 'sub', n.sub));
     if (n.pid != null) name.appendChild(el('span', 'pid', n.pid));
     if (n.alertable) { var a = el('span', 'alert', '!'); a.title = 'alertable'; name.appendChild(a); }
-    name.title = n.kind === 'session' ? n.unit : n.name + ' ' + n.pid;
+    name.title = n.kind === 'session' ? n.tip : n.name + ' ' + n.pid;
     row.appendChild(name);
     row.appendChild(el('span', n.kind === 'session' ? (n.live ? 'live' : 'ended') : 's-' + n.state, n.state));
     var live = n.kind !== 'session' || n.live;
@@ -257,11 +266,28 @@
     if (q) sessions = sessions.map(function (s) { return pruneTree(s, q, false); }).filter(Boolean);
     // live first, then by memory (the column sort applies within each session's tree)
     sessions.sort(function (a, b) { return (b.live ? 1 : 0) - (a.live ? 1 : 0) || b.priv - a.priv; });
+    // Ended sessions without processes go under one collapsed "Ended (N)" row at the bottom, newest first.
+    var shown = sessions.filter(function (s) { return s.live || s.procs > 0; });
+    var ended = sessions.filter(function (s) { return !s.live && s.procs === 0; });
     var wrap = el('div', 'scroll');
     var grid = el('div', 'grid');
     grid.appendChild(header());
     if (sessions.length === 0) grid.appendChild(el('div', 'empty', q ? 'No match.' : 'No sessions.'));
-    sessions.forEach(function (s) { addRow(grid, s, 0, q); });
+    shown.forEach(function (s) { addRow(grid, s, 0, q); });
+    if (ended.length > 0) {
+      var open = ui.endedOpen || !!q;
+      var row = el('div', 'row group');
+      var name = el('div', 'name');
+      var tw = el('button', 'tw', open ? '▼' : '▶');
+      tw.type = 'button';
+      tw.setAttribute('aria-label', 'expand or collapse ended sessions');
+      tw.addEventListener('click', function () { ui.endedOpen = !ui.endedOpen; saveUi(); renderSessions(); });
+      name.appendChild(tw);
+      name.appendChild(el('span', 't', 'Ended (' + ended.length + ')'));
+      row.appendChild(name);
+      grid.appendChild(row);
+      if (open) ended.forEach(function (s) { addRow(grid, s, 1, q); });
+    }
     wrap.appendChild(grid);
     pane.appendChild(wrap);
   }
