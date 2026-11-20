@@ -7,7 +7,7 @@ using Microsoft.Win32.SafeHandles;
 namespace ProcessTracker.Cli.Admin;
 
 /// <summary>One ACE as the trust decision sees it.</summary>
-public sealed record AceInfo(SecurityIdentifier Sid, int Mask, bool IsAllow);
+public sealed record AceInfo(SecurityIdentifier Sid, int Mask, bool IsAllow, bool InheritOnly = false);
 
 /// <summary>
 /// Handle-based folder operations: everything is decided and applied through one handle, so a folder swapped for a
@@ -77,6 +77,10 @@ internal static class NativeFolder
     /// requested, so share modes are not checked: other programs holding the folder open (a terminal's current
     /// directory, Explorer) never make this fail. Null with the Win32 error when it cannot be opened.
     /// </summary>
+    /// <summary>Read-only variant of <see cref="OpenForSecurity"/>: READ_CONTROL only, so it works without elevation.</summary>
+    public static SafeFileHandle? OpenForRead(string path, out int error) =>
+        OpenPath(path, ReadControl | FileReadAttributes | Synchronize, ShareRead | ShareWrite | ShareDelete, out error);
+
     public static SafeFileHandle? OpenForSecurity(string path, out int error) =>
         OpenPath(path, ReadControl | WriteDac | WriteOwner | FileReadAttributes | Synchronize, ShareRead | ShareWrite | ShareDelete, out error);
 
@@ -134,7 +138,8 @@ internal static class NativeFolder
             foreach (var ace in sd.DiscretionaryAcl)
                 if (ace is KnownAce known)
                     aces.Add(new AceInfo(known.SecurityIdentifier, known.AccessMask,
-                        ace.AceType is AceType.AccessAllowed or AceType.AccessAllowedCallback or AceType.AccessAllowedObject or AceType.AccessAllowedCallbackObject));
+                        ace.AceType is AceType.AccessAllowed or AceType.AccessAllowedCallback or AceType.AccessAllowedObject or AceType.AccessAllowedCallbackObject,
+                        (ace.AceFlags & AceFlags.InheritOnly) != 0));
                 else
                     aces.Add(new AceInfo(new SecurityIdentifier(WellKnownSidType.WorldSid, null), -1, true)); // unknown ACE type: assume the worst
         return (sd.Owner, aces);

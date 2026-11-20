@@ -5,7 +5,7 @@ namespace ProcessTracker.Cli.Admin;
 /// <summary>
 /// Finds winget.exe the way SYSTEM has to: the per-user alias is not on SYSTEM's PATH, so pick the newest
 /// Microsoft.DesktopAppInstaller_&lt;version&gt;_x64__8wekyb3d8bbwe package directory under WindowsApps.
-/// Keep in step with the resolution in installer/upgrade.ps1.
+/// Known limitation: x64 only, so an ARM64 machine finds no winget (the plan does not cover ARM64). Keep in step with the resolution in installer/upgrade.ps1.
 /// </summary>
 public static partial class WingetLocator
 {

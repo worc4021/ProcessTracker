@@ -24,7 +24,7 @@ public static class InstallDirCheck
 
     public static bool IsAdminOnly(string dir)
     {
-        using var handle = NativeFolder.OpenForSecurity(dir, out _);
+        using var handle = NativeFolder.OpenForRead(dir, out _);
         if (handle is null) return false;
         var (owner, aces) = NativeFolder.ReadSecurity(handle);
         return DataFolderSetup.Classify(owner, !NativeFolder.IsPlainDirectory(handle), aces, [TrustedInstaller]) == DataFolderSetup.FolderTrust.Trusted;

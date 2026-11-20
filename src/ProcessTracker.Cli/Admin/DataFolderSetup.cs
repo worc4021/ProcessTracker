@@ -68,7 +68,10 @@ public sealed class DataFolderSetup(string dataDirArg)
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
         if (isReparse || owner is null || !(owner.Equals(admins) || owner.Equals(system) || Trusted(owner))) return FolderTrust.Untrusted;
-        return aces.Any(a => a.IsAllow && (a.Mask & Danger) != 0 && !a.Sid.Equals(system) && !a.Sid.Equals(admins) && !Trusted(a.Sid))
+        // Inherit-only CREATOR OWNER (Program Files subfolders carry one) grants nothing on the folder itself; every other
+        // inherit-only ACE still counts (an inherit-only Users:Modify would let users write children admins create).
+        var creatorOwner = new SecurityIdentifier(WellKnownSidType.CreatorOwnerSid, null);
+        return aces.Any(a => a.IsAllow && !(a.InheritOnly && a.Sid.Equals(creatorOwner)) && (a.Mask & Danger) != 0 && !a.Sid.Equals(system) && !a.Sid.Equals(admins) && !Trusted(a.Sid))
             ? FolderTrust.Untrusted
             : FolderTrust.Trusted;
     }

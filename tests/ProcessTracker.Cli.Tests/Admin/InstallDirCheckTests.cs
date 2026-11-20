@@ -1,3 +1,4 @@
+using System.Security.Principal;
 using ProcessTracker.Cli.Admin;
 
 namespace ProcessTracker.Cli.Tests.Admin;
@@ -43,4 +44,32 @@ public class InstallDirCheckTests : IDisposable
 
     [Fact]
     public void IsAdminOnly_MissingFolder_IsFalse() => Assert.False(InstallDirCheck.IsAdminOnly(Path.Combine(dir, "nope")));
+
+    private static readonly SecurityIdentifier Admins = new(WellKnownSidType.BuiltinAdministratorsSid, null);
+    private static readonly SecurityIdentifier Users = new(WellKnownSidType.BuiltinUsersSid, null);
+    private static readonly SecurityIdentifier CreatorOwner = new(WellKnownSidType.CreatorOwnerSid, null);
+    private const int GenericAll = 0x10000000, Modify = 0x1301BF;
+
+    [Fact]
+    public void Classify_InheritOnlyCreatorOwner_IsTrusted() =>
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(Admins, false,
+            [new AceInfo(Admins, GenericAll, true), new AceInfo(CreatorOwner, GenericAll, true, InheritOnly: true)]));
+
+    [Fact]
+    public void Classify_NonInheritOnlyCreatorOwner_IsUntrusted() =>
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(Admins, false,
+            [new AceInfo(Admins, GenericAll, true), new AceInfo(CreatorOwner, GenericAll, true)]));
+
+    [Fact]
+    public void Classify_InheritOnlyUsersWrite_IsUntrusted() =>
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(Admins, false,
+            [new AceInfo(Admins, GenericAll, true), new AceInfo(Users, Modify, true, InheritOnly: true)]));
+
+    [Fact]
+    public void IsAdminOnly_RealProgramFilesDotnet_IsTrusted()
+    {
+        var dotnet = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "dotnet");
+        Assert.SkipUnless(Directory.Exists(dotnet), "Program Files dotnet folder is not present.");
+        Assert.True(InstallDirCheck.IsAdminOnly(dotnet));
+    }
 }
