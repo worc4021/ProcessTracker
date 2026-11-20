@@ -12,7 +12,11 @@ public sealed class ServiceOptions
     private const double MaxRetentionHours = 24 * 30;
     private const double MaxOrphanIdleAlertMinutes = 7 * 24 * 60;
 
-    /// <summary>Loopback port; 0 means the mode default (47811, or 47812 with --dev).</summary>
+    /// <summary>
+    /// Loopback port; 0 means the mode default (47811, or 47812 with --dev). Only the command line can set it (for
+    /// development and tests): the updater, install script and CLI all assume 47811, so a Port in an appsettings.json
+    /// is ignored.
+    /// </summary>
     public int Port { get; set; }
 
     /// <summary>Data folder; empty means %ProgramData%\ProcessTracker (or %LOCALAPPDATA%\ProcessTracker-dev with --dev).</summary>
@@ -42,10 +46,18 @@ public sealed class ServiceOptions
         return errors;
     }
 
-    public static ServiceOptions Resolve(IConfiguration config, bool dev)
+    /// <summary>True when a settings file sets <see cref="Port"/> that the command line does not (it is ignored).</summary>
+    public static bool HasIgnoredPort(IConfiguration config, IConfiguration commandLine) =>
+        config[nameof(Port)] is not null && commandLine[nameof(Port)] is null;
+
+    /// <param name="config">All configuration (settings files and command line).</param>
+    /// <param name="commandLine">The command line alone: the only source of <see cref="Port"/>.</param>
+    /// <param name="dev">Development mode (--dev).</param>
+    public static ServiceOptions Resolve(IConfiguration config, IConfiguration commandLine, bool dev)
     {
         var o = new ServiceOptions();
         config.Bind(o);
+        o.Port = commandLine.GetValue<int>(nameof(Port));
         if (o.Port == 0) o.Port = dev ? DevPort : ProductionPort;
         if (string.IsNullOrWhiteSpace(o.DataDir))
         {

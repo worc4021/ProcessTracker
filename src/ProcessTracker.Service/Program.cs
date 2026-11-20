@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.Extensions.Logging.EventLog;
 using Microsoft.Extensions.Primitives;
 using ProcessTracker.Core.Contracts;
 using ProcessTracker.Service;
@@ -43,7 +44,7 @@ try
     var builder = WebApplication.CreateBuilder(hostArgs);
 
     // Configuration: appsettings.json next to the exe, then %ProgramData%\ProcessTracker\appsettings.json
-    // (production only), then the command line.
+    // (production only), then the command line. Port comes from the command line only (see ServiceOptions.Port).
     var config = builder.Configuration;
     config.Sources.Clear();
     config.AddJsonFile(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), optional: true, reloadOnChange: false);
@@ -57,7 +58,7 @@ try
     config.AddInMemoryCollection(LoopbackGuard.NeutralizedHostingKeys);
 
     ServiceOptions options;
-    try { options = ServiceOptions.Resolve(config, dev); }
+    try { options = ServiceOptions.Resolve(config, mode, dev); }
     catch (InvalidOperationException e) // a value that does not convert, e.g. RetentionHours=abc
     {
         Console.Error.WriteLine("Invalid configuration: " + e.Message);
@@ -69,7 +70,24 @@ try
         return 1;
     }
 
-    if (!asConsole) builder.Services.AddWindowsService(o => o.ServiceName = "ProcessTracker");
+    if (!asConsole)
+    {
+        // As a service, Information and above go to the Application event log under the source install.ps1 creates
+        // (Get-WinEvent -ProviderName ProcessTracker). Per-request framework logging stays at Warning.
+        builder.Services.AddWindowsService(o => o.ServiceName = "ProcessTracker");
+        builder.Services.Configure<EventLogSettings>(s =>
+        {
+            s.SourceName = "ProcessTracker";
+            s.LogName = "Application";
+        });
+        builder.Logging.AddFilter<EventLogLoggerProvider>(null, LogLevel.Information);
+        builder.Logging.AddFilter<EventLogLoggerProvider>("Microsoft.AspNetCore", LogLevel.Warning);
+        builder.Logging.AddFilter<EventLogLoggerProvider>("ModelContextProtocol", LogLevel.Warning);
+    }
+    else
+    {
+        builder.Logging.AddFilter<EventLogLoggerProvider>(null, LogLevel.Warning); // console: the console has the rest
+    }
     builder.WebHost.ConfigureKestrel(k =>
     {
         k.Configure(new ConfigurationBuilder().Build(), reloadOnChange: false); // drop Kestrel:Endpoints etc.
@@ -89,6 +107,9 @@ try
     builder.Services.AddHostedService<CollectorWorker>();
 
     var app = builder.Build();
+    if (ServiceOptions.HasIgnoredPort(config, mode))
+        app.Logger.LogWarning("Port in appsettings.json is ignored; listening on {Port} (only --Port on the command line changes it)",
+            options.Port);
 
     // DNS-rebinding protection (ruling R7): a web page may get a browser to send requests to 127.0.0.1 under its own
     // host name, so only loopback Host names on our port are served, and a browser Origin must be ourselves.
