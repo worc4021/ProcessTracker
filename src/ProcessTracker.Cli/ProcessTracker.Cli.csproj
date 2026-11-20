@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>proctrack</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" />
+    <ProjectReference Include="..\ProcessTracker.Core\ProcessTracker.Core.csproj" />
+  </ItemGroup>
+</Project>

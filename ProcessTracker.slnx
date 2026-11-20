@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ProcessTracker.Cli/ProcessTracker.Cli.csproj" />
+    <Project Path="src/ProcessTracker.Core/ProcessTracker.Core.csproj" />
+    <Project Path="src/ProcessTracker.Native/ProcessTracker.Native.csproj" />
+    <Project Path="src/ProcessTracker.Service/ProcessTracker.Service.csproj" />
+    <Project Path="src/ProcessTracker.Updater/ProcessTracker.Updater.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ProcessTracker.Cli.Tests/ProcessTracker.Cli.Tests.csproj" />
+    <Project Path="tests/ProcessTracker.Core.Tests/ProcessTracker.Core.Tests.csproj" />
+    <Project Path="tests/ProcessTracker.Native.Tests/ProcessTracker.Native.Tests.csproj" />
+    <Project Path="tests/ProcessTracker.Service.Tests/ProcessTracker.Service.Tests.csproj" />
+    <Project Path="tests/ProcessTracker.Updater.Tests/ProcessTracker.Updater.Tests.csproj" />
+  </Folder>
+</Solution>

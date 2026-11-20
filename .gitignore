@@ -1,1 +1,7 @@
 .superpowers/
+bin/
+obj/
+publish/
+*.db
+.vs/
+TestResults/
