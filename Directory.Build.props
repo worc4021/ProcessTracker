@@ -14,7 +14,11 @@
   <PropertyGroup Condition="'$(DevSuffix)' != ''">
     <InformationalVersion>$(VersionPrefix)-$(DevSuffix)</InformationalVersion>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(DevSuffix)' == ''">
+  <!-- A caller-supplied -p:Version (legacy deploy scripts) still wins when there is no DevSuffix. -->
+  <PropertyGroup Condition="'$(DevSuffix)' == '' and '$(Version)' != ''">
+    <InformationalVersion>$(Version)</InformationalVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DevSuffix)' == '' and '$(Version)' == ''">
     <InformationalVersion>$(VersionPrefix)</InformationalVersion>
   </PropertyGroup>
 </Project>
