@@ -49,6 +49,11 @@ public class SettingsCarryOverTests
     [InlineData("""{"UserProfilePath":"relative\\path"}""")]
     [InlineData("""{"UserProfilePath":"\\\\server\\share\\me"}""")]
     [InlineData("""{"UserProfilePath":5}""")]
+    [InlineData("""{"UserProfilePath":"/\\server\\share\\me"}""")]
+    [InlineData("""{"UserProfilePath":"\\/server\\share\\me"}""")]
+    [InlineData("""{"UserProfilePath":"\\??\\UNC\\server\\share"}""")]
+    [InlineData("""{"UserProfilePath":"\\\\?\\C:\\x"}""")]
+    [InlineData("""{"UserProfilePath":"C:relative"}""")]
     public void Rewrite_DropsOutOfRangeValues(string input)
     {
         Assert.Empty(Parse(SettingsCarryOver.Rewrite(input)).EnumerateObject());

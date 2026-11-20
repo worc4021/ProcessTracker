@@ -61,32 +61,81 @@ public sealed class DataFolderSetupTests : IDisposable
     }
 
     [Fact]
-    public void Prepare_DataDirIsReparsePoint_Refused()
+    public void Classify_TrustsOnlyAdministratorsAndSystemOwnedNonLinks()
+    {
+        var me = WindowsIdentity.GetCurrent().User!;
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(Admins, false));
+        Assert.Equal(DataFolderSetup.FolderTrust.Trusted, DataFolderSetup.Classify(SystemSid, false));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(me, false));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(Users, false));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(null, false));
+        Assert.Equal(DataFolderSetup.FolderTrust.Untrusted, DataFolderSetup.Classify(Admins, true));
+    }
+
+    [Fact]
+    public void Prepare_DataDirIsJunction_NeverTouchesTarget_AndMovesLinkAsideWhenElevated()
     {
         var target = Path.Combine(_root, "target");
         Directory.CreateDirectory(target);
+        File.WriteAllText(Path.Combine(target, "keep.txt"), "x");
         MakeJunction(DataDir, target);
 
         var result = new DataFolderSetup(DataDir).Prepare();
 
-        Assert.False(result.Ok);
-        Assert.Contains("junction", result.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Empty(Directory.GetFileSystemEntries(target));
+        Assert.Equal(["keep.txt"], Directory.GetFileSystemEntries(target).Select(Path.GetFileName));
+        if (!DataFolderSetup.IsElevated())
+        {
+            Assert.False(result.Ok);
+            return;
+        }
+        Assert.True(result.Ok, result.Message);
+        Assert.Contains("untrusted", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(new DirectoryInfo(DataDir).Attributes.HasFlag(FileAttributes.ReparsePoint));
+        Assert.Single(Directory.GetDirectories(_root, "ProcessTracker.untrusted-*"));
     }
 
     [Fact]
-    public void Prepare_HistoryIsReparsePoint_Refused()
+    public void Prepare_UserOwnedFolder_IsMovedAside_AndFreshFolderCreated()
     {
-        var target = Path.Combine(_root, "target");
-        Directory.CreateDirectory(target);
-        Directory.CreateDirectory(DataDir);
-        MakeJunction(Path.Combine(DataDir, "history"), target);
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs an elevated process.");
+
+        var me = WindowsIdentity.GetCurrent().User!;
+        Directory.CreateDirectory(Path.Combine(DataDir, "history"));
+        File.WriteAllText(Path.Combine(DataDir, "state.db"), "planted");
+        File.WriteAllText(Path.Combine(DataDir, "appsettings.json"), """{"RetentionHours":48}""");
+        var planted = new DirectoryInfo(DataDir).GetAccessControl();
+        planted.SetOwner(me);
+        planted.AddAccessRule(new FileSystemAccessRule(Everyone, FileSystemRights.FullControl, AccessControlType.Allow));
+        new DirectoryInfo(DataDir).SetAccessControl(planted);
 
         var result = new DataFolderSetup(DataDir).Prepare();
 
-        Assert.False(result.Ok);
-        Assert.Empty(Directory.GetFileSystemEntries(target));
-        Assert.False(File.Exists(Path.Combine(DataDir, "appsettings.json")));
+        Assert.True(result.Ok, result.Message);
+        Assert.Contains("untrusted", result.Message, StringComparison.OrdinalIgnoreCase);
+        var aside = Assert.Single(Directory.GetDirectories(_root, "ProcessTracker.untrusted-*"));
+        Assert.True(File.Exists(Path.Combine(aside, "state.db")));
+        Assert.False(File.Exists(Path.Combine(DataDir, "state.db")));
+        Assert.DoesNotContain("48", File.ReadAllText(Path.Combine(DataDir, "appsettings.json")));
+        var fresh = new DirectoryInfo(DataDir).GetAccessControl();
+        Assert.Equal(Admins, fresh.GetOwner(typeof(SecurityIdentifier)));
+        Assert.DoesNotContain(fresh.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>(),
+            r => r.IdentityReference == Everyone);
+        Assert.True(Directory.Exists(Path.Combine(DataDir, "history")));
+    }
+
+    [Fact]
+    public void Remove_WithPurge_NestedJunction_TargetKept()
+    {
+        var target = Path.Combine(_root, "target");
+        Directory.CreateDirectory(target);
+        File.WriteAllText(Path.Combine(target, "keep.txt"), "x");
+        Directory.CreateDirectory(DataDir);
+        MakeJunction(Path.Combine(DataDir, "nested"), target);
+
+        try { new DataFolderSetup(DataDir).Remove(purge: true); }
+        catch (UnauthorizedAccessException) { /* tolerated without admin rights */ }
+
+        Assert.True(File.Exists(Path.Combine(target, "keep.txt")));
     }
 
     [Fact]
