@@ -44,6 +44,8 @@ public static class RestEndpoints
 
         api.MapGet("/orphans", (ITrackerHost host) => Orphans(host.View));
 
+        api.MapGet("/overview", (ITrackerHost host) => Overview(host));
+
         api.MapGet("/processes/by-pid/{pid:int}", (int pid, ITrackerHost host) =>
             host.View.Processes.Values.Where(p => p.Record.Key.Pid == pid).Select(ProcessViewDto.From).ToArray());
 
@@ -89,6 +91,16 @@ public static class RestEndpoints
         LoadAssessor.Assess(host.View, host.Recent(LoadFrames), callerUnit, new LoadOptions());
 
     public static SessionViewDto[] Sessions(TrackerView view) => view.Sessions.Select(SessionViewDto.From).ToArray();
+
+    /// <summary>One consistent snapshot for the dashboard: load, every session with its tree, and the orphans, all from one view.</summary>
+    public static OverviewDto Overview(ITrackerHost host)
+    {
+        var view = host.View;
+        var load = LoadAssessor.Assess(view, host.Recent(LoadFrames), null, new LoadOptions());
+        var processes = view.Processes.Values.ToList();
+        var sessions = view.Sessions.Select(s => SessionTreeDto.Build(s, processes)).ToArray();
+        return new OverviewDto(load, sessions, Orphans(view), ContractJson.AsUtc(view.TimestampUtc));
+    }
 
     /// <summary>The caller's session unit, or null when the caller is not a session.</summary>
     public static string? CallerUnit(ICallerResolver callers, HttpContext ctx) =>

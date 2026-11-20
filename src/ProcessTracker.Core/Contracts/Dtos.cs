@@ -129,6 +129,13 @@ public sealed record SessionTreeDto(SessionViewDto Session, IReadOnlyList<Proces
     }
 }
 
+/// <summary>
+/// Everything the dashboard shows, built from one <see cref="TrackerView"/> so the page is consistent: machine load,
+/// the sessions of <c>/api/sessions</c> each with its process tree, and the orphans of <c>/api/orphans</c>.
+/// </summary>
+public sealed record OverviewDto(
+    Load.LoadReport Load, IReadOnlyList<SessionTreeDto> Sessions, IReadOnlyList<ProcessViewDto> Orphans, DateTime TimestampUtc);
+
 /// <summary>One history point. ProcessCount is set for session series only.</summary>
 public sealed record HistoryPointDto(
     DateTime TimestampUtc, float CpuCores, long PrivateBytes, long ReadBytesDelta, long WriteBytesDelta, int? ProcessCount);

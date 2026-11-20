@@ -17,6 +17,10 @@
     <Content Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The dashboard is embedded, not served from disk: nothing writable is ever served. -->
+    <EmbeddedResource Include="Dashboard\*.*" LogicalName="dashboard/%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" />
     <ProjectReference Include="..\ProcessTracker.Core\ProcessTracker.Core.csproj" />

@@ -1,0 +1,3 @@
+# Dashboard design note
+
+A read-only browser dashboard (vanilla JS, no build step, no external resources) is served by the service itself: `GET /` redirects to `/dashboard/`, whose `index.html`, `dashboard.js` and `dashboard.css` are embedded resources (no served file system); it polls one consistent `GET /api/overview` snapshot (`OverviewDto`: load, sessions with trees, orphans, all from one `TrackerView`) every 2 s while visible; dashboard responses carry a strict CSP (`default-src 'none'`, self-only script/style/connect, no inline), `nosniff` and `no-referrer`; the loopback binding and DNS-rebinding guard apply unchanged; API text is inserted with `textContent` only; there is no mutating action (orphans offer only a copyable `proctrack kill <pid> --tree`).

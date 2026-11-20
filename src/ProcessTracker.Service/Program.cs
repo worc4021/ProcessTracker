@@ -122,6 +122,7 @@ try
     });
 
     app.MapRestEndpoints();
+    app.MapDashboard();
     app.MapMcp("/mcp");
 
     // Fail fast if the server is listening anywhere but loopback, and log what it actually bound.

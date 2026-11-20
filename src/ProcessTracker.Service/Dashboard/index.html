@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ProcessTracker</title>
+<link rel="stylesheet" href="dashboard.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header id="bar">
+  <h1>ProcessTracker</h1>
+  <span class="kpi" id="k-pressure"><span class="lbl">Pressure</span> <b>-</b></span>
+  <span class="kpi" id="k-cpu"><span class="lbl">CPU</span> <b>-</b></span>
+  <span class="kpi" id="k-cores"><span class="lbl">Free cores</span> <b>-</b></span>
+  <span class="kpi" id="k-mem"><span class="lbl">Available</span> <b>-</b></span>
+  <span class="kpi" id="k-commit"><span class="lbl">Commit headroom</span> <b>-</b></span>
+  <span class="kpi" id="k-par"><span class="lbl">Parallelism</span> <b>-</b></span>
+  <span class="kpi" id="k-time"><span class="lbl">Updated</span> <b>-</b></span>
+  <span id="stale" class="stale" hidden>stale</span>
+</header>
+<nav id="tabs">
+  <button type="button" class="tab active" data-tab="sessions">Sessions</button>
+  <button type="button" class="tab" data-tab="orphans">Orphans <span id="orphan-count" class="badge"></span></button>
+  <button type="button" class="tab" data-tab="load">Load</button>
+  <label class="filter">filter <input id="filter" type="search" placeholder="image, PID or session" autocomplete="off"></label>
+</nav>
+<main>
+  <section id="tab-sessions" class="pane"></section>
+  <section id="tab-orphans" class="pane" hidden></section>
+  <section id="tab-load" class="pane" hidden></section>
+</main>
+<script src="dashboard.js"></script>
+</body>
+</html>
