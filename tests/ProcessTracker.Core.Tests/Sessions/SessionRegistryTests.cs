@@ -54,4 +54,29 @@ public class SessionRegistryTests
         Assert.Equal(Key(1), s.Anchor);
         Assert.Equal(T, s.FirstSeenUtc);
     }
+
+    [Fact]
+    public void Observe_NewAnchorAfterExit_IsLiveAgain()
+    {
+        var reg = new SessionRegistry();
+        reg.Observe(Rec(Key(1), "s1", true));
+        reg.ProcessExited(Key(1), T.AddMinutes(5));
+        reg.Observe(Rec(Key(7), "s1", true, T.AddMinutes(10)));
+        Assert.True(reg.IsLive(Unit));
+        Assert.Equal(Key(7), reg.Get(Unit)!.Anchor);
+        Assert.Null(reg.Get(Unit)!.EndedUtc);
+    }
+
+    [Fact]
+    public void Observe_OldAnchorReobservedAfterResume_StaysLive()
+    {
+        var reg = new SessionRegistry();
+        reg.Observe(Rec(Key(1), "s1", true));
+        reg.ProcessExited(Key(1), T.AddMinutes(5));
+        reg.Observe(Rec(Key(7), "s1", true, T.AddMinutes(10)));
+        reg.Observe(Rec(Key(1), "s1", true) with { ExitedUtc = T.AddMinutes(5) });
+        reg.Observe(Rec(Key(1), "s1", true));
+        Assert.True(reg.IsLive(Unit));
+        Assert.Equal(Key(7), reg.Get(Unit)!.Anchor);
+    }
 }

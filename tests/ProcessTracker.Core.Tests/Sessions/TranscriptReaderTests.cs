@@ -56,4 +56,37 @@ public sealed class TranscriptReaderTests : IDisposable
         Write("long", "{\"type\":\"user\",\"message\":{\"content\":\"" + text + "\"},\"cwd\":\"C:\\\\a\"}");
         Assert.Equal(80, new TranscriptReader(_profile).Read("long")!.Title!.Length);
     }
+
+    [Fact]
+    public void Read_HugeFirstLine_BoundedAndNoException()
+    {
+        var huge = "{\"type\":\"attachment\",\"blob\":\"" + new string('A', 400 * 1024) + "\"}";
+        Write("huge1", huge, "{\"type\":\"user\",\"message\":{\"content\":\"late\"},\"cwd\":\"C:/a\"}");
+        var info = new TranscriptReader(_profile).Read("huge1");
+        Assert.NotNull(info);
+        Assert.Null(info.Cwd);
+        Assert.Null(info.Title);
+    }
+
+    [Fact]
+    public void Read_HugeLineAfterCwd_KeepsCwd()
+    {
+        var huge = "{\"type\":\"attachment\",\"blob\":\"" + new string('A', 400 * 1024) + "\"}";
+        Write("huge2", "{\"type\":\"attachment\",\"cwd\":\"C:/a\"}", huge);
+        var info = new TranscriptReader(_profile).Read("huge2");
+        Assert.Equal("C:/a", info!.Cwd);
+        Assert.Null(info.Title);
+    }
+
+    [Fact]
+    public void Read_EmptyId_Null() => Assert.Null(new TranscriptReader(_profile).Read(""));
+
+    [Fact]
+    public void Read_TitleTruncation_DoesNotSplitSurrogatePair()
+    {
+        var text = new string('x', 79) + "😀tail";
+        Write("sur", "{\"type\":\"user\",\"message\":{\"content\":\"" + text + "\"},\"cwd\":\"C:/a\"}");
+        var title = new TranscriptReader(_profile).Read("sur")!.Title!;
+        Assert.Equal(79, title.Length);
+    }
 }

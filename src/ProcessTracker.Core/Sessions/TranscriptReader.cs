@@ -16,7 +16,7 @@ public sealed class TranscriptReader
 
     public TranscriptInfo? Read(string claudeSessionId)
     {
-        if (!Directory.Exists(_projectsDir)) return null;
+        if (string.IsNullOrEmpty(claudeSessionId) || !Directory.Exists(_projectsDir)) return null;
         // Session ids come from process environments; refuse anything that could escape the directory.
         if (claudeSessionId.AsSpan().IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
 
@@ -33,23 +33,40 @@ public sealed class TranscriptReader
             var lastWrite = File.GetLastWriteTimeUtc(file);
             string? cwd = null, title = null;
             using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(fs);
-            var read = 0;
-            while (read < MaxBytes && (cwd is null || title is null) && reader.ReadLine() is { } line)
+            var buf = new byte[MaxBytes];
+            var n = 0;
+            int got;
+            while (n < MaxBytes && (got = fs.Read(buf, n, MaxBytes - n)) > 0) n += got;
+            // If the cap was hit, the last line may be truncated: only parse complete lines.
+            var end = n;
+            if (n == MaxBytes && fs.ReadByte() >= 0)
             {
-                read += line.Length + 1;
-                if (line.Length == 0) continue;
-                try
+                end = Array.LastIndexOf(buf, (byte)'\n', n - 1);
+                if (end < 0) end = 0;
+            }
+
+            var start = 0;
+            while (start < end && (cwd is null || title is null))
+            {
+                var nl = Array.IndexOf(buf, (byte)'\n', start, end - start);
+                var stop = nl < 0 ? end : nl;
+                if (stop > start)
                 {
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement;
-                    if (root.ValueKind != JsonValueKind.Object) continue;
-                    if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String
-                        && !string.IsNullOrEmpty(c.GetString()))
-                        cwd = c.GetString();
-                    title ??= TitleOf(root);
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(new ReadOnlyMemory<byte>(buf, start, stop - start));
+                        var root = doc.RootElement;
+                        if (root.ValueKind == JsonValueKind.Object)
+                        {
+                            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String
+                                && !string.IsNullOrEmpty(c.GetString()))
+                                cwd = c.GetString();
+                            title ??= TitleOf(root);
+                        }
+                    }
+                    catch (JsonException) { }
                 }
-                catch (JsonException) { }
+                start = stop + 1;
             }
             return new TranscriptInfo(cwd, title, lastWrite);
         }
@@ -78,6 +95,8 @@ public sealed class TranscriptReader
 
         var oneLine = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         if (oneLine.Length == 0) return null;
-        return oneLine.Length > MaxTitle ? oneLine[..MaxTitle] : oneLine;
+        if (oneLine.Length <= MaxTitle) return oneLine;
+        var len = char.IsHighSurrogate(oneLine[MaxTitle - 1]) ? MaxTitle - 1 : MaxTitle;
+        return oneLine[..len];
     }
 }
