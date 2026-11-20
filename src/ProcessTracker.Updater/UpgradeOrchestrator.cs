@@ -8,7 +8,7 @@ public enum UpgradeOutcome { Upgraded = 0, RolledBack = 1, RollbackFailed = 2 }
 /// <summary>
 /// Moves the service to a new version folder: stop, repoint <c>current</c>, start, and wait for a healthy report of the
 /// new version; on any failure, repoint to the previous version and wait for that one instead. After a successful
-/// upgrade, old version folders are pruned.
+/// upgrade, old version folders are pruned; a pruning failure is logged and never turns the upgrade into a rollback.
 /// </summary>
 public sealed class UpgradeOrchestrator(
     IServiceControl service, IJunction junction, IHealthProbe health, Action<string>? log = null, TimeSpan? pollInterval = null)
@@ -22,7 +22,8 @@ public sealed class UpgradeOrchestrator(
 
     /// <summary>
     /// Upgrades the service under <paramref name="installRoot"/> to <c>versions\<paramref name="newVersion"/></c>.
-    /// Throws <see cref="DirectoryNotFoundException"/>, before touching anything, if that folder does not exist.
+    /// Throws, before touching anything, <see cref="DirectoryNotFoundException"/> if that folder does not exist and
+    /// <see cref="InvalidOperationException"/> if <c>current</c> points nowhere (there would be nothing to roll back to).
     /// </summary>
     public async Task<UpgradeOutcome> RunAsync(string installRoot, string newVersion, TimeSpan healthTimeout)
     {
@@ -31,9 +32,11 @@ public sealed class UpgradeOrchestrator(
         var newTarget = Path.Combine(versionsDir, newVersion);
         if (!Directory.Exists(newTarget)) throw new DirectoryNotFoundException($"Version folder {newTarget} does not exist.");
 
-        var previous = junction.Target(link);
-        _log($"Upgrading {link} from {previous ?? "(none)"} to {newTarget}");
+        var previous = junction.Target(link)
+                       ?? throw new InvalidOperationException($"{link} does not point at a version folder; nothing to roll back to.");
+        _log($"Upgrading {link} from {previous} to {newTarget}");
 
+        var healthy = false;
         try
         {
             _log("Stopping the service");
@@ -42,30 +45,23 @@ public sealed class UpgradeOrchestrator(
             junction.Point(link, newTarget);
             _log("Starting the service");
             service.Start();
-            if (await WaitHealthyAsync(newVersion, healthTimeout))
-            {
-                _log($"Version {newVersion} is healthy");
-                Prune(versionsDir, newTarget, previous);
-                return UpgradeOutcome.Upgraded;
-            }
-            _log($"Version {newVersion} did not report healthy within {healthTimeout.TotalSeconds:0.#} s");
+            healthy = await WaitHealthyAsync(newVersion, healthTimeout);
+            if (!healthy) _log($"Version {newVersion} did not report healthy within {healthTimeout.TotalSeconds:0.#} s");
         }
         catch (Exception e)
         {
             _log($"Upgrade failed: {e.Message}");
         }
 
-        return await RollBackAsync(link, previous, healthTimeout);
+        if (!healthy) return await RollBackAsync(link, previous, healthTimeout);
+
+        _log($"Version {newVersion} is healthy");
+        Prune(versionsDir, newTarget, previous);
+        return UpgradeOutcome.Upgraded;
     }
 
-    private async Task<UpgradeOutcome> RollBackAsync(string link, string? previous, TimeSpan healthTimeout)
+    private async Task<UpgradeOutcome> RollBackAsync(string link, string previous, TimeSpan healthTimeout)
     {
-        if (previous is null)
-        {
-            _log("Rollback failed: there was no previous version to return to");
-            return UpgradeOutcome.RollbackFailed;
-        }
-
         var oldVersion = Path.GetFileName(Path.TrimEndingDirectorySeparator(previous));
         _log($"Rolling back to {previous}");
         try
@@ -120,28 +116,35 @@ public sealed class UpgradeOrchestrator(
 
     /// <summary>
     /// Deletes version folders other than the <see cref="VersionsToKeep"/> newest by creation time, never the current
-    /// or previous target. A folder that cannot be deleted (e.g. a locked file) is logged and skipped.
+    /// or previous target. A folder that cannot be deleted (e.g. a locked file) is logged and skipped; any other
+    /// failure is logged and ends pruning. Never throws: the upgrade has already succeeded.
     /// </summary>
-    private void Prune(string versionsDir, string current, string? previous)
+    private void Prune(string versionsDir, string current, string previous)
     {
-        var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Normalize(current) };
-        if (previous is not null) keep.Add(Normalize(previous));
-
-        var doomed = new DirectoryInfo(versionsDir).GetDirectories()
-            .OrderByDescending(d => d.CreationTimeUtc)
-            .Skip(VersionsToKeep)
-            .Where(d => !keep.Contains(Normalize(d.FullName)));
-        foreach (var dir in doomed)
+        try
         {
-            try
+            var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Normalize(current), Normalize(previous) };
+            var doomed = new DirectoryInfo(versionsDir).GetDirectories()
+                .OrderByDescending(d => d.CreationTimeUtc)
+                .Skip(VersionsToKeep)
+                .Where(d => !keep.Contains(Normalize(d.FullName)));
+            foreach (var dir in doomed)
             {
-                _log($"Pruning {dir.FullName}");
-                dir.Delete(recursive: true);
+                try
+                {
+                    _log($"Pruning {dir.FullName}");
+                    dir.Delete(recursive: true);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    _log($"Could not prune {dir.FullName}: {e.Message}; leaving it");
+                }
             }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                _log($"Could not prune {dir.FullName}: {e.Message}; leaving it");
-            }
+        }
+        catch (Exception e)
+        {
+            try { _log($"Could not prune old versions: {e.Message}"); }
+            catch { /* logging must not undo a healthy upgrade either */ }
         }
     }
 

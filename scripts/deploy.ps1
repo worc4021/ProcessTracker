@@ -5,7 +5,8 @@
 
 .DESCRIPTION
     Run from an elevated PowerShell in the checkout, after install.ps1 has registered the service.
-      1. dotnet test (stops on failure).
+      1. dotnet test, without the timing-sensitive tests (trait Category=Perf), so a loaded machine cannot fail a
+         deploy (stops on failure).
       2. Version = VersionPrefix + "-local.yyyyMMddHHmm".
       3. Publishes the service, the CLI (proctrack) and the updater, self-contained win-x64, into <Root>\versions\<version>.
       4. Copies the updater to %TEMP% and runs it from there (it must not run from a folder it swaps). The updater stops
@@ -61,8 +62,8 @@ try {
         throw 'The ProcessTracker service is not installed; run install.ps1 first.'
     }
 
-    Write-Host '== Running tests' -ForegroundColor Cyan
-    Invoke-Dotnet test --solution (Join-Path $repo 'ProcessTracker.slnx')
+    Write-Host '== Running tests (without the timing-sensitive Category=Perf ones)' -ForegroundColor Cyan
+    Invoke-Dotnet test --solution (Join-Path $repo 'ProcessTracker.slnx') '--' --filter-not-trait 'Category=Perf' # '--' quoted: a bare -- would be eaten by PowerShell
 
     $prefix = (& dotnet msbuild (Join-Path $repo 'src\ProcessTracker.Service\ProcessTracker.Service.csproj') -getProperty:VersionPrefix)
     if ($LASTEXITCODE -ne 0 -or -not $prefix) { throw 'Could not read VersionPrefix.' }

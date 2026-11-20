@@ -90,6 +90,60 @@ public sealed class UpgradeOrchestratorTests : IDisposable
     }
 
     [Fact]
+    public async Task StopThrows_RolledBack()
+    {
+        Layout("1.0.1", "1.0.1", "1.0.2");
+        _service.StopFailures = 1;
+
+        var outcome = await Orchestrator().RunAsync(_root, "1.0.2", Timeout);
+
+        Assert.Equal(UpgradeOutcome.RolledBack, outcome);
+        Assert.Equal(VersionDir("1.0.1"), _junction.Target(Link));
+        Assert.Equal("1.0.1", _service.RunningVersion);
+    }
+
+    [Fact]
+    public async Task PointThrows_RolledBack()
+    {
+        Layout("1.0.1", "1.0.1", "1.0.2");
+        _junction.ThrowOnPointTo = VersionDir("1.0.2");
+
+        var outcome = await Orchestrator().RunAsync(_root, "1.0.2", Timeout);
+
+        Assert.Equal(UpgradeOutcome.RolledBack, outcome);
+        Assert.Equal(VersionDir("1.0.1"), _junction.Target(Link));
+        Assert.Equal("1.0.1", _service.RunningVersion);
+        Assert.Equal(["stop", "stop", "start"], _service.Calls);
+    }
+
+    [Fact]
+    public async Task NoPreviousVersion_FailsBeforeStopping_NothingChanged()
+    {
+        Directory.CreateDirectory(VersionDir("1.0.2")); // no current junction
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Orchestrator().RunAsync(_root, "1.0.2", Timeout));
+
+        Assert.Empty(_service.Calls);
+        Assert.Null(_junction.Target(Link));
+    }
+
+    [Fact]
+    public async Task PruneFailure_DoesNotRollBackAHealthyUpgrade()
+    {
+        Layout("1.0.4", "1.0.1", "1.0.2", "1.0.3", "1.0.4", "1.0.5");
+        var orchestrator = new UpgradeOrchestrator(_service, _junction, _health,
+            m => { if (m.StartsWith("Pruning ", StringComparison.Ordinal)) throw new InvalidOperationException("boom"); _log.Add(m); },
+            pollInterval: TimeSpan.FromMilliseconds(10));
+
+        var outcome = await orchestrator.RunAsync(_root, "1.0.5", Timeout);
+
+        Assert.Equal(UpgradeOutcome.Upgraded, outcome);
+        Assert.Equal(VersionDir("1.0.5"), _junction.Target(Link));
+        Assert.Equal(["stop", "start"], _service.Calls);
+        Assert.Contains(_log, l => l.Contains("boom", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RollbackAlsoUnhealthy_RollbackFailed()
     {
         Layout("1.0.1", "1.0.1", "1.0.2");
@@ -131,9 +185,16 @@ public sealed class UpgradeOrchestratorTests : IDisposable
     {
         private readonly Dictionary<string, string> _links = new(StringComparer.OrdinalIgnoreCase);
 
+        public string? ThrowOnPointTo { get; set; }
+
         public string? Target(string link) => _links.GetValueOrDefault(link);
 
-        public void Point(string link, string target) => _links[link] = target;
+        public void Point(string link, string target)
+        {
+            if (string.Equals(target, ThrowOnPointTo, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("mklink failed");
+            _links[link] = target;
+        }
     }
 
     /// <summary>A service that runs whatever version folder the junction points at when it starts.</summary>
@@ -142,10 +203,16 @@ public sealed class UpgradeOrchestratorTests : IDisposable
         public List<string> Calls { get; } = [];
         public string? RunningVersion { get; private set; }
         public string? ThrowOnStartOf { get; set; }
+        public int StopFailures { get; set; }
 
         public void Stop(TimeSpan timeout)
         {
             Calls.Add("stop");
+            if (StopFailures > 0)
+            {
+                StopFailures--;
+                throw new InvalidOperationException("service did not stop"); // still running the old version
+            }
             RunningVersion = null;
         }
 

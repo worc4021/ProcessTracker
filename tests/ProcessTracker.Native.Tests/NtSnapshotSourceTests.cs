@@ -29,7 +29,7 @@ public class NtSnapshotSourceTests
         Assert.True(s.TotalPhysicalBytes >= s.AvailablePhysicalBytes);
     }
 
-    [Fact] public void TwoConsecutiveSnapshots_Under50ms()   // budget guard
+    [Fact, Trait("Category", "Perf")] public void TwoConsecutiveSnapshots_Under50ms()   // budget guard; timing-sensitive
     {
         var src = new NtSnapshotSource(); src.Take();
         var sw = Stopwatch.StartNew(); src.Take();

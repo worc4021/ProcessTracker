@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
     Uninstalls ProcessTracker: stops and deletes the service, removes the Claude Code MCP entry, the PATH entry and the
-    installed versions. Keeps %ProgramData%\ProcessTracker (history, state, settings, logs) unless -PurgeData is given.
+    installed versions. Keeps %ProgramData%\ProcessTracker (history, state, settings) and the ProcessTracker event source
+    unless -PurgeData is given.
 
 .DESCRIPTION
     Run from an elevated PowerShell as the user who ran install.ps1 (the user PATH and Claude Code config of the
@@ -14,7 +15,8 @@
     Install root holding versions\ and the current junction.
 
 .PARAMETER PurgeData
-    Also deletes %ProgramData%\ProcessTracker.
+    Also deletes %ProgramData%\ProcessTracker and the ProcessTracker event source. Refuses (before changing anything)
+    if %ProgramData%\ProcessTracker is a junction or symbolic link, which would make it delete the link's target.
 #>
 [CmdletBinding()]
 param(
@@ -34,6 +36,14 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $serviceName = 'ProcessTracker'
 $current = Join-Path $Root 'current'
 $dataDir = Join-Path $env:ProgramData 'ProcessTracker'
+
+if ($PurgeData) {
+    $item = Get-Item -LiteralPath $dataDir -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Write-Host "$dataDir is a junction or symbolic link; -PurgeData refuses to delete through it. Nothing was changed." -ForegroundColor Red
+        exit 3
+    }
+}
 
 # Tells running programs (Explorer, new terminals) that the user environment changed.
 function Send-EnvironmentChange {
@@ -110,9 +120,13 @@ try {
             Write-Host "== Deleting $dataDir" -ForegroundColor Cyan
             Remove-Item -LiteralPath $dataDir -Recurse -Force
         }
+        if ([Diagnostics.EventLog]::SourceExists($serviceName)) {
+            Write-Host "== Deleting the $serviceName event source" -ForegroundColor Cyan
+            [Diagnostics.EventLog]::DeleteEventSource($serviceName)
+        }
     }
     else {
-        Write-Host "Kept $dataDir (history, state, settings, logs); run with -PurgeData to delete it." -ForegroundColor Cyan
+        Write-Host "Kept $dataDir (history, state, settings) and the $serviceName event source; run with -PurgeData to delete them." -ForegroundColor Cyan
     }
 }
 catch {
