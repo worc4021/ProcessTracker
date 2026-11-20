@@ -5,8 +5,16 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <VersionPrefix>0.1.0</VersionPrefix>
+    <!-- version.txt is the single version source (release-please bumps it). -->
+    <VersionPrefix>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)version.txt').Trim())</VersionPrefix>
     <!-- /api/health reports the informational version; the updater compares it with the deployed folder name, so no +<git hash>. -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+  <!-- Local deploys pass -p:DevSuffix=dev.yyyyMMddHHmm; release builds leave it empty. -->
+  <PropertyGroup Condition="'$(DevSuffix)' != ''">
+    <InformationalVersion>$(VersionPrefix)-$(DevSuffix)</InformationalVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DevSuffix)' == ''">
+    <InformationalVersion>$(VersionPrefix)</InformationalVersion>
   </PropertyGroup>
 </Project>
