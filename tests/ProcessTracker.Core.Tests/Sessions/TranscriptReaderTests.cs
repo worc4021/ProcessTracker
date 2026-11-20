@@ -79,6 +79,38 @@ public sealed class TranscriptReaderTests : IDisposable
     }
 
     [Fact]
+    public void Read_SkipsMetaAndInjectedUserRecords_ForTitle()
+    {
+        Write("meta",
+            """{"type":"user","isMeta":true,"message":{"content":"Caveat: the messages below were generated"},"cwd":"C:\\a"}""",
+            """{"type":"user","message":{"content":"<system-reminder>\nCodebase and user instructions</system-reminder>"}}""",
+            """{"type":"user","message":{"content":[{"type":"text","text":"  <command-name>/clear</command-name>"}]}}""",
+            """{"type":"user","message":{"content":"the real question"}}""");
+        var info = new TranscriptReader(_profile).Read("meta");
+        Assert.Equal(@"C:\a", info!.Cwd);
+        Assert.Equal("the real question", info.Title);
+    }
+
+    [Fact]
+    public void Read_IsMetaFalse_StillCountsAsTitle()
+    {
+        Write("nometa", """{"type":"user","isMeta":false,"message":{"content":"plain"},"cwd":"C:\\a"}""");
+        Assert.Equal("plain", new TranscriptReader(_profile).Read("nometa")!.Title);
+    }
+
+    [Fact]
+    public void LastWriteUtc_StatsTheFile_WithoutParsing()
+    {
+        var path = Write("stat", "not json at all");
+        var when = new DateTime(2026, 3, 4, 5, 6, 7, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(path, when);
+        var reader = new TranscriptReader(_profile);
+        Assert.Equal(when, reader.LastWriteUtc("stat"));
+        Assert.Null(reader.LastWriteUtc("missing"));
+        Assert.Null(reader.LastWriteUtc(@"..\escape"));
+    }
+
+    [Fact]
     public void Read_EmptyId_Null() => Assert.Null(new TranscriptReader(_profile).Read(""));
 
     [Fact]

@@ -336,10 +336,20 @@ public sealed class Tracker : IDisposable
         }
     }
 
+    /// <summary>
+    /// Parses a transcript the first time; a refresh of the same transcript only stats the file once the session's
+    /// cwd and title are known.
+    /// </summary>
     private void ReadTranscript(string unit, string claudeSessionId, DateTime now)
     {
+        var refresh = _transcriptRead.TryGetValue(unit, out var last) && last.Id == claudeSessionId;
         _transcriptRead[unit] = (claudeSessionId, now);
-        if (_transcripts!.Read(claudeSessionId) is { } info) _sessions.ApplyTranscript(unit, info);
+        if (refresh && _sessions.Get(unit) is { Cwd: not null, Title: not null })
+        {
+            if (_transcripts!.LastWriteUtc(claudeSessionId) is { } written)
+                _sessions.ApplyTranscript(unit, new TranscriptInfo(null, null, written));
+        }
+        else if (_transcripts!.Read(claudeSessionId) is { } info) _sessions.ApplyTranscript(unit, info);
     }
 
     /// <summary>Sessions that are live, have live processes, or ended within the retention window; newest first.</summary>

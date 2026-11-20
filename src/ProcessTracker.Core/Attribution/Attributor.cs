@@ -16,16 +16,17 @@ public sealed class Attributor
             var isClaudeExe = string.Equals(proc.ImageName, ClaudeImage, StringComparison.OrdinalIgnoreCase);
             var isDesktopApp = inspect.ImagePath?.Contains(DesktopAppMarker, StringComparison.OrdinalIgnoreCase) == true;
 
-            // 1. Host session id.
+            // 1. Host session id. A present-but-empty CLAUDE_CODE_SESSION_ID counts as absent.
+            var sessionId = string.IsNullOrEmpty(inspect.SessionId) ? null : inspect.SessionId;
             if (!string.IsNullOrEmpty(inspect.HostSessionId))
-                return new Attr(AttributionKind.Session, "host:" + inspect.HostSessionId, inspect.SessionId,
-                    isClaudeExe && inspect.SessionId == null);
+                return new Attr(AttributionKind.Session, "host:" + inspect.HostSessionId, sessionId,
+                    isClaudeExe && sessionId is null);
 
             // 2. Session id only (terminal child).
-            if (!string.IsNullOrEmpty(inspect.SessionId))
+            if (sessionId is not null)
                 return parent is { Kind: AttributionKind.Session }
-                    ? new Attr(AttributionKind.Session, parent.UnitId, inspect.SessionId, false)
-                    : new Attr(AttributionKind.Session, "sid:" + inspect.SessionId, inspect.SessionId, false);
+                    ? new Attr(AttributionKind.Session, parent.UnitId, sessionId, false)
+                    : new Attr(AttributionKind.Session, "sid:" + sessionId, sessionId, false);
 
             // 3. Terminal claude.exe (not the desktop app's copy).
             if (isClaudeExe && inspect.ImagePath is not null && !isDesktopApp)

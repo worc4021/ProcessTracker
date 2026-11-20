@@ -424,6 +424,74 @@ public sealed class TrackerTests : IDisposable
     }
 
     [Fact]
+    public void Tick_TranscriptRefresh_OnlyStatsOnceCwdAndTitleAreKnown()
+    {
+        var profile = Path.Combine(_dir, "profile");
+        var project = Path.Combine(profile, ".claude", "projects", "C--work");
+        Directory.CreateDirectory(project);
+        var file = Path.Combine(project, "s1.jsonl");
+        File.WriteAllText(file, """{"type":"user","cwd":"C:\\work","message":{"content":"first title"}}""" + "\n");
+        AddAnchor();
+        var node = _src.Add(11, 200, 10, "node.exe");
+        _insp.Set(node, FakeInspector.Ok(sessionId: "s1", hostSessionId: "h1"));
+        var t = NewTracker(userProfile: profile);
+        Assert.Equal("first title", Assert.Single(t.Tick().Sessions).Info.Title);
+
+        File.WriteAllText(file, """{"type":"user","cwd":"C:\\other","message":{"content":"changed title"}}""" + "\n");
+        var written = new DateTime(2026, 2, 2, 0, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(file, written);
+        Step(TimeSpan.FromSeconds(61));
+        var s = Assert.Single(t.Tick().Sessions).Info;
+
+        Assert.Equal("first title", s.Title); // not re-read
+        Assert.Equal(@"C:\work", s.Cwd);
+        Assert.Equal(written, s.LastTranscriptWriteUtc);
+    }
+
+    [Fact]
+    public void Tick_NewClaudeSessionIdInKnownUnit_IsParsedAgain()
+    {
+        var profile = Path.Combine(_dir, "profile");
+        var project = Path.Combine(profile, ".claude", "projects", "C--work");
+        Directory.CreateDirectory(project);
+        File.WriteAllText(Path.Combine(project, "s1.jsonl"),
+            """{"type":"user","cwd":"C:\\work","message":{"content":"first conversation"}}""" + "\n");
+        File.WriteAllText(Path.Combine(project, "s2.jsonl"),
+            """{"type":"user","cwd":"C:\\work","message":{"content":"after clear"}}""" + "\n");
+        AddAnchor();
+        var n1 = _src.Add(11, 200, 10, "node.exe");
+        _insp.Set(n1, FakeInspector.Ok(sessionId: "s1", hostSessionId: "h1"));
+        var t = NewTracker(userProfile: profile);
+        Assert.Equal("first conversation", Assert.Single(t.Tick().Sessions).Info.Title);
+
+        var n2 = _src.Add(12, 300, 10, "node.exe");
+        _insp.Set(n2, FakeInspector.Ok(sessionId: "s2", hostSessionId: "h1"));
+        Step();
+
+        Assert.Equal("after clear", Assert.Single(t.Tick().Sessions).Info.Title);
+    }
+
+    [Fact]
+    public void Tick_TranscriptRefresh_RereadsWhileTitleUnknown()
+    {
+        var profile = Path.Combine(_dir, "profile");
+        var project = Path.Combine(profile, ".claude", "projects", "C--work");
+        Directory.CreateDirectory(project);
+        var file = Path.Combine(project, "s1.jsonl");
+        File.WriteAllText(file, """{"type":"attachment","cwd":"C:\\work"}""" + "\n");
+        AddAnchor();
+        var node = _src.Add(11, 200, 10, "node.exe");
+        _insp.Set(node, FakeInspector.Ok(sessionId: "s1", hostSessionId: "h1"));
+        var t = NewTracker(userProfile: profile);
+        Assert.Null(Assert.Single(t.Tick().Sessions).Info.Title);
+
+        File.AppendAllText(file, """{"type":"user","message":{"content":"late title"}}""" + "\n");
+        Step(TimeSpan.FromSeconds(61));
+
+        Assert.Equal("late title", Assert.Single(t.Tick().Sessions).Info.Title);
+    }
+
+    [Fact]
     public void Tick_Maintenance_RunsHourly()
     {
         // Snapshot clock far behind the wall clock, so the exited record is past retention as soon as it exits.

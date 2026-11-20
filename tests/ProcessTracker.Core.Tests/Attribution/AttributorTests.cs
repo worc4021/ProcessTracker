@@ -33,6 +33,21 @@ public class AttributorTests
     }
 
     [Fact]
+    public void HostId_OnClaudeExe_WithEmptySessionId_IsAnchor_AndSessionIdNormalisedToNull()
+    {
+        // CLAUDE_CODE_SESSION_ID= (present but empty) comes back from the inspector as "".
+        var a = Sut.Attribute(Proc("claude.exe"), Ok(sid: "", host: "local_x", path: @"C:\x\claude.exe"), null);
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "host:local_x", null, true), a);
+    }
+
+    [Fact]
+    public void HostId_OnChild_WithEmptySessionId_HasNullSessionId()
+    {
+        var a = Sut.Attribute(Proc("node.exe"), Ok(sid: "", host: "local_x"), null);
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "host:local_x", null, false), a);
+    }
+
+    [Fact]
     public void HostAndSessionId_OnPython_IsSessionNotAnchor()
     {
         var a = Sut.Attribute(Proc("python.exe"), Ok(sid: "sid1", host: "local_x"), null);

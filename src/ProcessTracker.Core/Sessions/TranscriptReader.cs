@@ -1,72 +1,67 @@
+using System.Buffers;
 using System.Text.Json;
 
 namespace ProcessTracker.Core.Sessions;
 
 public sealed record TranscriptInfo(string? Cwd, string? Title, DateTime LastWriteUtc);
 
-/// <summary>Reads cwd and a title from a Claude Code transcript (<c>.claude\projects\*\&lt;id&gt;.jsonl</c>).</summary>
+/// <summary>
+/// Reads cwd and a title from a Claude Code transcript (<c>.claude\projects\*\&lt;id&gt;.jsonl</c>). Single-threaded use.
+/// </summary>
 public sealed class TranscriptReader
 {
     private const int MaxBytes = 256 * 1024;
+    private const int Chunk = 32 * 1024;
     private const int MaxTitle = 80;
+    private const int MaxCachedPaths = 1024;
     private readonly string _projectsDir;
+    private readonly Dictionary<string, string> _paths = new(StringComparer.Ordinal);
 
     public TranscriptReader(string userProfilePath) =>
         _projectsDir = Path.Combine(userProfilePath, ".claude", "projects");
 
+    /// <summary>
+    /// The first cwd and the first real user prompt (as title) within the first 256 KB; reading stops as soon as
+    /// both are found. Null when the transcript does not exist or cannot be read.
+    /// </summary>
     public TranscriptInfo? Read(string claudeSessionId)
     {
-        if (string.IsNullOrEmpty(claudeSessionId) || !Directory.Exists(_projectsDir)) return null;
-        // Session ids come from process environments; refuse anything that could escape the directory.
-        if (claudeSessionId.AsSpan().IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
-
         try
         {
-            string? file = null;
-            foreach (var dir in Directory.EnumerateDirectories(_projectsDir))
-            {
-                var candidate = Path.Combine(dir, claudeSessionId + ".jsonl");
-                if (File.Exists(candidate)) { file = candidate; break; }
-            }
-            if (file is null) return null;
+            if (Locate(claudeSessionId) is not { } file) return null;
 
             var lastWrite = File.GetLastWriteTimeUtc(file);
             string? cwd = null, title = null;
             using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var buf = new byte[MaxBytes];
-            var n = 0;
-            int got;
-            while (n < MaxBytes && (got = fs.Read(buf, n, MaxBytes - n)) > 0) n += got;
-            // If the cap was hit, the last line may be truncated: only parse complete lines.
-            var end = n;
-            if (n == MaxBytes && fs.ReadByte() >= 0)
+            var buf = ArrayPool<byte>.Shared.Rent(MaxBytes);
+            try
             {
-                end = Array.LastIndexOf(buf, (byte)'\n', n - 1);
-                if (end < 0) end = 0;
-            }
-
-            var start = 0;
-            while (start < end && (cwd is null || title is null))
-            {
-                var nl = Array.IndexOf(buf, (byte)'\n', start, end - start);
-                var stop = nl < 0 ? end : nl;
-                if (stop > start)
+                int n = 0, start = 0;
+                var eof = false;
+                while (cwd is null || title is null)
                 {
-                    try
+                    var nl = Array.IndexOf(buf, (byte)'\n', start, n - start);
+                    if (nl < 0)
                     {
-                        using var doc = JsonDocument.Parse(new ReadOnlyMemory<byte>(buf, start, stop - start));
-                        var root = doc.RootElement;
-                        if (root.ValueKind == JsonValueKind.Object)
+                        if (!eof && n < MaxBytes)
                         {
-                            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String
-                                && !string.IsNullOrEmpty(c.GetString()))
-                                cwd = c.GetString();
-                            title ??= TitleOf(root);
+                            var got = fs.Read(buf, n, Math.Min(Chunk, MaxBytes - n));
+                            if (got == 0) eof = true;
+                            n += got;
+                            continue;
                         }
+                        // No newline left: the rest is a final line only if the whole file has been read; past the
+                        // cap the line is truncated and skipped.
+                        if (eof || fs.ReadByte() < 0) Parse(buf.AsMemory(start, n - start), ref cwd, ref title);
+                        break;
                     }
-                    catch (JsonException) { }
+                    Parse(buf.AsMemory(start, nl - start), ref cwd, ref title);
+                    start = nl + 1;
                 }
-                start = stop + 1;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
             }
             return new TranscriptInfo(cwd, title, lastWrite);
         }
@@ -74,10 +69,68 @@ public sealed class TranscriptReader
         catch (UnauthorizedAccessException) { return null; }
     }
 
+    /// <summary>Last write time of the transcript without reading it; null when it does not exist.</summary>
+    public DateTime? LastWriteUtc(string claudeSessionId)
+    {
+        try
+        {
+            if (Locate(claudeSessionId) is not { } file) return null;
+            var info = new FileInfo(file);
+            return info.Exists ? info.LastWriteTimeUtc : null;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>The transcript path for a session id (cached once found), or null.</summary>
+    private string? Locate(string claudeSessionId)
+    {
+        if (string.IsNullOrEmpty(claudeSessionId)) return null;
+        // Session ids come from process environments; refuse anything that could escape the directory.
+        if (claudeSessionId.AsSpan().IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
+        if (_paths.TryGetValue(claudeSessionId, out var cached))
+        {
+            if (File.Exists(cached)) return cached;
+            _paths.Remove(claudeSessionId);
+        }
+        if (!Directory.Exists(_projectsDir)) return null;
+
+        foreach (var dir in Directory.EnumerateDirectories(_projectsDir))
+        {
+            var candidate = Path.Combine(dir, claudeSessionId + ".jsonl");
+            if (!File.Exists(candidate)) continue;
+            if (_paths.Count >= MaxCachedPaths) _paths.Clear();
+            _paths[claudeSessionId] = candidate;
+            return candidate;
+        }
+        return null;
+    }
+
+    private static void Parse(ReadOnlyMemory<byte> line, ref string? cwd, ref string? title)
+    {
+        if (line.IsEmpty) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return;
+            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String
+                && !string.IsNullOrEmpty(c.GetString()))
+                cwd = c.GetString();
+            title ??= TitleOf(root);
+        }
+        catch (JsonException) { }
+    }
+
+    /// <summary>
+    /// The text of a user record typed by the user. Records Claude Code injects are skipped: those marked
+    /// <c>"isMeta": true</c> and those whose text starts with a tag such as &lt;system-reminder&gt; or &lt;command-name&gt;.
+    /// </summary>
     private static string? TitleOf(JsonElement root)
     {
         if (!root.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String
             || type.GetString() != "user") return null;
+        if (root.TryGetProperty("isMeta", out var meta) && meta.ValueKind == JsonValueKind.True) return null;
         if (!root.TryGetProperty("message", out var msg) || msg.ValueKind != JsonValueKind.Object
             || !msg.TryGetProperty("content", out var content)) return null;
 
@@ -94,7 +147,7 @@ public sealed class TranscriptReader
         if (text is null) return null;
 
         var oneLine = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-        if (oneLine.Length == 0) return null;
+        if (oneLine.Length == 0 || oneLine[0] == '<') return null;
         if (oneLine.Length <= MaxTitle) return oneLine;
         var len = char.IsHighSurrogate(oneLine[MaxTitle - 1]) ? MaxTitle - 1 : MaxTitle;
         return oneLine[..len];
