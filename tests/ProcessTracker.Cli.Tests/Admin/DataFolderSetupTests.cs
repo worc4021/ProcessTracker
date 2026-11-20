@@ -67,6 +67,13 @@ public sealed class DataFolderSetupTests : IDisposable
     private static DataFolderSetup.FolderTrust Classify(SecurityIdentifier? owner, bool reparse, params AceInfo[] aces) =>
         DataFolderSetup.Classify(owner, reparse, aces);
 
+    /// <summary>Elevated only: a folder created with our protected Admin/SYSTEM DACL, i.e. one Prepare must keep.</summary>
+    private void CreateTrustedDataDir()
+    {
+        Directory.CreateDirectory(_root);
+        Assert.True(DataFolderSetup.TryCreateSecured(DataDir));
+    }
+
     [Fact]
     public void Classify_Phase1InstallAcl_IsTrusted()
     {
@@ -97,7 +104,9 @@ public sealed class DataFolderSetupTests : IDisposable
     [Theory]
     [InlineData(0x2)]        // FILE_ADD_FILE / WRITE_DATA
     [InlineData(0x4)]        // FILE_ADD_SUBDIRECTORY / APPEND_DATA
+    [InlineData(0x10)]       // FILE_WRITE_EA
     [InlineData(0x40)]       // FILE_DELETE_CHILD
+    [InlineData(0x100)]      // FILE_WRITE_ATTRIBUTES
     [InlineData(0x10000)]    // DELETE
     [InlineData(0x40000)]    // WRITE_DAC
     [InlineData(0x80000)]    // WRITE_OWNER
@@ -134,11 +143,10 @@ public sealed class DataFolderSetupTests : IDisposable
     {
         Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs an elevated process.");
 
-        // Elevated: folders created here are owned by Administrators; give Users the %ProgramData%-style AddFile right.
-        Directory.CreateDirectory(DataDir);
+        // Otherwise-trusted folder (Administrators owner, protected Admin/SYSTEM DACL) plus ONLY a Users AddFile ACE.
+        CreateTrustedDataDir();
         File.WriteAllText(Path.Combine(DataDir, "state.db"), "planted");
         var acl = new DirectoryInfo(DataDir).GetAccessControl();
-        acl.SetOwner(Admins);
         acl.AddAccessRule(new FileSystemAccessRule(Users, FileSystemRights.CreateFiles | FileSystemRights.AppendData,
             InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow));
         new DirectoryInfo(DataDir).SetAccessControl(acl);
@@ -206,14 +214,17 @@ public sealed class DataFolderSetupTests : IDisposable
     [Fact]
     public void Remove_WithPurge_NestedJunction_TargetKept()
     {
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned, locked) folder, which needs elevation.");
         var target = Path.Combine(_root, "target");
         Directory.CreateDirectory(target);
         File.WriteAllText(Path.Combine(target, "keep.txt"), "x");
-        Directory.CreateDirectory(DataDir);
+        CreateTrustedDataDir();
         MakeJunction(Path.Combine(DataDir, "nested"), target);
 
-        try { new DataFolderSetup(DataDir).Remove(purge: true); }
-        catch (UnauthorizedAccessException) { /* tolerated without admin rights */ }
+        var result = new DataFolderSetup(DataDir).Remove(purge: true);
+
+        Assert.True(result.Ok, result.Message);
+        Assert.False(Directory.Exists(DataDir));
 
         Assert.True(File.Exists(Path.Combine(target, "keep.txt")));
     }
@@ -235,7 +246,7 @@ public sealed class DataFolderSetupTests : IDisposable
     {
         Assert.SkipUnless(DataFolderSetup.IsElevated(), "Setting the Administrators owner needs an elevated process.");
 
-        Directory.CreateDirectory(DataDir);
+        CreateTrustedDataDir(); // a folder under %TEMP% would inherit the current user's ACE and be untrusted
         var settings = Path.Combine(DataDir, "appsettings.json");
         File.WriteAllText(settings, """{"RetentionHours":48,"DataDir":"D:\\evil"}""");
         var planted = new FileInfo(settings).GetAccessControl();
@@ -270,8 +281,10 @@ public sealed class DataFolderSetupTests : IDisposable
     }
 
     [Fact]
-    public void Remove_WithPurge_DeletesFolder()
+    public void Remove_WithPurge_DeletesTrustedFolder()
     {
+        Assert.SkipUnless(DataFolderSetup.IsElevated(), "Needs a trusted (Administrators-owned, locked) folder, which needs elevation.");
+        CreateTrustedDataDir();
         Directory.CreateDirectory(Path.Combine(DataDir, "history"));
         File.WriteAllText(Path.Combine(DataDir, "state.db"), "x");
 
@@ -279,6 +292,18 @@ public sealed class DataFolderSetupTests : IDisposable
 
         Assert.True(result.Ok, result.Message);
         Assert.False(Directory.Exists(DataDir));
+    }
+
+    [Fact]
+    public void Remove_WithPurge_UntrustedFolder_RefusedAndKept()
+    {
+        Directory.CreateDirectory(Path.Combine(DataDir, "history")); // under %TEMP%: inherits the current user's rights
+        File.WriteAllText(Path.Combine(DataDir, "state.db"), "x");
+
+        var result = new DataFolderSetup(DataDir).Remove(purge: true);
+
+        Assert.False(result.Ok);
+        Assert.True(File.Exists(Path.Combine(DataDir, "state.db")));
     }
 
     [Fact]

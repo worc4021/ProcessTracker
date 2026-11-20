@@ -15,12 +15,15 @@ public sealed record AceInfo(SecurityIdentifier Sid, int Mask, bool IsAllow);
 /// </summary>
 internal static class NativeFolder
 {
-    private const uint ReadControl = 0x20000, WriteDac = 0x40000, WriteOwner = 0x80000, FileReadAttributes = 0x80, Synchronize = 0x100000;
-    private const uint ShareRead = 1, ShareWrite = 2; // no FILE_SHARE_DELETE: the folder cannot be renamed or replaced while held
+    private const uint Delete = 0x10000, ReadControl = 0x20000, WriteDac = 0x40000, WriteOwner = 0x80000, FileReadAttributes = 0x80, Synchronize = 0x100000;
+    // No FILE_SHARE_DELETE. Share modes are only checked for handles with data or DELETE access, so the open below
+    // requests DELETE: that is what stops anyone (including us) renaming or replacing the folder while it is held, and
+    // makes the open fail if a user already holds a handle with DELETE.
+    private const uint ShareRead = 1, ShareWrite = 2;
     private const uint OpenExisting = 3;
     private const uint BackupSemantics = 0x02000000, OpenReparsePoint = 0x00200000;
     private const uint OwnerInfo = 1, DaclInfo = 4, ProtectedDacl = 0x80000000;
-    private const uint ReparseAttribute = 0x400;
+    private const uint ReparseAttribute = 0x400, DirectoryAttribute = 0x10;
     public const int ErrorFileNotFound = 2, ErrorPathNotFound = 3, ErrorAlreadyExists = 183, ErrorInsufficientBuffer = 122;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -30,7 +33,7 @@ internal static class NativeFolder
     private struct ByHandleFileInformation
     {
         public uint Attributes;
-        public long CreationTime, LastAccessTime, LastWriteTime;
+        public uint CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh; // FILETIMEs as uint pairs: native layout is 52 bytes
         public uint VolumeSerialNumber, SizeHigh, SizeLow, NumberOfLinks, IndexHigh, IndexLow;
     }
 
@@ -75,7 +78,7 @@ internal static class NativeFolder
     /// <summary>Opens the path itself (a link is opened as a link). Null with the Win32 error when it cannot be opened.</summary>
     public static SafeFileHandle? Open(string path, out int error)
     {
-        var handle = CreateFileW(path, ReadControl | WriteDac | WriteOwner | FileReadAttributes | Synchronize, ShareRead | ShareWrite,
+        var handle = CreateFileW(path, Delete | ReadControl | WriteDac | WriteOwner | FileReadAttributes | Synchronize, ShareRead | ShareWrite,
             IntPtr.Zero, OpenExisting, BackupSemantics | OpenReparsePoint, IntPtr.Zero);
         if (handle.IsInvalid)
         {
@@ -87,10 +90,11 @@ internal static class NativeFolder
         return handle;
     }
 
-    public static bool IsReparsePoint(SafeFileHandle handle)
+    /// <summary>True for a real directory: not a link, not a file.</summary>
+    public static bool IsPlainDirectory(SafeFileHandle handle)
     {
         if (!GetFileInformationByHandle(handle, out var info)) throw new Win32Exception(Marshal.GetLastPInvokeError());
-        return (info.Attributes & ReparseAttribute) != 0;
+        return (info.Attributes & ReparseAttribute) == 0 && (info.Attributes & DirectoryAttribute) != 0;
     }
 
     /// <summary>Owner and explicit ACEs read through the handle. A null DACL (everyone full control) is one allow-all ACE for Everyone.</summary>
