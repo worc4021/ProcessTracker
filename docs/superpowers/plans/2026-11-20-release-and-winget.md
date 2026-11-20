@@ -34,7 +34,7 @@
   - InformationalVersion is `X.Y.Z` for release builds and `X.Y.Z-dev.yyyyMMddHHmm` for local deploys.
 - The MSI uses `MajorUpgrade AllowDowngrades="yes"` (see Ruling P1 below).
 - Actions are pinned to full commit SHAs. Each workflow has least-privilege `permissions:`.
-  - Secrets: `WINGET_TOKEN` (a fine-grained token on the user's `winget-pkgs` fork).
+  - Secrets: `WINGET_TOKEN` (a classic personal access token with the `public_repo` scope).
   - Repository variables: `WINGET_PUBLISHED` (`true` enables `wingetcreate update --submit`) and `SIGNING_ENABLED` (`true` enables Azure Trusted Signing). Both are off by default; releases ship unsigned.
 - Release workflow tests exclude `Category=Perf`.
 - Commit trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never push from tasks; the controller pushes.

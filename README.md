@@ -111,7 +111,7 @@ against an MSI install.
   | `OrphanIdleAlertMinutes` | 30 | |
   | `UserProfilePath` | | Optional override. By default the service resolves each session's user profile itself; set this only to force one profile |
 
-  A `Port` set there is ignored, because the scheduled task, scripts and CLI all use 47811. Only `--Port` on the
+  A `Port` set there is ignored, because `deploy.ps1` and the CLI both use 47811. Only `--Port` on the
   command line changes the port, which is meant for development and tests.
 
 ## Logs
@@ -238,7 +238,7 @@ submits the new version to winget. Nothing is released by hand.
 One-time winget setup:
 
 1. Fork [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) to your account.
-2. Create a fine-grained personal access token that can write to that fork and store it as the repository secret
+2. Create a **classic** personal access token with the `public_repo` scope (`wingetcreate` opens a PR against microsoft/winget-pkgs, and fine-grained tokens cannot contribute to repositories you are not a member of) and store it as the repository secret
    `WINGET_TOKEN`.
 3. Submit the first version yourself with `wingetcreate new <url of the release MSI>`. Use the PackageIdentifier
    `worc4021.ProcessTracker`; the PR to `winget-pkgs` must be merged before later versions can be updated.

@@ -9,7 +9,7 @@
          deploy (stops on failure; skip with -SkipTests).
       2. scripts\build-msi.ps1 -DevSuffix dev.<yyyyMMddHHmm>: the MSI carries the version in version.txt, and the
          service and proctrack report X.Y.Z-dev.<yyyyMMddHHmm>.
-      3. msiexec /i <msi> /qn /l*v artifacts\deploy.log. The MSI upgrades any installed build, including a newer one
+      3. msiexec /i <msi> /qn /norestart /l*v artifacts\deploy.log. The MSI upgrades any installed build, including a newer one
          (MajorUpgrade AllowDowngrades), so a dev build always replaces the installed one.
       4. Polls http://127.0.0.1:47811/api/health for up to 60 s until it reports X.Y.Z-dev.<stamp> with a collector tick
          younger than 5 s.
@@ -17,7 +17,7 @@
     A fresh machine gets a first install this way too. A phase 1 (script-installed) copy must be removed first with
     scripts\uninstall-legacy.ps1; this script refuses while it is present.
 
-    Exit codes: 0 installed and healthy; 1 installed but unhealthy (reinstall the last release from
+    Exit codes: 0 installed and healthy; 1 installed but unhealthy or a restart is required (reinstall the last release from
     https://github.com/worc4021/ProcessTracker/releases/latest); 3 nothing changed (not elevated, phase 1 install
     present, tests or build failed, or msiexec failed, in which case the MSI has rolled back).
 
@@ -78,12 +78,16 @@ catch {
 
 Write-Host "== Installing $msi (log: $log)" -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
-$install = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', "`"$log`"") -Wait -PassThru
-if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+$install = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
+$restartRequired = $install.ExitCode -in 3010, 1641
+if ($install.ExitCode -ne 0 -and -not $restartRequired) {
     Write-Host "msiexec failed with exit code $($install.ExitCode); the MSI rolled back and nothing changed. See $log." -ForegroundColor Red
     exit 3
 }
-if ($install.ExitCode -eq 3010) { Write-Warning 'The install asks for a restart (exit code 3010).' }
+if ($restartRequired) {
+    Write-Host "$expected is installed but Windows needs a restart to finish (msiexec exit code $($install.ExitCode)); restart, then check http://127.0.0.1:47811/api/health. Not checking health now." -ForegroundColor Yellow
+    exit 1
+}
 
 Write-Host "== Waiting up to $healthTimeoutSeconds s for $expected to report healthy" -ForegroundColor Cyan
 $deadline = (Get-Date).AddSeconds($healthTimeoutSeconds)

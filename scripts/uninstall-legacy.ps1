@@ -72,6 +72,19 @@ public static extern IntPtr SendMessageTimeout(
     [ProcessTrackerSetup.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result) | Out-Null
 }
 
+# Runs a native command and returns its exit code. Windows PowerShell 5.1 turns a native command's stderr into a
+# terminating error under $ErrorActionPreference = 'Stop', so the preference is relaxed inside; callers decide by exit code.
+function Invoke-Native {
+    param([scriptblock]$Command, [switch]$Quiet)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($Quiet) { & $Command 2>&1 | Out-Null } else { & $Command 2>&1 | Out-Host }
+        return $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $saved }
+}
+
 try {
     # Service: stop (a graceful stop persists state), then delete.
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
@@ -81,8 +94,14 @@ try {
             Stop-Service -Name $serviceName -Force
             $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
         }
-        sc.exe delete $serviceName | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "sc.exe delete $serviceName failed with exit code $LASTEXITCODE." }
+        $code = Invoke-Native { sc.exe delete $serviceName }
+        if ($code -ne 0) { throw "sc.exe delete $serviceName failed with exit code $code." }
+        # The service can linger as "marked for deletion" while something (services.msc, Event Viewer) holds a handle.
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Service -Name $serviceName -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+        if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+            throw "The $serviceName service is still marked for deletion. Close services.msc, Event Viewer and any other tool that has it open (or reboot), then run this script again."
+        }
     }
     else {
         Write-Host "The $serviceName service is not installed." -ForegroundColor Cyan
@@ -94,11 +113,11 @@ try {
         Write-Warning 'claude was not found on the PATH; if an MCP entry exists, remove it yourself: claude mcp remove process-tracker --scope user'
     }
     else {
-        & $claude mcp get process-tracker *> $null
-        if ($LASTEXITCODE -eq 0) {
+        $getCode = Invoke-Native -Quiet { & $claude mcp get process-tracker }
+        if ($getCode -eq 0) {
             Write-Host '== Removing the MCP server from Claude Code' -ForegroundColor Cyan
-            & $claude mcp remove process-tracker --scope user
-            if ($LASTEXITCODE -ne 0) { Write-Warning "claude mcp remove failed with exit code $LASTEXITCODE; remove it yourself: claude mcp remove process-tracker --scope user" }
+            $removeCode = Invoke-Native { & $claude mcp remove process-tracker --scope user }
+            if ($removeCode -ne 0) { Write-Warning "claude mcp remove failed with exit code $removeCode; remove it yourself: claude mcp remove process-tracker --scope user" }
         }
         else { Write-Host 'No process-tracker MCP entry in Claude Code.' -ForegroundColor Cyan }
     }
@@ -123,8 +142,8 @@ try {
         $link = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
         if ($link) {
             if (-not ($link.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$current is not a junction; remove it yourself." }
-            cmd /d /c rmdir "$current"
-            if ($LASTEXITCODE -ne 0) { throw "Could not remove the junction $current." }
+            $rmCode = Invoke-Native { cmd /d /c rmdir "$current" }
+            if ($rmCode -ne 0) { throw "Could not remove the junction $current." }
         }
         $versions = Join-Path $Root 'versions'
         if (Test-Path -LiteralPath $versions) { Remove-Item -LiteralPath $versions -Recurse -Force }
