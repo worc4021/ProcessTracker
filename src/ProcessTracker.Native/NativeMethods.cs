@@ -18,6 +18,39 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool GetPerformanceInfo(out PerformanceInformation info, int size);
 
+    public const uint ProcessQueryLimitedInformation = 0x1000, ProcessVmRead = 0x0010;
+    public const int ErrorAccessDenied = 5, ErrorInvalidParameter = 87;
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial nint OpenProcess(uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, int processId);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool CloseHandle(nint handle);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetProcessTimes(nint process, out long creation, out long exit, out long kernel, out long user);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsWow64Process2(nint process, out ushort processMachine, out ushort nativeMachine);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static unsafe partial bool QueryFullProcessImageNameW(nint process, int flags, char* buffer, ref int size);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static unsafe partial bool ReadProcessMemory(nint process, nint baseAddress, byte* buffer, nuint size, out nuint bytesRead);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetExitCodeProcess(nint process, out int exitCode);
+
+    [LibraryImport("ntdll.dll")]
+    public static unsafe partial int NtQueryInformationProcess(nint process, int infoClass, void* info, int length, out int returnLength);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct PerformanceInformation
     {
