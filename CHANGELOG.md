@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/worc4021/ProcessTracker/compare/v0.1.0...v0.2.0) (2026-11-21)
+
+
+### Features
+
+* MCP server instructions tell sessions to check the load before heavy work ([2e4d633](https://github.com/worc4021/ProcessTracker/commit/2e4d6335d3876a705cb41ec36d0bf5104546616f))
+* sessions check machine load before heavy work; document winget publishing ([4d8eff2](https://github.com/worc4021/ProcessTracker/commit/4d8eff2d7e7f6226728ad6e198c5fd7694fe6dcf))
+
 ## 0.1.0 (2026-11-21)
 
 
