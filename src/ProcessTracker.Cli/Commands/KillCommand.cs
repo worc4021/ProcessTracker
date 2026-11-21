@@ -49,7 +49,7 @@ public static class KillCommand
         // 4. Confirm.
         if (!yes)
         {
-            var what = tree ? $"{target.ImageName} (PID {pid}) and {members.Count} descendant(s)" : $"{target.ImageName} (PID {pid})";
+            var what = tree ? $"{Format.Safe(target.ImageName)} (PID {pid}) and {members.Count} descendant(s)" : $"{Format.Safe(target.ImageName)} (PID {pid})";
             Console.Write($"Kill {what}? [y/N] ");
             var answer = Console.ReadLine()?.Trim();
             if (!"y".Equals(answer, StringComparison.OrdinalIgnoreCase) && !"yes".Equals(answer, StringComparison.OrdinalIgnoreCase))
@@ -65,7 +65,7 @@ public static class KillCommand
             using var live = Process.GetProcessById(pid);
             live.Kill(entireProcessTree: tree);
             result = "killed";
-            Console.WriteLine($"Killed {target.ImageName} (PID {pid}){(tree ? " and its process tree" : "")}.");
+            Console.WriteLine($"Killed {Format.Safe(target.ImageName)} (PID {pid}){(tree ? " and its process tree" : "")}.");
         }
         catch (Exception e) when (e is InvalidOperationException or ArgumentException or Win32Exception or AggregateException or NotSupportedException)
         {

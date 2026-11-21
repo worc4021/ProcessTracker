@@ -115,6 +115,33 @@ public class AttributorTests
     }
 
     [Fact]
+    public void TerminalClaudeExe_ChildOfSession_InheritsParentUnit_NotAnchor()
+    {
+        // `claude mcp get ...` run by an agent's shell: no session variables of its own, parent belongs to a session.
+        var a = Sut.Attribute(Proc("claude.exe"), Ok(path: TerminalPath), Session("host:local_x", "sid1"));
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "host:local_x", "sid1", false), a);
+    }
+
+    [Fact]
+    public void TerminalClaudeExe_ChildOfTerminalSession_InheritsThatSession()
+    {
+        var a = Sut.Attribute(Proc("claude.exe", pid: 200), Ok(path: TerminalPath), Session("term:1@2"));
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "term:1@2", null, false), a);
+    }
+
+    [Theory]
+    [InlineData("unattributed")]
+    [InlineData("desktop-app")]
+    public void TerminalClaudeExe_ParentNotASession_IsNewTerminalAnchor(string parentKind)
+    {
+        var parent = parentKind == "unattributed"
+            ? ProcessTracker.Core.Model.Attribution.Unattributed
+            : new ProcessTracker.Core.Model.Attribution(AttributionKind.ClaudeApp, null, null, false);
+        var a = Sut.Attribute(Proc("claude.exe"), Ok(path: TerminalPath), parent);
+        Assert.Equal(new ProcessTracker.Core.Model.Attribution(AttributionKind.Session, "term:100@777", null, true), a);
+    }
+
+    [Fact]
     public void DesktopElectron_IsClaudeApp()
     {
         var a = Sut.Attribute(Proc("Claude.exe"), Ok(path: AppPath), null);

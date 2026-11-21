@@ -35,7 +35,7 @@ public static class TreeCommand
 
             var now = DateTime.UtcNow;
             var s = tree.Session;
-            Console.WriteLine($"{s.Title ?? s.UnitId}  ({s.ProcessCount} processes, {Format.Cores(s.CpuCores)} cores, {Format.Gigabytes(s.PrivateBytes)} GB)");
+            Console.WriteLine($"{Format.Safe(s.Title ?? s.UnitId)}  ({s.ProcessCount} processes, {Format.Cores(s.CpuCores)} cores, {Format.Gigabytes(s.PrivateBytes)} GB)");
             var rows = new List<string[]>();
             void Walk(ProcessTreeNodeDto n, int depth)
             {

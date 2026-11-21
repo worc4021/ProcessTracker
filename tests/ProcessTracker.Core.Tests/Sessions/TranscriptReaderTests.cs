@@ -121,4 +121,42 @@ public sealed class TranscriptReaderTests : IDisposable
         var title = new TranscriptReader(_profile).Read("sur")!.Title!;
         Assert.Equal(79, title.Length);
     }
+
+    [Fact]
+    public void Read_LeadingSystemReminder_IsStripped_RestIsTitle()
+    {
+        // A worktree or forked session's first prompt starts with injected reminders.
+        Write("wt",
+            """{"type":"user","message":{"content":"<system-reminder>\nLinked sessions now</system-reminder>\n<system-reminder>more</system-reminder>\n\nFix the   login bug"},"cwd":"C:\\a"}""");
+        Assert.Equal("Fix the login bug", new TranscriptReader(_profile).Read("wt")!.Title);
+    }
+
+    [Fact]
+    public void Read_ArrayContent_TagOnlyFirstItem_UsesFollowingText()
+    {
+        Write("ide",
+            """{"type":"user","message":{"content":[{"type":"text","text":"<ide_opened_file>The user opened x.mo</ide_opened_file>"},{"type":"text","text":"Why is the rudder angle wrong?"}]},"cwd":"C:\\a"}""");
+        Assert.Equal("Why is the rudder angle wrong?", new TranscriptReader(_profile).Read("ide")!.Title);
+    }
+
+    [Fact]
+    public void Read_OnlyTags_SkippedUntilARealPrompt()
+    {
+        Write("tags",
+            """{"type":"user","message":{"content":"<system-reminder>a</system-reminder>  <command-name>/x</command-name>"}}""",
+            """{"type":"user","isMeta":true,"message":{"content":"<system-reminder>a</system-reminder> meta text"}}""",
+            """{"type":"user","message":{"content":"second"}}""");
+        Assert.Equal("second", new TranscriptReader(_profile).Read("tags")!.Title);
+    }
+
+    [Theory]
+    [InlineData("<system-reminder>x</system-reminder>rest", "rest")]
+    [InlineData("  <a b=\"1\">x</a>\n<c>y</c> rest ", "rest ")]
+    [InlineData("<system-reminder>x</system-reminder>", null)]
+    [InlineData("<system-reminder>unclosed rest", null)]
+    [InlineData("<3 cats", null)]
+    [InlineData("</x> rest", null)]
+    [InlineData("plain <b>not stripped</b>", "plain <b>not stripped</b>")]
+    public void StripLeadingTags_Cases(string input, string? expected) =>
+        Assert.Equal(expected, TranscriptReader.StripLeadingTags(input));
 }

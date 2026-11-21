@@ -105,6 +105,29 @@ public sealed class McpToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task Mcp_ListSessions_IncludesTitleSourceProjectBranchSummary()
+    {
+        var desktop = new DesktopSessionInfo("Sidebar title", "main", null, null, @"C:\repos\Widget", "Did a thing.", null);
+        var s = new SessionView(new SessionInfo("host:local_a", "local_a", [], null, T0, null, @"C:\work", "a title", null, desktop),
+            true, 1f, 100, 1);
+        _app.Tracker.View = new TrackerView(T0, default, FrozenDictionary<ProcessKey, ProcessView>.Empty, [s]);
+        await using var client = await Connect();
+
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Contains("titleSource", tools.Single(t => t.Name == "list_sessions").Description, StringComparison.Ordinal);
+
+        var result = await client.CallToolAsync("list_sessions", cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(true, result.IsError);
+        var dto = Assert.Single(Json<SessionViewDto[]>(result));
+        Assert.Equal("Sidebar title", dto.Title);
+        Assert.Equal("desktop", dto.TitleSource);
+        Assert.Equal("Widget", dto.Project);
+        Assert.Equal("main", dto.Branch);
+        Assert.Equal("Did a thing.", dto.Summary);
+    }
+
+    [Fact]
     public async Task Mcp_GetProcessHistory_CoversLastMinutes()
     {
         var key = new ProcessKey(42, 1_000_042);

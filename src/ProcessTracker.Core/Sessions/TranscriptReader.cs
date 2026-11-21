@@ -13,6 +13,7 @@ public sealed class TranscriptReader
     private const int MaxBytes = 256 * 1024;
     private const int Chunk = 32 * 1024;
     private const int MaxTitle = 80;
+    private const int MaxPath = 400;
     private const int MaxCachedPaths = 1024;
     private readonly string _projectsDir;
     private readonly Dictionary<string, string> _paths = new(StringComparer.Ordinal);
@@ -114,9 +115,8 @@ public sealed class TranscriptReader
             using var doc = JsonDocument.Parse(line);
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object) return;
-            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String
-                && !string.IsNullOrEmpty(c.GetString()))
-                cwd = c.GetString();
+            if (cwd is null && root.TryGetProperty("cwd", out var c) && c.ValueKind == JsonValueKind.String)
+                cwd = SessionText.Clean(c.GetString(), MaxPath);
             title ??= TitleOf(root);
         }
         catch (JsonException) { }
@@ -124,7 +124,9 @@ public sealed class TranscriptReader
 
     /// <summary>
     /// The text of a user record typed by the user. Records Claude Code injects are skipped: those marked
-    /// <c>"isMeta": true</c> and those whose text starts with a tag such as &lt;system-reminder&gt; or &lt;command-name&gt;.
+    /// <c>"isMeta": true</c> and those whose text is only tags such as &lt;system-reminder&gt;...&lt;/system-reminder&gt;
+    /// or &lt;command-name&gt;...&lt;/command-name&gt;. Leading tag blocks before the user's own words (a worktree or forked
+    /// session's first prompt starts with a system reminder) are stripped. Text items of array content are joined.
     /// </summary>
     private static string? TitleOf(JsonElement root)
     {
@@ -136,20 +138,42 @@ public sealed class TranscriptReader
 
         string? text = null;
         if (content.ValueKind == JsonValueKind.String) text = content.GetString();
-        else if (content.ValueKind == JsonValueKind.Array && content.GetArrayLength() > 0)
+        else if (content.ValueKind == JsonValueKind.Array)
         {
-            var first = content[0];
-            if (first.ValueKind == JsonValueKind.Object
-                && first.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String && t.GetString() == "text"
-                && first.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String)
-                text = tx.GetString();
+            List<string>? parts = null;
+            foreach (var item in content.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.Object
+                    && item.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String && t.GetString() == "text"
+                    && item.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String)
+                    (parts ??= []).Add(tx.GetString()!);
+            }
+            if (parts is not null) text = string.Join("\n", parts);
         }
-        if (text is null) return null;
+        if (text is null || StripLeadingTags(text) is not { } own) return null;
 
-        var oneLine = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-        if (oneLine.Length == 0 || oneLine[0] == '<') return null;
-        if (oneLine.Length <= MaxTitle) return oneLine;
-        var len = char.IsHighSurrogate(oneLine[MaxTitle - 1]) ? MaxTitle - 1 : MaxTitle;
-        return oneLine[..len];
+        // One line, no control or bidi characters (terminal escapes), at most MaxTitle characters.
+        return SessionText.Clean(own, MaxTitle);
+    }
+
+    /// <summary>
+    /// The text after any leading <c>&lt;tag ...&gt;...&lt;/tag&gt;</c> blocks; null when nothing but tags remains, or
+    /// when the text starts with '&lt;' that does not open a closed tag block (so injected text is never a title).
+    /// </summary>
+    public static string? StripLeadingTags(string text)
+    {
+        var s = text.AsSpan().TrimStart();
+        while (s.Length > 0 && s[0] == '<')
+        {
+            var i = 1;
+            if (i >= s.Length || !char.IsAsciiLetter(s[i])) return null;
+            while (i < s.Length && (char.IsAsciiLetterOrDigit(s[i]) || s[i] is '-' or '_' or ':' or '.')) i++;
+            if (i >= s.Length || (s[i] != '>' && !char.IsWhiteSpace(s[i]))) return null;
+            var close = string.Concat("</", s[1..i], ">");
+            var end = s.IndexOf(close, StringComparison.Ordinal);
+            if (end < 0) return null;
+            s = s[(end + close.Length)..].TrimStart();
+        }
+        return s.Length == 0 ? null : s.ToString();
     }
 }

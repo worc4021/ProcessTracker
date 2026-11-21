@@ -17,12 +17,23 @@ public static class SessionsCommand
             var now = DateTime.UtcNow;
             var rows = sessions.Select(s => new[]
             {
-                Format.Truncate(s.Title ?? s.UnitId, 40), Format.Cores(s.CpuCores), Format.Gigabytes(s.PrivateBytes),
+                Format.Truncate(s.Title ?? s.UnitId, 40), Format.Truncate(s.Project ?? "-", 24),
+                Format.Truncate(s.Branch ?? "-", 28), Format.Cores(s.CpuCores), Format.Gigabytes(s.PrivateBytes),
                 s.ProcessCount.ToString(CultureInfo.InvariantCulture),
                 Format.Idle(s.LastTranscriptWriteUtc, now), s.IsLive ? "live" : "ended", s.UnitId,
             }).ToList();
-            Console.Write(Format.Table(
-                ["SESSION", "CPU", "MEM_GB", "PROCS", "IDLE", "STATE", "UNIT"], rows, "CPU", "MEM_GB", "PROCS", "IDLE"));
+            string[] headers = ["SESSION", "PROJECT", "BRANCH", "CPU", "MEM_GB", "PROCS", "IDLE", "STATE", "UNIT"];
+            var table = Format.Table(headers, rows, "CPU", "MEM_GB", "PROCS", "IDLE");
+
+            // BRANCH only when there is one to show and the table still fits the console (always when redirected).
+            var anyBranch = sessions.Any(s => !string.IsNullOrEmpty(s.Branch));
+            if (!anyBranch || Format.ConsoleWidth() is { } width && Format.MaxLineLength(table) > width)
+            {
+                const int branch = 2;
+                table = Format.Table(headers.Where((_, i) => i != branch).ToArray(),
+                    rows.Select(r => r.Where((_, i) => i != branch).ToArray()).ToList(), "CPU", "MEM_GB", "PROCS", "IDLE");
+            }
+            Console.Write(table);
             return CommandSupport.Ok;
         }));
         return cmd;

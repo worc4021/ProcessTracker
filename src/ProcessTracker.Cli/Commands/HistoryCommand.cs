@@ -30,7 +30,7 @@ public static class HistoryCommand
             }
             if (pr.GetValue(json)) { Console.WriteLine(Format.Json(series)); return CommandSupport.Ok; }
 
-            Console.WriteLine($"{series.Name ?? series.UnitId ?? series.Key}  {series.FromUtc:HH:mm:ss}Z - {series.ToUtc:HH:mm:ss}Z (UTC)");
+            Console.WriteLine($"{Format.Safe(series.Name ?? series.UnitId ?? series.Key)}  {series.FromUtc:HH:mm:ss}Z - {series.ToUtc:HH:mm:ss}Z (UTC)");
             var rows = series.Points.Select(p => new[]
             {
                 p.TimestampUtc.ToString("HH:mm:ss", CultureInfo.InvariantCulture), Format.Cores(p.CpuCores), Format.Gigabytes(p.PrivateBytes),

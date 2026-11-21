@@ -60,6 +60,7 @@ public sealed class Tracker : IDisposable
     private readonly IProfileResolver? _profiles;
     private readonly bool _transcriptsEnabled;
     private readonly Dictionary<string, TranscriptReader> _readers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DesktopSessionReader> _desktopReaders = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _unitProfile = new(StringComparer.Ordinal);
     private readonly SegmentWriter _writer;
 
@@ -72,6 +73,8 @@ public sealed class Tracker : IDisposable
     private readonly Queue<(string Unit, string Id)> _transcriptQueue = new();
     private readonly HashSet<(string Unit, string Id)> _transcriptQueued = new();
     private readonly Dictionary<string, (string Id, DateTime At)> _transcriptRead = new();
+    private readonly Dictionary<string, DateTime> _desktopRead = new();
+    private readonly HashSet<string> _rejectedProfiles = new(StringComparer.OrdinalIgnoreCase);
 
     private TrackerView _view = TrackerView.Empty;
     private SystemCounters? _prevSystem;
@@ -352,7 +355,10 @@ public sealed class Tracker : IDisposable
         }
     }
 
-    /// <summary>At most <see cref="MaxTranscriptReadsPerTick"/> reads: new session ids first, then refreshes of live sessions.</summary>
+    /// <summary>
+    /// At most <see cref="MaxTranscriptReadsPerTick"/> reads: new session ids first, then refreshes of live sessions
+    /// (transcript and, for desktop sessions, the desktop app's metadata), each at most every <see cref="TranscriptRefresh"/>.
+    /// </summary>
     private void ReadTranscripts(DateTime now)
     {
         if (!_transcriptsEnabled) return;
@@ -368,39 +374,74 @@ public sealed class Tracker : IDisposable
         foreach (var s in _sessions.All())
         {
             if (budget == 0) break;
-            if (s.ClaudeSessionIds.Count == 0 || !_sessions.IsLive(s.UnitId)) continue;
+            if (!_sessions.IsLive(s.UnitId)) continue;
             var known = _transcriptRead.TryGetValue(s.UnitId, out var last);
-            if (known && now - last.At < TranscriptRefresh) continue;
+            var transcriptDue = s.ClaudeSessionIds.Count > 0 && (!known || now - last.At >= TranscriptRefresh);
+            var desktopDue = s.HostSessionId is not null
+                             && (!_desktopRead.TryGetValue(s.UnitId, out var at) || now - at >= TranscriptRefresh);
+            if (!transcriptDue && !desktopDue) continue;
             budget--;
-            ReadTranscript(s.UnitId, known ? last.Id : s.ClaudeSessionIds[^1], now);
+            if (desktopDue) ReadDesktop(s.UnitId, s.HostSessionId!, now);
+            if (transcriptDue) ReadTranscript(s.UnitId, known ? last.Id : s.ClaudeSessionIds[^1], now);
         }
     }
 
     /// <summary>
-    /// The reader for the unit's transcripts: the configured profile if set, else the profile of the anchor's owner
-    /// (the last one resolved while the anchor is unknown or gone). Null when no profile is known.
+    /// The profile whose files describe the unit: the configured profile if set, else the profile of the anchor's
+    /// owner (the last one resolved while the anchor is unknown or gone). Null when no profile is known, or when the
+    /// path is not a fully qualified local drive path (<c>X:\...</c>; no UNC or device paths): nothing is read then.
     /// </summary>
-    private TranscriptReader? ReaderFor(string unit)
+    private string? ProfileFor(string unit)
     {
         var profile = _options.UserProfilePath;
-        if (string.IsNullOrEmpty(profile))
-        {
-            if (_profiles is not null && _sessions.Get(unit)?.Anchor is { } anchor)
-            {
-                string? resolved = null;
-                try { resolved = _profiles.ProfileOf(anchor); }
-                catch (Exception e) when (IsNonFatal(e))
-                {
-                    _log.LogWarning(e, "Resolving the profile of {Anchor} failed", anchor);
-                }
-                if (!string.IsNullOrEmpty(resolved)) _unitProfile[unit] = resolved;
-            }
-            if (!_unitProfile.TryGetValue(unit, out profile)) return null;
-        }
+        if (!string.IsNullOrEmpty(profile)) return IsLocalDrivePath(profile) ? profile : RejectProfile(profile);
 
+        if (_profiles is not null && _sessions.Get(unit)?.Anchor is { } anchor)
+        {
+            string? resolved = null;
+            try { resolved = _profiles.ProfileOf(anchor); }
+            catch (Exception e) when (IsNonFatal(e))
+            {
+                _log.LogWarning(e, "Resolving the profile of {Anchor} failed", anchor);
+            }
+            if (!string.IsNullOrEmpty(resolved))
+            {
+                if (IsLocalDrivePath(resolved)) _unitProfile[unit] = resolved;
+                else RejectProfile(resolved);
+            }
+        }
+        return _unitProfile.GetValueOrDefault(unit);
+    }
+
+    /// <summary>A fully qualified path on a drive letter (<c>C:\x</c>), not UNC (<c>\\server</c>) or a device path.</summary>
+    public static bool IsLocalDrivePath(string path) =>
+        path.Length >= 4 && char.IsAsciiLetter(path[0]) && path[1] == ':' && path[2] == '\\'
+        && path[3] != '\\' && Path.IsPathFullyQualified(path);
+
+    private string? RejectProfile(string profile)
+    {
+        if (_rejectedProfiles.Add(profile))
+            _log.LogWarning("Ignoring profile path {Profile}: not a local drive path; its session files are not read", profile);
+        return null;
+    }
+
+    /// <summary>The transcript reader for the unit's profile (see <see cref="ProfileFor"/>), or null.</summary>
+    private TranscriptReader? ReaderFor(string unit)
+    {
+        if (ProfileFor(unit) is not { } profile) return null;
         if (!_readers.TryGetValue(profile, out var reader))
             _readers[profile] = reader = new TranscriptReader(profile);
         return reader;
+    }
+
+    /// <summary>Applies the desktop app's metadata of a desktop session; a missing or unreadable file changes nothing.</summary>
+    private void ReadDesktop(string unit, string hostSessionId, DateTime now)
+    {
+        _desktopRead[unit] = now;
+        if (!DesktopSessionReader.IsValidHostId(hostSessionId) || ProfileFor(unit) is not { } profile) return;
+        if (!_desktopReaders.TryGetValue(profile, out var reader))
+            _desktopReaders[profile] = reader = new DesktopSessionReader(profile);
+        if (reader.Read(hostSessionId) is { } info) _sessions.ApplyDesktop(unit, info);
     }
 
     /// <summary>

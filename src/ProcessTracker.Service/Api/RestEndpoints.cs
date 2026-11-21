@@ -206,7 +206,7 @@ public static class RestEndpoints
                 ContractJson.AsUtc(a.TimestampUtc), a.CpuCores, a.PrivateBytes, a.ReadBytesDelta, a.WriteBytesDelta, a.ProcessCount))
             .OrderBy(p => p.TimestampUtc)
             .ToList();
-        return new HistorySeriesDto(unit, null, session.Info.Title, fromUtc, toUtc, points);
+        return new HistorySeriesDto(unit, null, session.Info.DisplayTitle, fromUtc, toUtc, points);
     }
 
     /// <summary>

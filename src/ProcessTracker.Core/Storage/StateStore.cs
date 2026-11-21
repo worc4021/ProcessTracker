@@ -60,6 +60,16 @@ public sealed class StateStore : IDisposable
           pid INTEGER NOT NULL, create_ticks INTEGER NOT NULL, image_name TEXT NOT NULL,
           unit_id TEXT, caller_image TEXT NOT NULL, tree INTEGER NOT NULL, result TEXT NOT NULL);
         """,
+        // The desktop app's session metadata (SessionInfo.Desktop); all NULL when there is none.
+        """
+        ALTER TABLE sessions ADD COLUMN desktop_title TEXT;
+        ALTER TABLE sessions ADD COLUMN desktop_branch TEXT;
+        ALTER TABLE sessions ADD COLUMN desktop_worktree TEXT;
+        ALTER TABLE sessions ADD COLUMN desktop_cwd TEXT;
+        ALTER TABLE sessions ADD COLUMN desktop_origin_cwd TEXT;
+        ALTER TABLE sessions ADD COLUMN desktop_summary TEXT;
+        ALTER TABLE sessions ADD COLUMN desktop_focused_ticks INTEGER;
+        """,
     ];
 
     private readonly object _lock = new();
@@ -136,6 +146,16 @@ public sealed class StateStore : IDisposable
         r.IsDBNull(i) ? null : new DateTime(r.GetInt64(i), DateTimeKind.Utc);
     private static string? ReadString(SqliteDataReader r, int i) => r.IsDBNull(i) ? null : r.GetString(i);
 
+    /// <summary>The seven desktop columns starting at <paramref name="i"/>; null when all are NULL.</summary>
+    private static DesktopSessionInfo? ReadDesktop(SqliteDataReader r, int i)
+    {
+        var d = new DesktopSessionInfo(ReadString(r, i), ReadString(r, i + 1), ReadString(r, i + 2), ReadString(r, i + 3),
+            ReadString(r, i + 4), ReadString(r, i + 5), ReadTicks(r, i + 6));
+        return d == Empty ? null : d;
+    }
+
+    private static readonly DesktopSessionInfo Empty = new(null, null, null, null, null, null, null);
+
     /// <summary>
     /// Upserts process records and sessions in one transaction. When <paramref name="live"/> is given, the live
     /// counters are replaced by it and <c>last_tick_ticks</c> is set to <paramref name="ts"/> in the same transaction,
@@ -187,15 +207,21 @@ public sealed class StateStore : IDisposable
 
             var ses = Prepare(ref _upsertSession,
                 """
-                INSERT INTO sessions(unit_id,host_session_id,anchor_pid,anchor_create_ticks,first_seen_ticks,ended_ticks,cwd,title,last_transcript_ticks)
-                VALUES(@unit,@host,@apid,@act,@first,@ended,@cwd,@title,@lt)
+                INSERT INTO sessions(unit_id,host_session_id,anchor_pid,anchor_create_ticks,first_seen_ticks,ended_ticks,cwd,title,last_transcript_ticks,
+                  desktop_title,desktop_branch,desktop_worktree,desktop_cwd,desktop_origin_cwd,desktop_summary,desktop_focused_ticks)
+                VALUES(@unit,@host,@apid,@act,@first,@ended,@cwd,@title,@lt,@dt,@db,@dw,@dc,@do,@ds,@df)
                 ON CONFLICT(unit_id) DO UPDATE SET
                   host_session_id=excluded.host_session_id, anchor_pid=excluded.anchor_pid,
                   anchor_create_ticks=excluded.anchor_create_ticks, first_seen_ticks=excluded.first_seen_ticks,
                   ended_ticks=excluded.ended_ticks, cwd=excluded.cwd, title=excluded.title,
-                  last_transcript_ticks=excluded.last_transcript_ticks
+                  last_transcript_ticks=excluded.last_transcript_ticks,
+                  desktop_title=excluded.desktop_title, desktop_branch=excluded.desktop_branch,
+                  desktop_worktree=excluded.desktop_worktree, desktop_cwd=excluded.desktop_cwd,
+                  desktop_origin_cwd=excluded.desktop_origin_cwd, desktop_summary=excluded.desktop_summary,
+                  desktop_focused_ticks=excluded.desktop_focused_ticks
                 """,
-                "@unit", "@host", "@apid", "@act", "@first", "@ended", "@cwd", "@title", "@lt");
+                "@unit", "@host", "@apid", "@act", "@first", "@ended", "@cwd", "@title", "@lt",
+                "@dt", "@db", "@dw", "@dc", "@do", "@ds", "@df");
             ses.Transaction = tx;
             var delIds = Prepare(ref _deleteSessionIds, "DELETE FROM session_ids WHERE unit_id=@unit", "@unit");
             delIds.Transaction = tx;
@@ -214,6 +240,14 @@ public sealed class StateStore : IDisposable
                 v["@cwd"].Value = Db(s.Cwd);
                 v["@title"].Value = Db(s.Title);
                 v["@lt"].Value = Ticks(s.LastTranscriptWriteUtc);
+                var d = s.Desktop;
+                v["@dt"].Value = Db(d?.Title);
+                v["@db"].Value = Db(d?.Branch);
+                v["@dw"].Value = Db(d?.WorktreeName);
+                v["@dc"].Value = Db(d?.Cwd);
+                v["@do"].Value = Db(d?.OriginCwd);
+                v["@ds"].Value = Db(d?.Summary);
+                v["@df"].Value = Ticks(d?.LastFocusedUtc);
                 ses.ExecuteNonQuery();
 
                 delIds.Parameters["@unit"].Value = s.UnitId;
@@ -357,7 +391,8 @@ public sealed class StateStore : IDisposable
             using (var c = _db.CreateCommand())
             {
                 c.CommandText =
-                    "SELECT unit_id,host_session_id,anchor_pid,anchor_create_ticks,first_seen_ticks,ended_ticks,cwd,title,last_transcript_ticks FROM sessions";
+                    "SELECT unit_id,host_session_id,anchor_pid,anchor_create_ticks,first_seen_ticks,ended_ticks,cwd,title,last_transcript_ticks," +
+                    "desktop_title,desktop_branch,desktop_worktree,desktop_cwd,desktop_origin_cwd,desktop_summary,desktop_focused_ticks FROM sessions";
                 using var r = c.ExecuteReader();
                 while (r.Read())
                 {
@@ -365,7 +400,7 @@ public sealed class StateStore : IDisposable
                     ProcessKey? anchor = r.IsDBNull(2) ? null : new ProcessKey(r.GetInt32(2), r.GetInt64(3));
                     sessions.Add(new SessionInfo(unit, ReadString(r, 1),
                         ids.TryGetValue(unit, out var l) ? l : [], anchor, ReadTicks(r, 4)!.Value, ReadTicks(r, 5),
-                        ReadString(r, 6), ReadString(r, 7), ReadTicks(r, 8)));
+                        ReadString(r, 6), ReadString(r, 7), ReadTicks(r, 8), ReadDesktop(r, 9)));
                 }
             }
 
