@@ -102,7 +102,7 @@ try
     builder.Services.AddSingleton<ICallerResolver, CallerResolver>();
     builder.Services.AddSingleton<OverviewCache>();
     builder.Services.AddHttpContextAccessor(); // MCP tools resolve the caller from the current request
-    builder.Services.AddMcpServer()
+    builder.Services.AddMcpServer(o => o.ServerInstructions = ProcessTrackerTools.ServerInstructions)
         .WithHttpTransport(o => o.Stateless = true)
         .WithTools<ProcessTrackerTools>(ContractJson.Options); // same JSON contract as REST (enums as strings)
     builder.Services.AddHostedService<CollectorWorker>();

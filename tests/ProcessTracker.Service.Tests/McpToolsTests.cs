@@ -62,6 +62,20 @@ public sealed class McpToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task Mcp_Initialize_SendsLoadCheckInstructions()
+    {
+        await using var client = await Connect();
+
+        var instructions = client.ServerInstructions;
+
+        Assert.NotNull(instructions);
+        Assert.Contains("get_machine_load", instructions);
+        Assert.Contains("suggestedParallelism", instructions);
+        Assert.Contains("Critical", instructions);
+        Assert.Equal(Mcp.ProcessTrackerTools.ServerInstructions, instructions);
+    }
+
+    [Fact]
     public async Task Mcp_GetMachineLoad_ReturnsPressure()
     {
         // 1.5 GB commit headroom is under the 2 GB critical floor.
