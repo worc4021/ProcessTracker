@@ -17,6 +17,24 @@ namespace ProcessTracker.Service.Mcp;
 public sealed class ProcessTrackerTools(
     ITrackerHost host, ICallerResolver callers, IHttpContextAccessor http, ServiceOptions options, TimeProvider time)
 {
+    /// <summary>
+    /// Sent in the MCP initialize result; Claude Code puts it into every connected session's system prompt, so each
+    /// session learns to check the load without a CLAUDE.md entry. Keep it short: clients may truncate long text.
+    /// </summary>
+    public const string ServerInstructions =
+        "ProcessTracker watches this machine and attributes every process to the Claude Code session that started it. "
+        + "Several sessions share this machine, so check before you add load.\n"
+        + "Before starting heavy local work (builds, test suites, simulations, MATLAB or Dymola engines, parallel jobs, "
+        + "or subagents that will do any of these), call get_machine_load and act on pressure:\n"
+        + "- Low or Moderate: go ahead, with at most suggestedParallelism tasks at once (use it for -j, -m, --parallel, "
+        + "worker pools, and the number of engines or subagents).\n"
+        + "- High: do not start new heavy work on your own. If it cannot wait, run one task at a time and tell the user "
+        + "which sessions in topSessions are using the machine.\n"
+        + "- Critical: do not start it. Tell the user, naming the topSessions, and wait for their go-ahead.\n"
+        + "Check again before each further batch of a long job. Shut down engines and servers you started once you are "
+        + "done with them; list_orphans shows what ended sessions left running. If this server is unreachable, "
+        + "`proctrack load --json` gives the same report.";
+
     public const string NotASession =
         "The caller is not a Claude Code session: its connection is not owned by a tracked session process "
         + "and it sent no X-Claude-Session header.";
