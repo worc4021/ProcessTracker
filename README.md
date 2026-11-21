@@ -22,7 +22,8 @@ supported, and no .NET runtime is needed (everything is self-contained).
 winget install worc4021.ProcessTracker
 ```
 
-The winget package becomes available once it has been published (see [Releasing](#releasing)). Until then, download
+The winget package becomes available once it has been published (see
+[Publishing to winget](#publishing-to-winget)). Until then, download
 `ProcessTracker-<version>-x64.msi` from the
 [latest GitHub release](https://github.com/worc4021/ProcessTracker/releases/latest), compare its hash with
 `SHA256SUMS.txt` and run it (double-click, or from an elevated PowerShell:
@@ -173,6 +174,37 @@ them the header is empty and ignored. The caller is then identified from the TCP
 
 The tools are all read-only. There are no kill tools.
 
+### Checking the load before heavy work
+
+The server sends **instructions** when a session connects, and Claude Code adds them to that session's system prompt.
+So every session with the MCP entry is told, with no CLAUDE.md change, to call `get_machine_load` before builds,
+test suites, simulations, MATLAB or Dymola engines, parallel jobs or subagents doing these, and to act on the
+pressure:
+
+| Pressure | What the session does |
+|---|---|
+| Low, Moderate | Goes ahead with at most `suggestedParallelism` tasks at once |
+| High | Starts no new heavy work on its own. If the work cannot wait, it runs one task at a time and names the sessions using the machine |
+| Critical | Does not start, names the sessions using the machine, and waits for your go-ahead |
+
+The exact text is `ProcessTrackerTools.ServerInstructions` in
+[src/ProcessTracker.Service/Mcp/ProcessTrackerTools.cs](src/ProcessTracker.Service/Mcp/ProcessTrackerTools.cs).
+Sessions that were already running when the service was upgraded get it on their next start.
+
+Instructions from an MCP server carry less weight than your own memory file. To make the rule stronger, or to cover
+sessions without the MCP entry, add this to `%USERPROFILE%\.claude\CLAUDE.md`:
+
+```markdown
+# Machine load
+
+- Before starting heavy local work (builds, test suites, simulations, MATLAB/Dymola engines, parallel jobs, or
+  subagents that will do these), check the load with the process-tracker MCP tool `get_machine_load`
+  (or `proctrack load --json` if the MCP is unavailable).
+- Low/Moderate: run at most `suggestedParallelism` tasks at once. High: start nothing heavy on your own; if it cannot
+  wait, run one task at a time and say which sessions are loading the machine. Critical: don't start; tell me and wait.
+- Shut down engines and servers you started once you are done with them.
+```
+
 | Tool | Returns |
 |---|---|
 | `get_machine_load` | Pressure level, free cores, memory and commit headroom, suggested parallelism, the caller's own usage, the top sessions |
@@ -235,15 +267,59 @@ and `fix` the patch). Merging that PR tags `v<version>`, and the `release` workf
 MSI, uploads `ProcessTracker-<version>-x64.msi` and `SHA256SUMS.txt` to the GitHub release and, once enabled,
 submits the new version to winget. Nothing is released by hand.
 
-One-time winget setup:
+### Publishing to winget
 
-1. Fork [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) to your account.
-2. Create a **classic** personal access token with the `public_repo` scope (`wingetcreate` opens a PR against microsoft/winget-pkgs, and fine-grained tokens cannot contribute to repositories you are not a member of) and store it as the repository secret
-   `WINGET_TOKEN`.
-3. Submit the first version yourself with `wingetcreate new <url of the release MSI>`. Use the PackageIdentifier
-   `worc4021.ProcessTracker`; the PR to `winget-pkgs` must be merged before later versions can be updated.
-4. Set the repository variable `WINGET_PUBLISHED` to `true`. From then on each release runs
-   `wingetcreate update ... --submit`.
+**How winget finds a package.** `winget install` does not search GitHub. Its default source, `winget`, is an index
+built from the [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) repository, where every package
+version is a folder of YAML manifests (`manifests/w/worc4021/ProcessTracker/<version>/`). The manifests give the
+package id, name, publisher, license, and the installer URL and SHA256. So to make `worc4021.ProcessTracker` known,
+someone opens a pull request to winget-pkgs adding those manifests. The PR is checked by Microsoft's validation
+pipeline: it downloads the MSI, checks the hash, scans it, and installs it in a VM. A moderator then reviews it, and
+a **new** package gets a human review. That usually takes from a few hours to a few days. Once merged, the index is
+republished and clients see the package within a few hours (`winget source update` forces a refresh).
+
+[`wingetcreate`](https://github.com/microsoft/winget-create) writes the manifests and opens that PR. It uses a
+GitHub token to fork winget-pkgs into your account (if you have no fork) and to open the PR from it.
+
+**One-time setup (by hand, once):**
+
+1. Create a **classic** personal access token with the `public_repo` scope. Fine-grained tokens cannot open PRs
+   against repositories you are not a member of. Store it as this repository's secret `WINGET_TOKEN`.
+2. Install `wingetcreate` (`winget install Microsoft.WingetCreate`) and submit the first version:
+
+   ```powershell
+   wingetcreate new https://github.com/worc4021/ProcessTracker/releases/download/v0.1.0/ProcessTracker-0.1.0-x64.msi --token <PAT>
+   ```
+
+   It downloads the MSI, reads the ProductCode and installer type from it, and prompts for the rest:
+
+   | Prompt | Answer |
+   |---|---|
+   | PackageIdentifier | `worc4021.ProcessTracker` (every later release uses this id) |
+   | PackageVersion | `0.1.0` |
+   | Publisher | `worc4021` (the MSI's Manufacturer) |
+   | PackageName | `ProcessTracker` |
+   | License | `MIT` |
+   | ShortDescription | `Tracks process resource use per Claude Code session and finds orphaned processes.` |
+   | Scope | `machine` |
+
+   Before submitting, open the generated `*.installer.yaml` and check that it has an `AppsAndFeaturesEntries` entry
+   with `UpgradeCode: '{69B0FAFC-2873-43F9-8377-3B554A10091D}'` (the MSI's fixed UpgradeCode), and add it if it is
+   missing. Every version has a new ProductCode, so the UpgradeCode is what lets winget recognise copies installed
+   from a downloaded MSI, or by `deploy.ps1`, as this package and upgrade them. To edit first, decline the submit
+   prompt, edit, then run `wingetcreate submit <manifest folder> --token <PAT>`. When submitting, it prints the URL
+   of the PR it opened in winget-pkgs.
+3. Wait for that PR to be **merged**. If validation adds a label such as `Needs-Author-Feedback`, reply on the PR.
+   Unsigned installers are accepted, but the scan may take longer.
+4. Set this repository's variable `WINGET_PUBLISHED` to `true`.
+
+**From then on it is automatic.** Each release runs
+`wingetcreate update worc4021.ProcessTracker --version <v> --urls <msi url>|x64 --submit`, which copies the
+previous manifests, updates the version, URL and hash, and opens the next PR. That PR is validated and merged
+without you (an update to an existing package needs no human review unless validation flags it). On every
+installed machine, the `\ProcessTracker\AutoUpgrade` task's next `winget upgrade` then picks the new version up.
+Until step 4 is done, the release workflow skips the winget step with a notice, and the AutoUpgrade task logs
+event 1002 because winget does not know the package yet.
 
 Code signing (optional, off by default): set the repository variable `SIGNING_ENABLED` to `true` and add the Azure
 Trusted Signing secrets the `release` workflow reads (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
