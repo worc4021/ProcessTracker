@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.1](https://github.com/worc4021/ProcessTracker/compare/v0.3.0...v0.3.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* address review of the deferred-fixes branch ([d81da3b](https://github.com/worc4021/ProcessTracker/commit/d81da3b52bb4926e75d4c12b23b7d76317d6e1a7))
+* **cli:** roll back honestly when a copy does not stop or another user takes the port ([f5e1298](https://github.com/worc4021/ProcessTracker/commit/f5e12984e9fb6e39b12d6cb6bcc7a5092a7995ab))
+* deferred rollback, SessionStart, log and test-gap follow-ups to v0.3.0 ([72deef3](https://github.com/worc4021/ProcessTracker/commit/72deef38cc4029671c41a2a1150365d20a2029ed))
+* **plugin:** don't post SessionStart to a listener that can't be checked ([3cea63e](https://github.com/worc4021/ProcessTracker/commit/3cea63e0a71964c2b9f5de56b22f276f71c6e655))
+* **service:** make each log entry one step across processes ([6b1c064](https://github.com/worc4021/ProcessTracker/commit/6b1c064b3bc90631159e5a0fc6688d3f18280d96))
+
 ## [0.3.0](https://github.com/worc4021/ProcessTracker/compare/v0.2.0...v0.3.0) (2026-11-23)
 
 
