@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace ProcessTracker.Service.Logging;
@@ -8,6 +9,9 @@ namespace ProcessTracker.Service.Logging;
 /// the exception if any). When the next entry would take the file past the size limit, it becomes
 /// <c>processtracker.log.1</c> (replacing the previous one) and a new file starts, so at most two files exist.
 /// Levels are left to logging filters. Write failures are swallowed: logging must never stop the service.
+/// Another process (a takeover or rollback) may log to the same file at the same time; a named mutex per file, in this
+/// logon session, makes each entry's size check, rollover and append one step across processes, and the file is opened
+/// for each entry, so an entry never lands in a file another process has just rolled over.
 /// </summary>
 [ProviderAlias("File")]
 public sealed class FileLoggerProvider : ILoggerProvider
@@ -18,8 +22,10 @@ public sealed class FileLoggerProvider : ILoggerProvider
     private readonly string _path;
     private readonly string _rolledPath;
     private readonly long _maxBytes;
-    private readonly Lock _lock = new();
-    private FileStream? _stream;
+    private readonly Mutex _fileMutex;
+    private bool _disposed;
+    /// <summary>How long an entry waits for another process's entry; after that it is written anyway.</summary>
+    private static readonly TimeSpan MutexWait = TimeSpan.FromSeconds(1);
 
     public FileLoggerProvider(string directory, long maxBytes = DefaultMaxBytes)
     {
@@ -27,16 +33,35 @@ public sealed class FileLoggerProvider : ILoggerProvider
         _rolledPath = _path + ".1";
         _maxBytes = maxBytes;
         Directory.CreateDirectory(directory);
+        _fileMutex = OpenMutex(MutexName(_path));
+    }
+
+    /// <summary>The named mutex; when the name can't be used (taken by another kind of object, or denied), an unnamed one.</summary>
+    private static Mutex OpenMutex(string name)
+    {
+        try { return new Mutex(false, name); }
+        catch (Exception e) when (e is WaitHandleCannotBeOpenedException or UnauthorizedAccessException or IOException)
+        {
+            return new Mutex(false);
+        }
+    }
+
+    /// <summary><c>Local\ProcessTracker.Log.&lt;hash of the full path&gt;</c>: one per log file, case-insensitive like the file system.</summary>
+    public static string MutexName(string path)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToUpperInvariant()));
+        return @"Local\ProcessTracker.Log." + Convert.ToHexString(hash, 0, 16);
     }
 
     public ILogger CreateLogger(string categoryName) => new FileLogger(this, categoryName);
 
     public void Dispose()
     {
-        lock (_lock)
+        lock (_fileMutex)
         {
-            _stream?.Dispose();
-            _stream = null;
+            if (_disposed) return;
+            _disposed = true;
+            _fileMutex.Dispose();
         }
     }
 
@@ -48,38 +73,44 @@ public sealed class FileLoggerProvider : ILoggerProvider
         if (exception is not null) line.AppendLine().Append(exception);
         var bytes = Encoding.UTF8.GetBytes(line.AppendLine().ToString());
 
-        lock (_lock)
+        // The monitor orders this process's threads; the mutex orders the processes (it is owned per thread, so it
+        // alone would not keep a second thread of this process out while the first waits on the file).
+        lock (_fileMutex)
         {
+            if (_disposed) return;
+            var owned = Acquire();
             try
             {
-                _stream ??= Open();
-                _stream.Seek(0, SeekOrigin.End); // another process (a takeover or rollback) may have appended since
-                if (_stream.Length > 0 && _stream.Length + bytes.Length > _maxBytes)
+                using var stream = Open();
+                if (stream.Length > 0 && stream.Length + bytes.Length > _maxBytes)
                 {
-                    _stream.Dispose();
+                    stream.Dispose();
                     File.Move(_path, _rolledPath, overwrite: true);
-                    _stream = Open();
+                    using var fresh = Open();
+                    fresh.Write(bytes);
                 }
-                _stream.Write(bytes);
-                _stream.Flush();
+                else stream.Write(bytes);
             }
-            catch (IOException) { DropStream(); }
-            catch (UnauthorizedAccessException) { DropStream(); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            finally
+            {
+                if (owned) _fileMutex.ReleaseMutex();
+            }
         }
     }
 
+    private bool Acquire()
+    {
+        try { return _fileMutex.WaitOne(MutexWait); }
+        catch (AbandonedMutexException) { return true; } // its owner died mid-entry; this thread owns it now
+    }
+
     /// <summary>
-    /// Appends. Others may read, write (a takeover or rollback process logging while the instance it replaces still
-    /// holds the file) and rename or delete it (rolling over) while it is open.
+    /// Appends. Others may read, write (another process's entry, should it ever not wait for the mutex) and rename or
+    /// delete it (rolling over) while it is open.
     /// </summary>
     private FileStream Open() => new(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-
-    private void DropStream()
-    {
-        try { _stream?.Dispose(); }
-        catch (IOException) { }
-        _stream = null; // reopened on the next entry
-    }
 
     private sealed class FileLogger(FileLoggerProvider provider, string category) : ILogger
     {

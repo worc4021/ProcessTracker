@@ -71,6 +71,61 @@ public sealed class FileLoggerProviderTests : IDisposable
         Assert.Equal(4, text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length);
     }
 
+    /// <summary>Two providers on one folder stand in for two processes: each has its own lock and its own handle.</summary>
+    private static void Hammer(FileLoggerProvider first, FileLoggerProvider second, int threads, int linesPerThread)
+    {
+        var writers = Enumerable.Range(0, threads).Select(t => new Thread(() =>
+        {
+            var logger = (t % 2 == 0 ? first : second).CreateLogger($"w{t}");
+            for (var i = 0; i < linesPerThread; i++) logger.LogInformation("entry {T:D2}-{I:D4} end", t, i);
+        })).ToList();
+        writers.ForEach(w => w.Start());
+        writers.ForEach(w => w.Join());
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex Entry =
+        new(@"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z \[Information\] w(\d+): entry (\d\d-\d{4}) end$");
+
+    [Fact]
+    public void TwoWritersAppendingAtOnce_LoseAndGarbleNothing()
+    {
+        using (var first = new FileLoggerProvider(_dir))
+        using (var second = new FileLoggerProvider(_dir))
+            Hammer(first, second, threads: 8, linesPerThread: 300);
+
+        var lines = Read("processtracker.log").Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.TrimEnd('\r')).ToList();
+        Assert.All(lines, l => Assert.Matches(Entry, l));
+        Assert.Equal(8 * 300, lines.Select(l => Entry.Match(l).Groups[2].Value).Distinct().Count());
+    }
+
+    [Fact]
+    public void TwoWritersRollingOverAtOnce_GarbleNothingAndStayUnderTheLimit()
+    {
+        const long max = 4096;
+        using (var first = new FileLoggerProvider(_dir, max))
+        using (var second = new FileLoggerProvider(_dir, max))
+            Hammer(first, second, threads: 8, linesPerThread: 100);
+
+        Assert.All(Directory.GetFiles(_dir), f => Assert.True(new FileInfo(f).Length <= max, $"{f}: {new FileInfo(f).Length} bytes"));
+        var lines = (Read("processtracker.log") + Read("processtracker.log.1"))
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.TrimEnd('\r')).ToList();
+        Assert.All(lines, l => Assert.Matches(Entry, l));
+        Assert.Equal(lines.Count, lines.Distinct().Count());
+    }
+
+    [Fact]
+    public void MutexNameTakenByAnotherKindOfObject_StillLogs()
+    {
+        // Something else squats the name (here an event): logging goes on without the cross-process ordering.
+        Directory.CreateDirectory(_dir);
+        using var squatter = new EventWaitHandle(false, EventResetMode.ManualReset,
+            FileLoggerProvider.MutexName(Path.Combine(_dir, FileLoggerProvider.FileName)));
+        using (var provider = new FileLoggerProvider(_dir))
+            provider.CreateLogger("c").LogInformation("still here");
+
+        Assert.Contains("still here", Read("processtracker.log"));
+    }
+
     [Fact]
     public void FileCanBeRenamedWhileOpen()
     {
