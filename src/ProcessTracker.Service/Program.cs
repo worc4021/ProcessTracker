@@ -131,6 +131,7 @@ try
     builder.Services.AddSingleton<TrackerHost>();
     builder.Services.AddSingleton<ITrackerHost>(sp => sp.GetRequiredService<TrackerHost>());
     builder.Services.AddSingleton<ICallerResolver, CallerResolver>();
+    builder.Services.AddSingleton<IRequestOwnerGate, OwnerGate>();
     builder.Services.AddSingleton<OverviewCache>();
     builder.Services.AddHttpContextAccessor(); // MCP tools resolve the caller from the current request
     builder.Services.AddMcpServer(o => o.ServerInstructions = ProcessTrackerTools.ServerInstructions)
@@ -152,6 +153,21 @@ try
         ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
         return Task.CompletedTask;
     });
+
+    // User mode serves only its owner: everything but GET /api/health (so a client can see whose instance this is)
+    // must come from a process running as this user. Runs before routing, so a rejected request's body is never read.
+    if (runMode == RunMode.User)
+    {
+        app.Use((ctx, next) =>
+        {
+            if (HttpMethods.IsGet(ctx.Request.Method)
+                && ctx.Request.Path.Equals("/api/health", StringComparison.OrdinalIgnoreCase))
+                return next(ctx);
+            if (ctx.RequestServices.GetRequiredService<IRequestOwnerGate>().IsOwner(ctx)) return next(ctx);
+            ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return ctx.Response.WriteAsync(OwnerGate.ForbiddenMessage);
+        });
+    }
 
     app.UseDashboardHeaders();
     app.MapRestEndpoints();

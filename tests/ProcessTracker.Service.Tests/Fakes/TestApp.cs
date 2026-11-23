@@ -28,6 +28,9 @@ public sealed class TestApp : WebApplicationFactory<Program>
 
     public FakeTrackerHost Tracker { get; } = new();
 
+    /// <summary>Replaces the owner gate when set; null keeps the production one.</summary>
+    public IRequestOwnerGate? OwnerGate { get; init; }
+
     /// <summary>The temporary data folder in user mode; null otherwise.</summary>
     public string? DataDir => _dataDir;
 
@@ -45,6 +48,11 @@ public sealed class TestApp : WebApplicationFactory<Program>
             s.AddSingleton<ITrackerHost>(Tracker);
             s.RemoveAll<TimeProvider>();
             s.AddSingleton<TimeProvider>(new FixedTimeProvider(_utcNow));
+            if (OwnerGate is not null)
+            {
+                s.RemoveAll<IRequestOwnerGate>();
+                s.AddSingleton(OwnerGate);
+            }
             foreach (var d in s.Where(d => d.ImplementationType == typeof(CollectorWorker)).ToList()) s.Remove(d);
         });
     }
