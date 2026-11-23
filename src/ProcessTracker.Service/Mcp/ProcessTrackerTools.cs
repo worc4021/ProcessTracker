@@ -24,7 +24,7 @@ public sealed class ProcessTrackerTools(
     public const string ServerInstructions =
         "ProcessTracker watches this machine and attributes every process to the Claude Code session that started it. "
         + "Several sessions share this machine, so check before you add load.\n"
-        + "Before heavy local work (builds, test suites, simulations, simulation or solver engines, parallel jobs, or "
+        + "Before heavy local work (builds, test suites, simulations, solver engines, parallel jobs, or "
         + "subagents doing these), call get_machine_load.\n"
         + "- Low/Moderate: run at most suggestedParallelism tasks at once (use it for -j, -m, --parallel, worker pools, "
         + "and the number of engines or subagents).\n"

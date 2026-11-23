@@ -110,6 +110,24 @@ public sealed class HostConfigurationTests
     }
 
     [Fact]
+    public void NewSettings_BindFromRealJson()
+    {
+        var json = """{"ActivityThresholds":{"Solver.exe":{"CpuCores":0.05}},"OrphanAlertImages":["a*"]}""";
+        var config = new ConfigurationBuilder().AddJsonStream(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json))).Build();
+
+        var o = ServiceOptions.Resolve(config, Config(), RunMode.Dev);
+
+        Assert.Empty(o.Validate());
+        var defaults = new ProcessTracker.Core.Activity.ActivityThresholds();
+        var t = o.ToActivityOptions().PerImage["SOLVER.EXE"];
+        Assert.Equal(0.05f, t.CpuCores);
+        Assert.Equal(defaults.IoOps, t.IoOps);
+        Assert.Equal(defaults.WriteOps, t.WriteOps);
+        Assert.Equal(defaults.ContextSwitches, t.ContextSwitches);
+        Assert.Equal(["a*"], o.OrphanAlertImages);
+    }
+
+    [Fact]
     public void OutOfRangePort_OnCommandLine_IsRejected()
     {
         var errors = ServiceOptions.Resolve(Config(("Port", "70000")), Config(("Port", "70000")), RunMode.Dev).Validate();

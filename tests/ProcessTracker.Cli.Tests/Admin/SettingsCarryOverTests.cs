@@ -33,12 +33,12 @@ public class SettingsCarryOverTests
         var output = Parse(SettingsCarryOver.Rewrite("""
             {"OrphanAlertImages":["solver.exe","engine*.exe"],
              "ActivityThresholds":{"solver.exe":{"CpuCores":0.05,"ContextSwitches":2000}},
-             "HeavyCommandPatterns":["\bsolver\b"]}
+             "HeavyCommandPatterns":["\\bsolver\\b"]}
             """));
         Assert.Equal(["solver.exe", "engine*.exe"], output.GetProperty("OrphanAlertImages").EnumerateArray().Select(e => e.GetString()));
         Assert.Equal(2000, output.GetProperty("ActivityThresholds").GetProperty("solver.exe").GetProperty("ContextSwitches").GetInt64());
         Assert.Equal(0.05, output.GetProperty("ActivityThresholds").GetProperty("solver.exe").GetProperty("CpuCores").GetDouble());
-        Assert.Single(output.GetProperty("HeavyCommandPatterns").EnumerateArray());
+        Assert.Equal([@"\bsolver\b"], output.GetProperty("HeavyCommandPatterns").EnumerateArray().Select(e => e.GetString()));
     }
 
     [Theory]
