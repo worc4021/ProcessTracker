@@ -12,7 +12,7 @@
         "source": "git-subdir",
         "url": "https://github.com/worc4021/ProcessTracker.git",
         "path": "plugin",
-        "ref": "v0.2.0"
+        "ref": "v0.3.0"
       }
     }
   ]
