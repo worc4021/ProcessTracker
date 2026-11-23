@@ -42,6 +42,7 @@ public sealed class ApiClient : IDisposable
             ? url
             : $"http://127.0.0.1:{(dev ? DevPort : ProductionPort)}";
 
+    public Task<HealthDto> HealthAsync(CancellationToken ct) => RequiredAsync<HealthDto>("/api/health", ct);
     public Task<LoadReport> LoadAsync(CancellationToken ct) => RequiredAsync<LoadReport>("/api/load", ct);
     public Task<SessionViewDto[]> SessionsAsync(CancellationToken ct) => RequiredAsync<SessionViewDto[]>("/api/sessions", ct);
     public Task<SessionTreeDto?> SessionTreeAsync(string unit, CancellationToken ct) =>

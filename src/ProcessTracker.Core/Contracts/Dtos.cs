@@ -195,8 +195,14 @@ public sealed record HistoryPointDto(
 public sealed record HistorySeriesDto(
     string? UnitId, string? Key, string? Name, DateTime FromUtc, DateTime ToUtc, IReadOnlyList<HistoryPointDto> Points);
 
-/// <summary>Service health. LastTickUtc and TickAgeSeconds are null before the collector's first tick.</summary>
-public sealed record HealthDto(string Version, DateTime StartedUtc, DateTime? LastTickUtc, double? TickAgeSeconds);
+/// <summary>
+/// Service health. LastTickUtc and TickAgeSeconds are null before the collector's first tick. Mode is how the instance
+/// runs: "service", "user" or "dev". Owner is the DOMAIN\user an instance runs as in user mode, and omitted otherwise.
+/// Both are null when read from a service that predates them.
+/// </summary>
+public sealed record HealthDto(
+    string Version, DateTime StartedUtc, DateTime? LastTickUtc, double? TickAgeSeconds, string Mode,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Owner);
 
 /// <summary>A kill performed by a client. TsUtc defaults to the time the service receives the record.</summary>
 public sealed record KillAuditDto(

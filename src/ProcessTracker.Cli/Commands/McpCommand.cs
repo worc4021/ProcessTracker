@@ -10,13 +10,19 @@ public static class McpCommand
     public static Command Create()
     {
         var register = new Command("register", "Register the process-tracker MCP server with Claude Code (user scope).");
-        register.SetAction(_ => Run(r => r.Register(), "registered"));
+        register.SetAction(_ => Run(r => r.Register(), "registered", ClaudeMissingOnRegister));
         var unregister = new Command("unregister", "Remove the process-tracker MCP server from Claude Code (user scope).");
-        unregister.SetAction(_ => Run(r => r.Unregister(), "removed"));
+        unregister.SetAction(_ => Run(r => r.Unregister(), "removed", ClaudeMissingOnUnregister));
         return new Command("mcp", "Manage the Claude Code MCP registration (run as the user, not elevated).") { register, unregister };
     }
 
-    private static int Run(Func<McpRegistrar, McpResult> action, string doneWord)
+    public const string ClaudeMissingOnRegister =
+        "claude was not found on the PATH or in %USERPROFILE%\\.local\\bin; nothing changed. Once Claude Code is installed, run: proctrack mcp register";
+
+    public const string ClaudeMissingOnUnregister =
+        "claude was not found on the PATH or in %USERPROFILE%\\.local\\bin, so there is no Claude Code registration to remove; nothing changed.";
+
+    private static int Run(Func<McpRegistrar, McpResult> action, string doneWord, string claudeMissing)
     {
         try
         {
@@ -25,7 +31,7 @@ public static class McpCommand
                 case McpResult.Done: Console.WriteLine($"MCP server process-tracker {doneWord}."); break;
                 case McpResult.AlreadyInState: Console.WriteLine($"Nothing to do: process-tracker is already in the requested state ({doneWord} or absent)."); break;
                 case McpResult.Skipped:
-                    Console.WriteLine("claude was not found on the PATH or in %USERPROFILE%\\.local\\bin; nothing changed. Once Claude Code is installed, run: proctrack mcp register");
+                    Console.WriteLine(claudeMissing);
                     break;
             }
             return CommandSupport.Ok;

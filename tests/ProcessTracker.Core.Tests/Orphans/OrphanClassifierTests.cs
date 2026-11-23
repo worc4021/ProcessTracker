@@ -68,30 +68,50 @@ public class OrphanClassifierTests
         Assert.Equal(ProcessState.Normal, OrphanClassifier.Classify(r, new SessionRegistry(), Table(Key(5))));
     }
 
+    private static readonly string[] Watched = ["engine*.exe", "solver.exe"];
+
     [Fact]
-    public void Alertable_WatchedOrphanIdle31Min_True() =>
-        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "matlab.exe"), ProcessState.Orphan,
+    public void Alertable_DefaultWatchList_AnyIdleOrphan_True() =>
+        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "node.exe"), ProcessState.Orphan,
             T.AddMinutes(-31), T, Idle));
 
     [Fact]
-    public void Alertable_WatchedOrphanIdle10Min_False() =>
-        Assert.False(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "MATLAB.exe"), ProcessState.Orphan,
-            T.AddMinutes(-10), T, Idle));
+    public void Alertable_EmptyWatchList_AnyIdleOrphan_True() =>
+        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "node.exe"), ProcessState.Orphan,
+            T.AddMinutes(-31), T, Idle, []));
 
     [Fact]
-    public void Alertable_NonWatchedImage_False() =>
+    public void Alertable_IdleBelowThreshold_False() =>
+        Assert.False(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "engine.exe"), ProcessState.Orphan,
+            T.AddMinutes(-10), T, Idle, Watched));
+
+    [Fact]
+    public void Alertable_WatchListSet_MatchingImageIdle_True() =>
+        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "SOLVER.exe"), ProcessState.Orphan,
+            T.AddMinutes(-31), T, Idle, Watched));
+
+    [Fact]
+    public void Alertable_WatchListSet_OtherImage_False() =>
         Assert.False(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "node.exe"), ProcessState.Orphan,
-            T.AddMinutes(-90), T, Idle));
+            T.AddMinutes(-90), T, Idle, Watched));
 
     [Fact]
-    public void Alertable_DymosimWildcard_True() =>
-        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "dymosim_sweep.exe"), ProcessState.Orphan,
-            T.AddMinutes(-31), T, Idle));
+    public void Alertable_WatchListWildcard_True() =>
+        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "engine_sweep.exe"), ProcessState.Orphan,
+            T.AddMinutes(-31), T, Idle, Watched));
+
+    [Fact]
+    public void Alertable_QuestionMarkWildcard_MatchesOneChar()
+    {
+        string[] w = ["job?.exe"];
+        Assert.True(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "job1.exe"), ProcessState.Orphan, T.AddMinutes(-31), T, Idle, w));
+        Assert.False(OrphanClassifier.IsAlertable(Rec(Key(2), null, false, "job12.exe"), ProcessState.Orphan, T.AddMinutes(-31), T, Idle, w));
+    }
 
     [Fact]
     public void Alertable_NeverActive_UsesFirstSeen()
     {
-        var r = Rec(Key(2), null, false, "Dymola.exe") with { FirstSeenUtc = T.AddMinutes(-45) };
+        var r = Rec(Key(2), null, false, "engine.exe") with { FirstSeenUtc = T.AddMinutes(-45) };
         Assert.True(OrphanClassifier.IsAlertable(r, ProcessState.Orphan, null, T, Idle));
         Assert.False(OrphanClassifier.IsAlertable(r, ProcessState.Normal, null, T, Idle));
     }

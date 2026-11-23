@@ -3,6 +3,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="ProcessTracker.Native.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\ProcessTracker.Core\ProcessTracker.Core.csproj" />
   </ItemGroup>
 </Project>

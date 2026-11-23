@@ -24,6 +24,46 @@ jobs:
       - name: Test
         run: dotnet test --solution ProcessTracker.slnx -c Release --no-build -- --filter-not-trait "Category=Perf"
 
+  # The plain-script tests, under Windows PowerShell 5.1 and pwsh.
+  script-tests:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Script tests
+        run: |
+          $failed = @()
+          foreach ($test in 'tests/upgrade-script.tests.ps1', 'tests/plugin.tests.ps1') {
+            foreach ($shell in 'powershell', 'pwsh') {
+              Write-Host "== $test ($shell)"
+              & $shell -NoProfile -ExecutionPolicy Bypass -File $test
+              if ($LASTEXITCODE -ne 0) { $failed += "$test ($shell)" }
+            }
+          }
+          if ($failed) { throw "Failed: $($failed -join ', ')" }
+
+  # Its own job: user mode exits at start while the machine service is installed, which msi-smoke does.
+  user-smoke:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+      - name: Build the zip
+        run: |
+          $version = (Get-Content -LiteralPath version.txt -Raw).Trim()
+          "VERSION=$version" >> $env:GITHUB_ENV
+          ./scripts/build-msi.ps1 -Configuration Release -OutDir artifacts
+          if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 failed.' }
+      - name: User-mode smoke test
+        run: ./scripts/user-smoke.ps1 -Zip "artifacts\ProcessTracker-$env:VERSION-x64.zip"
+
   msi-smoke:
     runs-on: windows-latest
     defaults:

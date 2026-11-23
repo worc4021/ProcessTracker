@@ -1,76 +1,185 @@
 using System.Diagnostics;
 using System.Net;
+using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Logging.EventLog;
 using Microsoft.Extensions.Primitives;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Hooks;
+using ProcessTracker.Core.Updates;
+using ProcessTracker.Native;
 using ProcessTracker.Service;
 using ProcessTracker.Service.Api;
+using ProcessTracker.Service.Logging;
 using ProcessTracker.Service.Mcp;
+using ProcessTracker.Service.Updates;
 
-// Flags: --console (run as a console app instead of a Windows service) and --dev (port 47812, dev data dir,
-// no single-instance mutex). Both are also accepted as configuration keys Console/Dev, e.g. "--Dev=true".
-// Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running,
-// 3 the server ended up listening on a non-loopback address.
-var configArgs = args.Select(a => a switch
+// Flags: --console (run as a console app instead of a Windows service), --dev (port 47812, dev data dir, no
+// single-instance mutex) and --user (run as the logged-in user, with data, settings and a log file in
+// %LOCALAPPDATA%\ProcessTracker). They are also accepted as configuration keys Console/Dev/User, e.g. "--Dev=true".
+// With --user, --takeover <previousAppDir> asks the running user-mode instance to exit and waits up to 2 min for it;
+// if this version then completes no collector tick within 60 s, it starts the previous one again (Updates/Takeover).
+// Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running (or holds the exit event),
+// 3 the server ended up listening on a non-loopback address, 4 user mode refused: the machine service is installed,
+// 5 a --takeover start did not become healthy and started the previous version again.
+var commandLine = new ConfigurationBuilder().AddCommandLine(RunModes.NormalizeFlags(args)).Build();
+
+// The exe is a GUI-subsystem app (no window at logon in user mode); --console gets a console before anything logs.
+var asConsole = bool.TryParse(commandLine["Console"], out var consoleFlag) && consoleFlag;
+if (asConsole) ConsoleWindow.Attach();
+
+RunMode runMode;
+try { runMode = RunModes.ParseMode(commandLine); }
+catch (InvalidOperationException e) // --user with --dev, or a flag value that is not a bool
 {
-    "--dev" => "--Dev=true",
-    "--console" => "--Console=true",
-    _ => a,
-}).ToArray();
-var mode = new ConfigurationBuilder().AddCommandLine(configArgs).Build();
+    Console.Error.WriteLine("Invalid configuration: " + e.Message);
+    return 1;
+}
 
 // The API is unauthenticated and runs as SYSTEM, so no configuration may add or replace listeners. The command line
 // is re-emitted without listener keys (the host reads urls etc. from the arguments it is created with), a last
 // configuration source blanks them for the JSON files, Kestrel's own "Kestrel" section is ignored, and a startup
 // check stops the host if it is listening anywhere but loopback anyway.
-var hostArgs = mode.AsEnumerable()
+var hostArgs = commandLine.AsEnumerable()
     .Where(kv => kv.Value is not null && !LoopbackGuard.IsListenerKey(kv.Key))
     .Select(kv => $"--{kv.Key}={kv.Value}")
     .ToArray();
-var dev = mode.GetValue<bool>("Dev");
-var asConsole = mode.GetValue<bool>("Console");
 
-using var mutex = dev ? null : SingleInstance.TryAcquire();
-if (!dev && mutex is null)
+var builder = WebApplication.CreateBuilder(hostArgs);
+
+// Configuration: appsettings.json next to the exe, then the mode's data folder's appsettings.json
+// (%ProgramData%\ProcessTracker, or %LOCALAPPDATA%\ProcessTracker in user mode; none in dev mode), then the command
+// line. Port comes from the command line only (see ServiceOptions.Port).
+var config = builder.Configuration;
+config.Sources.Clear();
+config.AddJsonFile(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), optional: true, reloadOnChange: false);
+if (runMode != RunMode.Dev)
+{
+    config.AddJsonFile(Path.Combine(ServiceOptions.DefaultDataDir(runMode), "appsettings.json"),
+        optional: true, reloadOnChange: false);
+}
+config.AddCommandLine(hostArgs);
+config.AddInMemoryCollection(LoopbackGuard.NeutralizedHostingKeys);
+
+ServiceOptions options;
+try { options = ServiceOptions.Resolve(config, commandLine, runMode); }
+catch (InvalidOperationException e) // a value that does not convert, e.g. RetentionHours=abc
+{
+    Console.Error.WriteLine("Invalid configuration: " + e.Message);
+    return 1;
+}
+if (options.Validate() is { Count: > 0 } errors)
+{
+    Console.Error.WriteLine("Invalid configuration: " + string.Join("; ", errors));
+    return 1;
+}
+var logDir = Path.Combine(options.DataDir, "logs");
+
+// The machine service always wins: a user-mode instance does not start while it is installed, running or not.
+var instanceChecks = runMode != RunMode.Dev && !Program.SkipInstanceChecks;
+if (instanceChecks && runMode == RunMode.User && ServiceProbe.IsMachineServiceInstalled())
+{
+    using var log = new FileLoggerProvider(logDir);
+    log.CreateLogger("ProcessTracker").LogInformation(
+        "The machine-wide ProcessTracker service is installed; this user-mode instance exits (code 4)");
+    return 4;
+}
+
+// --takeover <previousAppDir> (user mode): a newer version replacing a running one asks it to exit through the exit
+// event, then waits for it to release the mutex.
+var takeover = runMode == RunMode.User && !string.IsNullOrEmpty(commandLine["Takeover"]);
+var previousAppDir = takeover ? AppFolders.Normalize(commandLine["Takeover"]!) : null;
+if (instanceChecks && takeover)
+{
+    try { UserModeSignal.TrySignal(); }
+    catch (UnauthorizedAccessException) { } // another user's instance: the mutex wait below fails and says so
+}
+
+using var mutex = instanceChecks ? SingleInstance.TryAcquire(takeover ? SingleInstance.TakeoverWait : TimeSpan.Zero) : null;
+if (instanceChecks && mutex is null)
 {
     Console.Error.WriteLine(@"Another ProcessTracker instance holds Global\ProcessTracker.Service; exiting.");
+    if (takeover)
+    {
+        // The old instance was told to exit but still holds the mutex after the full wait: it is hung (or belongs to
+        // another user). Nothing runs now; the logon task starts the installed version at the next logon.
+        using var log = new FileLoggerProvider(logDir);
+        log.CreateLogger("ProcessTracker.Takeover").LogError(
+            @"Takeover from {Previous} gave up: Global\ProcessTracker.Service was not released within {Seconds} s. " +
+            "The running instance did not exit; ProcessTracker will start again at the next logon. Exiting (code 2)",
+            previousAppDir, SingleInstance.TakeoverWait.TotalSeconds);
+    }
     return 2;
 }
 
+// User mode's log file. The host disposes it on shutdown; a takeover's rollback still logs after that (it reopens).
+var fileLog = runMode == RunMode.User ? new FileLoggerProvider(logDir) : null;
+
+// A --takeover start: Takeover decides once the collector ticks, or no tick comes, or the host fails. Rolling back
+// needs this instance gone first (host stopped, mutex released on this thread), hence the hand-offs below.
+Task<int>? takeoverRun = null;
+ITrackerHost? takeoverTracker = null;
+Action? stopHost = null;
+var exitRequested = false;
+ExceptionDispatchInfo? hostFailure = null;
+var hostEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var instanceReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+int exitCode;
 try
 {
-    var builder = WebApplication.CreateBuilder(hostArgs);
+    // User mode: the exit event the MSI (before starting the machine service) or a newer version sets to stop this
+    // instance gracefully. Created only once the mutex is ours, so a stale signal for the previous instance is reset.
+    using var exitEvent = instanceChecks && runMode == RunMode.User
+        ? UserModeExitEvent.TryCreate(fileLog!.CreateLogger("ProcessTracker"))
+        : null;
+    if (instanceChecks && runMode == RunMode.User && exitEvent is null) return 2;
 
-    // Configuration: appsettings.json next to the exe, then %ProgramData%\ProcessTracker\appsettings.json
-    // (production only), then the command line. Port comes from the command line only (see ServiceOptions.Port).
-    var config = builder.Configuration;
-    config.Sources.Clear();
-    config.AddJsonFile(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), optional: true, reloadOnChange: false);
-    if (!dev)
+    if (instanceChecks && previousAppDir is not null)
     {
-        config.AddJsonFile(
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ProcessTracker", "appsettings.json"),
-            optional: true, reloadOnChange: false);
+        takeoverRun = Takeover.RunAsync(previousAppDir,
+            () => Takeover.FirstTickAsync(() => Volatile.Read(ref takeoverTracker), hostEnded.Task, Takeover.HealthyWithin,
+                TimeProvider.System),
+            new TakeoverEnvironment
+            {
+                NewAppDir = AppFolders.Normalize(AppContext.BaseDirectory),
+                LocalAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                Task = new UserTask(ProcessRunner.Run),
+                Starter = new DetachedProcessStarter(),
+                ReleaseInstance = () =>
+                {
+                    Volatile.Read(ref stopHost)?.Invoke();
+                    return instanceReleased.Task;
+                },
+                // Read the event itself, so an MSI stop that lands during the 60 s window is seen even while the host
+                // is still running; once the event is disposed (host gone), the value read after app.Run stands.
+                ExitRequested = () =>
+                {
+                    try { return exitEvent!.WaitOne(0) || Volatile.Read(ref exitRequested); }
+                    catch (ObjectDisposedException) { return Volatile.Read(ref exitRequested); }
+                },
+                Log = fileLog!.CreateLogger("ProcessTracker.Takeover"),
+            });
     }
-    config.AddCommandLine(hostArgs);
-    config.AddInMemoryCollection(LoopbackGuard.NeutralizedHostingKeys);
 
-    ServiceOptions options;
-    try { options = ServiceOptions.Resolve(config, mode, dev); }
-    catch (InvalidOperationException e) // a value that does not convert, e.g. RetentionHours=abc
+    if (runMode == RunMode.User)
     {
-        Console.Error.WriteLine("Invalid configuration: " + e.Message);
-        return 1;
-    }
-    if (options.Validate() is { Count: > 0 } errors)
-    {
-        Console.Error.WriteLine("Invalid configuration: " + string.Join("; ", errors));
-        return 1;
-    }
+        // User mode: no event log (creating its source needs admin) and no Windows service host. Information and above
+        // go to a rolling file in the data folder, and to the console with --console. Per-request framework logging
+        // stays at Warning. Registered through a factory so the host disposes it (closing the file) on shutdown.
+        builder.Logging.ClearProviders();
+        if (asConsole) builder.Logging.AddConsole();
+        builder.Services.AddSingleton<ILoggerProvider>(_ => fileLog!);
+        builder.Logging.AddFilter<FileLoggerProvider>(null, LogLevel.Information);
+        builder.Logging.AddFilter<FileLoggerProvider>("Microsoft.AspNetCore", LogLevel.Warning);
+        builder.Logging.AddFilter<FileLoggerProvider>("ModelContextProtocol", LogLevel.Warning);
 
-    if (!asConsole)
+        // A newer version taking over waits SingleInstance.TakeoverWait (2 min) for this instance to stop and release
+        // the mutex; bound the stop well inside that (the collector's in-flight tick wait is 10 s of it).
+        builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = SingleInstance.UserModeShutdownTimeout);
+    }
+    else if (!asConsole)
     {
         // As a service, Information and above go to the Application event log under the source the MSI creates
         // (Get-WinEvent -ProviderName ProcessTracker). Per-request framework logging stays at Warning.
@@ -100,15 +209,31 @@ try
     builder.Services.AddSingleton<TrackerHost>();
     builder.Services.AddSingleton<ITrackerHost>(sp => sp.GetRequiredService<TrackerHost>());
     builder.Services.AddSingleton<ICallerResolver, CallerResolver>();
+    builder.Services.AddSingleton<IRequestOwnerGate, OwnerGate>();
     builder.Services.AddSingleton<OverviewCache>();
+    // The user's last input is readable only in their own desktop session, not by the service in session 0.
+    builder.Services.AddSingleton<IUserActivity>(runMode == RunMode.Service ? new NoUserActivity() : new LastInputProbe());
+    builder.Services.AddSingleton(sp => new HookWarningLimiter(sp.GetRequiredService<TimeProvider>()));
     builder.Services.AddHttpContextAccessor(); // MCP tools resolve the caller from the current request
     builder.Services.AddMcpServer(o => o.ServerInstructions = ProcessTrackerTools.ServerInstructions)
         .WithHttpTransport(o => o.Stateless = true)
         .WithTools<ProcessTrackerTools>(ContractJson.Options); // same JSON contract as REST (enums as strings)
     builder.Services.AddHostedService<CollectorWorker>();
+    if (exitEvent is not null)
+    {
+        builder.Services.AddHostedService(sp => new UserModeExitWatcher(exitEvent,
+            sp.GetRequiredService<IHostApplicationLifetime>(), sp.GetRequiredService<ILogger<UserModeExitWatcher>>()));
+    }
+    if (instanceChecks && runMode == RunMode.User) AddSelfUpdate(builder.Services);
 
     var app = builder.Build();
-    if (ServiceOptions.HasIgnoredPort(config, mode))
+    Volatile.Write(ref takeoverTracker, app.Services.GetRequiredService<ITrackerHost>());
+    Volatile.Write(ref stopHost, () =>
+    {
+        try { app.Lifetime.StopApplication(); }
+        catch (ObjectDisposedException) { } // the host has already gone
+    });
+    if (ServiceOptions.HasIgnoredPort(config, commandLine))
         app.Logger.LogWarning("Port in appsettings.json is ignored; listening on {Port} (only --Port on the command line changes it)",
             options.Port);
 
@@ -122,8 +247,24 @@ try
         return Task.CompletedTask;
     });
 
+    // User mode serves only its owner: everything but GET /api/health (so a client can see whose instance this is)
+    // must come from a process running as this user. Runs before routing, so a rejected request's body is never read.
+    if (runMode == RunMode.User)
+    {
+        app.Use((ctx, next) =>
+        {
+            if (HttpMethods.IsGet(ctx.Request.Method)
+                && ctx.Request.Path.Equals("/api/health", StringComparison.OrdinalIgnoreCase))
+                return next(ctx);
+            if (ctx.RequestServices.GetRequiredService<IRequestOwnerGate>().IsOwner(ctx)) return next(ctx);
+            ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return ctx.Response.WriteAsync(OwnerGate.ForbiddenMessage);
+        });
+    }
+
     app.UseDashboardHeaders();
     app.MapRestEndpoints();
+    app.MapHookEndpoints();
     app.MapDashboard();
     app.MapMcp("/mcp");
 
@@ -141,34 +282,117 @@ try
             app.Lifetime.StopApplication();
             return;
         }
-        app.Logger.LogInformation("ProcessTracker {Version} listening on {Addresses}, data in {DataDir}, GC heap limit {HeapMb} MB{Dev}",
+        app.Logger.LogInformation("ProcessTracker {Version} listening on {Addresses}, data in {DataDir}, GC heap limit {HeapMb} MB, {Mode} mode",
             RestEndpoints.Version, string.Join(", ", addresses), options.DataDir,
-            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20, dev ? " (dev)" : "");
+            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20, runMode.WireName());
     });
 
     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
     app.Run(); // synchronous, so the mutex is released on the thread that acquired it
-    return exposed ? 3 : 0;
+    Volatile.Write(ref exitRequested, exitEvent?.WaitOne(0) == true);
+    exitCode = exposed ? 3 : 0;
+}
+catch (Exception e) when (takeoverRun is not null)
+{
+    // A takeover start's host failed. Before the first tick, Takeover rolls back once the mutex is free; the takeover's
+    // result below decides the exit code either way.
+    fileLog!.CreateLogger("ProcessTracker").LogCritical(e, "The host failed");
+    hostFailure = ExceptionDispatchInfo.Capture(e);
+    exitCode = -1; // never returned: replaced by the takeover's code, or the failure is rethrown
 }
 finally
 {
+    hostEnded.TrySetResult();
     mutex?.ReleaseMutex();
+    instanceReleased.TrySetResult();
+}
+
+// An undecided takeover decides now (hostEnded). Its code is the exit code when it started the previous version (5);
+// when it had already committed (or was asked to exit), a host failure fails the process like any other.
+if (takeoverRun is not null)
+{
+    var takeoverExit = takeoverRun.GetAwaiter().GetResult();
+    if (takeoverExit != 0) return takeoverExit;
+    hostFailure?.Throw();
+}
+return exitCode;
+
+// User mode installed in %LOCALAPPDATA%\Programs\ProcessTracker\app-<X.Y.Z> keeps itself up to date from GitHub
+// releases. Anywhere else (a build output, a copied folder) it does not.
+static void AddSelfUpdate(IServiceCollection services)
+{
+    var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    if (SelfUpdateWorker.InstallRootFor(AppContext.BaseDirectory, localAppData) is not { } installRoot
+        || SelfUpdateWorker.NumericVersion(RestEndpoints.Version) is not { } currentVersion)
+        return;
+    services.AddHostedService(sp => new SelfUpdateWorker(
+        new ReleaseClient(new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(30) },
+            RestEndpoints.Version),
+        new SelfUpdateEnvironment
+        {
+            CurrentAppDir = AppFolders.Normalize(AppContext.BaseDirectory),
+            CurrentVersion = currentVersion,
+            InstallRoot = installRoot,
+            TempDir = Path.GetTempPath(),
+            MachineServiceInstalled = ServiceProbe.IsMachineServiceInstalled,
+            Starter = new DetachedProcessStarter(),
+        },
+        sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<SelfUpdateWorker>>()));
+}
+
+/// <summary>User mode's exit event, created once the instance mutex is ours.</summary>
+internal static class UserModeExitEvent
+{
+    /// <summary>
+    /// The exit event, or null (the caller exits with code 2) when the name is taken: by another user's event
+    /// (<see cref="UnauthorizedAccessException"/>) or by an object of another type squatting it
+    /// (<see cref="WaitHandleCannotBeOpenedException"/>). Both are logged to <paramref name="log"/> and stderr.
+    /// </summary>
+    public static EventWaitHandle? TryCreate(ILogger log, string name = UserModeSignal.ExitEventName)
+    {
+        try { return UserModeSignal.CreateForInstance(name); }
+        catch (UnauthorizedAccessException e)
+        {
+            return Refuse(log, name, e);
+        }
+        catch (WaitHandleCannotBeOpenedException e)
+        {
+            return Refuse(log, name, e);
+        }
+    }
+
+    private static EventWaitHandle? Refuse(ILogger log, string name, Exception e)
+    {
+        Console.Error.WriteLine($"Cannot create the user-mode exit event: {e.Message} Exiting.");
+        log.LogError("Cannot create the user-mode exit event {Name}: {Reason} Exiting (code 2)", name, e.Message);
+        return null;
+    }
 }
 
 /// <summary>The machine-wide single-instance guard (not taken with --dev).</summary>
 internal static class SingleInstance
 {
-    private const string Name = @"Global\ProcessTracker.Service";
+    /// <summary>
+    /// How long a --takeover start waits for the instance it replaces to exit (ruling R8): well beyond that instance's
+    /// <see cref="UserModeShutdownTimeout"/> plus disposal, so only a hung instance makes it give up.
+    /// </summary>
+    public static readonly TimeSpan TakeoverWait = TimeSpan.FromMinutes(2);
 
-    /// <summary>The owned mutex, or null when another instance (possibly under another account) holds it.</summary>
-    public static Mutex? TryAcquire()
+    /// <summary>User mode's host shutdown timeout (the default is 30 s): bounds how long a takeover waits in practice.</summary>
+    public static readonly TimeSpan UserModeShutdownTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// The owned mutex, or null when another instance (possibly under another account) still holds it after
+    /// <paramref name="wait"/>.
+    /// </summary>
+    public static Mutex? TryAcquire(TimeSpan wait, string name = UserModeSignal.InstanceMutexName)
     {
         Mutex m;
-        try { m = new Mutex(initiallyOwned: false, Name); }
+        try { m = new Mutex(initiallyOwned: false, name); }
         catch (UnauthorizedAccessException) { return null; } // created by an instance under another account
         try
         {
-            if (m.WaitOne(0)) return m;
+            if (m.WaitOne(wait)) return m;
         }
         catch (AbandonedMutexException)
         {
@@ -227,4 +451,42 @@ public static class LoopbackGuard
     }
 }
 
-public partial class Program;
+/// <summary>
+/// The exe is a GUI-subsystem app so that user mode shows no window at logon. With --console it borrows the parent's
+/// console, or opens its own, so log lines still appear. Output that is already redirected to a pipe or file (a test or
+/// script capturing it) is left as it is.
+/// </summary>
+internal static class ConsoleWindow
+{
+    private const int AttachParentProcess = -1;
+    private const int StdOutputHandle = -11;
+    private const uint FileTypeDisk = 1, FileTypePipe = 3;
+
+    public static void Attach()
+    {
+        var stdout = GetStdHandle(StdOutputHandle);
+        if (stdout is not (0 or -1) && GetFileType(stdout) is FileTypeDisk or FileTypePipe) return;
+        if (!AttachConsole(AttachParentProcess)) AllocConsole();
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint GetStdHandle(int stdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetFileType(nint file);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AllocConsole();
+}
+
+public partial class Program
+{
+    /// <summary>
+    /// Test seam (ruling R1), set only by the test host: skips the single-instance mutex and the machine-service probe,
+    /// so tests never contend with an installed ProcessTracker service. Deliberately not a configuration key.
+    /// </summary>
+    internal static bool SkipInstanceChecks { get; set; }
+}

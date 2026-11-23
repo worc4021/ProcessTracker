@@ -230,7 +230,7 @@ public sealed class DashboardTests : IDisposable
         SetView(T0,
             Proc(10, "claude.exe", UnitA),
             Proc(11, "node.exe", UnitA, parentPid: 10),
-            Proc(12, "Dymola.exe", UnitA, state: ProcessState.Orphan),
+            Proc(12, "solver.exe", UnitA, state: ProcessState.Orphan),
             Proc(20, "claude.exe", UnitB));
 
         var o = await Overview(Expand(UnitA));
@@ -251,7 +251,7 @@ public sealed class DashboardTests : IDisposable
     [Fact]
     public async Task Overview_WithoutExpand_HasNoProcessRowsButStillOrphans()
     {
-        SetView(T0, Proc(10, "claude.exe", UnitA), Proc(12, "Dymola.exe", UnitA, state: ProcessState.Orphan));
+        SetView(T0, Proc(10, "claude.exe", UnitA), Proc(12, "solver.exe", UnitA, state: ProcessState.Orphan));
 
         var o = await Overview();
 

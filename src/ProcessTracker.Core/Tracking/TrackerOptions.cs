@@ -10,8 +10,14 @@ public sealed class TrackerOptions
     /// <summary>History retention; values below 2 h are raised to 2 h.</summary>
     public TimeSpan Retention { get; set; } = TimeSpan.FromHours(24);
 
-    /// <summary>Effective idle time after which an orphaned watched process is alertable.</summary>
+    /// <summary>Effective idle time after which an orphaned process is alertable.</summary>
     public TimeSpan OrphanIdleAlert { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Image-name patterns (<c>*</c> and <c>?</c> wildcards, case-insensitive) that limit orphan alerts. Empty means
+    /// every orphan idle for <see cref="OrphanIdleAlert"/> is alertable.
+    /// </summary>
+    public string[] OrphanAlertImages { get; set; } = [];
 
     /// <summary>
     /// Profile whose transcripts (under <c>.claude\projects</c>) are read for every session. Empty means each session's

@@ -29,6 +29,14 @@ public class McpRegistrarTests
     }
 
     [Fact]
+    public void McpCommand_ClaudeMissing_MessagePerAction()
+    {
+        Assert.Contains("run: proctrack mcp register", Commands.McpCommand.ClaudeMissingOnRegister);
+        Assert.DoesNotContain("mcp register", Commands.McpCommand.ClaudeMissingOnUnregister);
+        Assert.Contains("nothing changed", Commands.McpCommand.ClaudeMissingOnUnregister);
+    }
+
+    [Fact]
     public void McpRegistrar_Register_PassesHeaderLiterally()
     {
         var runner = new FakeRunner(a => a[1] == "get" ? (1, "not found") : (0, ""));

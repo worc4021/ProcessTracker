@@ -220,7 +220,7 @@ public sealed class Tracker : IDisposable
             var rec = _live[s.Key].Record;
             var state = OrphanClassifier.Classify(rec, _sessions, _table);
             var effective = effectiveAll[s.Key];
-            var alertable = OrphanClassifier.IsAlertable(rec, state, effective, now, _options.OrphanIdleAlert);
+            var alertable = OrphanClassifier.IsAlertable(rec, state, effective, now, _options.OrphanIdleAlert, _options.OrphanAlertImages);
             processViews[s.Key] = new ProcessView(rec, s, _activity.Get(s.Key), effective, state, alertable);
 
             if (rec.Attribution is { Kind: AttributionKind.Session, UnitId: { } unit })

@@ -131,4 +131,27 @@ internal static partial class NativeMethods
 
     [LibraryImport("kernel32.dll")]
     public static partial nint LocalFree(nint mem);
+
+    public const uint ScManagerConnect = 0x0001, ServiceQueryStatus = 0x0004;
+
+    [LibraryImport("advapi32.dll", EntryPoint = "OpenSCManagerW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    public static partial nint OpenSCManager(string? machineName, string? databaseName, uint desiredAccess);
+
+    [LibraryImport("advapi32.dll", EntryPoint = "OpenServiceW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    public static partial nint OpenService(nint scManager, string serviceName, uint desiredAccess);
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool CloseServiceHandle(nint handle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LastInputInfo
+    {
+        public uint Size;
+        public uint Time; // GetTickCount of the last input event
+    }
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetLastInputInfo(ref LastInputInfo info);
 }

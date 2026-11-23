@@ -1,5 +1,6 @@
 using System.CommandLine;
 using ProcessTracker.Cli.Admin;
+using ProcessTracker.Core.Updates;
 
 namespace ProcessTracker.Cli.Commands;
 
@@ -41,7 +42,33 @@ public static class AdminCommand
         var removeTask = new Command("remove-task", "Remove the auto-upgrade scheduled task (requires elevation).");
         removeTask.SetAction(_ => RunTask(t => t.Remove(), "removed"));
 
-        return new Command("admin", "Installer helpers.") { Hidden = true, Subcommands = { prepare, remove, registerTask, removeTask } };
+        var stopUserInstances = new Command("stop-user-instances",
+            "Ask running user-mode instances to exit and wait up to 30 s for them (exit 1 on timeout).");
+        stopUserInstances.SetAction(_ => Report(new StopUserInstances().Run()));
+
+        var asset = new Option<string>("--asset") { Description = "Release asset to fetch.", Required = true };
+        asset.AcceptOnlyFromAmong("msi");
+        var outDir = new Option<string>("--out") { Description = "Folder to download into.", Required = true };
+        var fetchRelease = new Command("fetch-release",
+            "Download the latest release's MSI, hash-verified, if newer than this proctrack; print its path "
+            + "(exit 0), 3 when up to date, 1 on failure.") { asset, outDir };
+        fetchRelease.SetAction(async (pr, ct) =>
+        {
+            if (FetchRelease.InstalledVersion() is not { } installed)
+            {
+                Console.Error.WriteLine("This proctrack build has no X.Y.Z version.");
+                return CommandSupport.Refused;
+            }
+            using var handler = new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(30) };
+            var releases = new ReleaseClient(handler, installed.ToString());
+            return await new FetchRelease(releases, installed).RunAsync(pr.GetValue(asset)!, pr.GetValue(outDir)!, ct);
+        });
+
+        return new Command("admin", "Installer helpers.")
+        {
+            Hidden = true,
+            Subcommands = { prepare, remove, registerTask, removeTask, stopUserInstances, fetchRelease },
+        };
     }
 
     private static bool RefuseUnlessElevated()

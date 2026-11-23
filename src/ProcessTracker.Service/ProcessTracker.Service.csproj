@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <!-- A GUI-subsystem exe: user mode, started at logon, must not show a console window. With the console flag the
+         program attaches to its parent's console (or opens one) itself. -->
+    <OutputType>WinExe</OutputType>
     <!-- The Web SDK defaults to server GC (a heap per core); a small background service wants workstation GC. -->
     <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
@@ -21,5 +23,9 @@
     <PackageReference Include="ModelContextProtocol.AspNetCore" />
     <ProjectReference Include="..\ProcessTracker.Core\ProcessTracker.Core.csproj" />
     <ProjectReference Include="..\ProcessTracker.Native\ProcessTracker.Native.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- For the test host's seam (Program.SkipInstanceChecks). -->
+    <InternalsVisibleTo Include="ProcessTracker.Service.Tests" />
   </ItemGroup>
 </Project>

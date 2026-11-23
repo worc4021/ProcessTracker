@@ -6,5 +6,7 @@
   <ItemGroup>
     <PackageReference Include="System.CommandLine" />
     <ProjectReference Include="..\ProcessTracker.Core\ProcessTracker.Core.csproj" />
+    <!-- UserModeSignal (admin stop-user-instances), shared with the service (ruling R2). -->
+    <ProjectReference Include="..\ProcessTracker.Native\ProcessTracker.Native.csproj" />
   </ItemGroup>
 </Project>
