@@ -17,8 +17,8 @@ public sealed class UserInstallEnvironment
     public required Func<string> CurrentUser { get; init; }
     /// <summary>True when the running proctrack.exe lives inside the folder (it is locked while it runs).</summary>
     public required Func<string, bool> RunningFrom { get; init; }
-    /// <summary>Starts a detached, windowless process (exe, command line); used for the deferred folder cleanup.</summary>
-    public required Action<string, string> StartCleanup { get; init; }
+    /// <summary>Starts a detached, windowless process (exe, command line, extra environment variables); used for the deferred folder cleanup.</summary>
+    public required Action<string, string, IReadOnlyDictionary<string, string>> StartCleanup { get; init; }
     /// <summary>The health answer of the production port; null when nothing answers.</summary>
     public required Func<CancellationToken, Task<HealthDto?>> Health { get; init; }
     public required Func<bool> SignalExit { get; init; }
@@ -137,10 +137,18 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.MachineServiceInstalled());
     }
 
-    /// <summary>The PowerShell command line that waits for <paramref name="pid"/> to exit, then removes <paramref name="dir"/>.</summary>
-    public static string CleanupCommandLine(string dir, int pid) =>
-        $"-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Wait-Process -Id {pid} -Timeout 60 -ErrorAction SilentlyContinue; "
-        + $"Remove-Item -LiteralPath '{dir.Replace("'", "''")}' -Recurse -Force -ErrorAction SilentlyContinue\"";
+    /// <summary>Name of the environment variable that carries the folder to the cleanup helper (never part of the script text).</summary>
+    public const string CleanupDirVariable = "PROCTRACK_CLEANUP_DIR";
+
+    /// <summary>The script text, decoded from <see cref="CleanupCommandLine"/>; it contains only the PID and the variable name.</summary>
+    public static string CleanupScript(int pid) =>
+        $"Wait-Process -Id {pid} -Timeout 60 -ErrorAction SilentlyContinue; "
+        + $"Remove-Item -LiteralPath $env:{CleanupDirVariable} -Recurse -Force -ErrorAction SilentlyContinue";
+
+    /// <summary>PowerShell arguments that wait for <paramref name="pid"/> to exit, then remove the folder named by the environment variable.</summary>
+    public static string CleanupCommandLine(int pid) =>
+        "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand "
+        + Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(CleanupScript(pid)));
 
     public static string CleanupExe => Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
 
@@ -172,7 +180,7 @@ public sealed class UserInstall(UserInstallEnvironment env)
             }
             // proctrack.exe itself is in there and locked: remove what can go now, let a detached helper finish.
             DeleteBestEffort(dir);
-            env.StartCleanup(CleanupExe, CleanupCommandLine(dir, env.ProcessId));
+            env.StartCleanup(CleanupExe, CleanupCommandLine(env.ProcessId), new Dictionary<string, string> { [CleanupDirVariable] = dir });
             env.Out.WriteLine($"Removal of {dir} finishes when this command exits.");
             return Ok;
         }

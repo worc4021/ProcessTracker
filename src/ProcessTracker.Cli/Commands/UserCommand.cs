@@ -48,8 +48,7 @@ public static class UserCommand
         MachineServiceInstalled = ServiceProbe.IsMachineServiceInstalled,
         CurrentUser = () => WindowsIdentity.GetCurrent().Name,
         RunningFrom = UserInstallEnvironment.DefaultRunningFrom,
-        StartCleanup = (exe, commandLine) =>
-            Process.Start(new ProcessStartInfo(exe, commandLine) { UseShellExecute = false, CreateNoWindow = true })?.Dispose(),
+        StartCleanup = StartCleanupHelper,
         Health = async ct =>
         {
             using var client = new ApiClient(ApiClient.ResolveBaseUrl(dev: false));
@@ -59,4 +58,23 @@ public static class UserCommand
         SignalExit = () => UserModeSignal.TrySignal(),
         LocalAppData = UserInstallEnvironment.DefaultLocalAppData(),
     });
+
+    /// <summary>Starts the helper with all three standard handles redirected and closed, so a caller capturing our output is not held open.</summary>
+    private static void StartCleanupHelper(string exe, string commandLine, IReadOnlyDictionary<string, string> environment)
+    {
+        var psi = new ProcessStartInfo(exe, commandLine)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var (key, value) in environment) psi.Environment[key] = value;
+        using var process = Process.Start(psi);
+        if (process is null) return;
+        process.StandardInput.Close();
+        process.StandardOutput.Close();
+        process.StandardError.Close();
+    }
 }

@@ -11,7 +11,7 @@ public sealed class UserInstallTests : IDisposable
     private const string Me = @"PC\me";
     private readonly string _root = Path.Combine(Path.GetTempPath(), "proctrack-userinstall-" + Guid.NewGuid().ToString("N"));
     private readonly List<string> _schtasks = [];
-    private readonly List<(string Exe, string CommandLine)> _cleanups = [];
+    private readonly List<(string Exe, string CommandLine, IReadOnlyDictionary<string, string> Env)> _cleanups = [];
     private readonly StringWriter _out = new(), _err = new();
     private string TaskXml = "";
     private int _signals;
@@ -48,7 +48,7 @@ public sealed class UserInstallTests : IDisposable
             MachineServiceInstalled = () => machineService,
             CurrentUser = () => Me,
             RunningFrom = _ => runningFromInside,
-            StartCleanup = (exe, line) => _cleanups.Add((exe, line)),
+            StartCleanup = (exe, line, env) => _cleanups.Add((exe, line, env)),
             ProcessId = 4242,
             Health = _ => Task.FromResult(health?.Invoke()),
             SignalExit = () => { _signals++; return true; },
@@ -174,8 +174,8 @@ public sealed class UserInstallTests : IDisposable
 
         Assert.Equal(0, code);
         var cleanup = Assert.Single(_cleanups);
-        Assert.Contains($"'{Programs}'", cleanup.CommandLine);
-        Assert.Contains("Wait-Process -Id 4242", cleanup.CommandLine);
+        Assert.Equal(Programs, cleanup.Env[UserInstall.CleanupDirVariable]);
+        Assert.Contains("Wait-Process -Id 4242", UserInstall.CleanupScript(4242));
         Assert.Contains("finishes when this command exits", _out.ToString());
     }
 
@@ -235,5 +235,34 @@ public sealed class UserInstallTests : IDisposable
         Assert.False(s.TaskRegistered);
         Assert.False(s.Responding);
         Assert.Null(s.Mode);
+    }
+
+    [Fact]
+    public void CleanupCommand_KeepsFolderOutOfScriptText()
+    {
+        var script = UserInstall.CleanupScript(7);
+        var line = UserInstall.CleanupCommandLine(7);
+
+        Assert.DoesNotContain("'", script);
+        Assert.Contains("$env:" + UserInstall.CleanupDirVariable, script);
+        var encoded = line[(line.IndexOf("-EncodedCommand ", StringComparison.Ordinal) + "-EncodedCommand ".Length)..];
+        Assert.Equal(script, System.Text.Encoding.Unicode.GetString(Convert.FromBase64String(encoded)));
+    }
+
+    [Fact]
+    public async Task Uninstall_PathWithQuotesAndSpace_TravelsOnlyInEnvironment()
+    {
+        var local = Path.Combine(_root, "O'Brien ’x‘ dir");
+        var programs = Path.Combine(local, "Programs", "ProcessTracker");
+        Directory.CreateDirectory(programs);
+
+        var code = await Make(localAppData: local, runningFromInside: true).UninstallAsync(purgeData: false, Ct);
+
+        Assert.Equal(0, code);
+        var cleanup = Assert.Single(_cleanups);
+        Assert.Equal(programs, cleanup.Env[UserInstall.CleanupDirVariable]);
+        Assert.DoesNotContain("Brien", cleanup.CommandLine);
+        var encoded = cleanup.CommandLine[(cleanup.CommandLine.IndexOf("-EncodedCommand ", StringComparison.Ordinal) + 16)..];
+        Assert.DoesNotContain("Brien", System.Text.Encoding.Unicode.GetString(Convert.FromBase64String(encoded)));
     }
 }
