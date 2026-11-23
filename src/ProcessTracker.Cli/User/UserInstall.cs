@@ -155,8 +155,9 @@ public sealed class UserInstall(UserInstallEnvironment env)
             }
             if (running == Running.Other)
             {
+                // Another account took the port while ours started: undo, and stop whatever of ours may still run.
                 env.Err.WriteLine(OtherUser);
-                return Refused;
+                return await RollBackAsync(appDir, previousAppDir, wasRunning ? before : null, stopNew: true, ct);
             }
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
@@ -169,13 +170,14 @@ public sealed class UserInstall(UserInstallEnvironment env)
     /// After a failed (re)install: points the task back at <paramref name="previousAppDir"/> (or removes the task when
     /// there was none), and when a copy was running before (<paramref name="previouslyRunning"/>) starts it again and
     /// says whether it answers. <paramref name="stopNew"/> first stops whatever the failed start left running, so it
-    /// releases the instance mutex and its folder. Always returns <see cref="Refused"/>.
+    /// releases the instance mutex and its folder; when that copy does not stop, the previous one could not start
+    /// beside it, so it is left to the next logon. Always returns <see cref="Refused"/>.
     /// </summary>
     private async Task<int> RollBackAsync(string appDir, string? previousAppDir, HealthDto? previouslyRunning, bool stopNew,
         CancellationToken ct)
     {
-        if (stopNew && !env.StopInstance(env.StopTimeout))
-            env.Err.WriteLine($"The new version did not stop within {env.StopTimeout.TotalSeconds:0} s either.");
+        var stuck = stopNew && !env.StopInstance(env.StopTimeout);
+        if (stuck) env.Err.WriteLine($"The new version did not stop within {env.StopTimeout.TotalSeconds:0} s either.");
 
         if (previousAppDir is null)
         {
@@ -195,21 +197,43 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine($"The task points at the previous version in {previousAppDir} again.");
             return Refused;
         }
+        if (stuck)
+        {
+            env.Err.WriteLine($"The task points at the previous version {previouslyRunning.Version} again; it starts at your next logon, "
+                              + "or when /process-tracker:install runs again after the stuck copy has exited.");
+            return Refused;
+        }
 
+        // Only a copy started after this install began counts: the previous one may still be exiting after a stop that
+        // timed out, and it answers with the same StartedUtc until it is gone. While nothing answers, the task is started
+        // again (it ignores /Run while it still counts the exiting copy as running).
         env.Task.Start();
         var clock = Stopwatch.StartNew();
+        var lastStart = Stopwatch.StartNew();
         while (true)
         {
-            if (Classify(await env.Health(ct)) == Running.Mine)
+            var health = await env.Health(ct);
+            var running = Classify(health);
+            if (running == Running.Mine && health!.StartedUtc != previouslyRunning.StartedUtc)
             {
                 env.Err.WriteLine($"The new version did not start; the previous version {previouslyRunning.Version} is running again.");
                 return Refused;
+            }
+            if (running == Running.Other)
+            {
+                env.Err.WriteLine($"The task points at the previous version {previouslyRunning.Version} again, but another user's ProcessTracker answers on the port.");
+                return Refused;
+            }
+            if (running == Running.None && lastStart.Elapsed >= env.StartRetryInterval)
+            {
+                env.Task.Start();
+                lastStart.Restart();
             }
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
         }
         env.Err.WriteLine($"The new version did not start; the task points at the previous version {previouslyRunning.Version} again, "
-                          + $"but it did not answer within {env.HealthTimeout.TotalSeconds:0} s. /process-tracker:status shows details.");
+                          + $"but no restarted copy answered within {env.HealthTimeout.TotalSeconds:0} s. /process-tracker:status shows details.");
         return Refused;
     }
 

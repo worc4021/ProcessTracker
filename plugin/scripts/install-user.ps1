@@ -20,7 +20,8 @@
       4. Runs app-<v>\bin\proctrack.exe user install --app-dir <that folder> and prints its output; an older copy of
          yours that is still running is restarted on the new version by it; when that fails, it points the task back
          at the previous version and starts that again. A folder this run extracted is then removed, unless the task
-         points at it afterwards (read again after proctrack returns).
+         points at it afterwards (read again after proctrack returns), the task can't be read then, or a process still
+         runs from it.
       5. Runs proctrack mcp unregister, so a leftover user-scope MCP entry doesn't duplicate the plugin's.
     Exits with the code of proctrack user install, or 1 when it refuses or fails before that.
 #>
@@ -198,6 +199,21 @@ function Get-TaskAppDir([string]$Name) {
     try { return Split-Path -Parent $command } catch { return $null }
 }
 
+function Test-RunningFrom([string]$Dir) {
+    # True when a process runs an executable inside $Dir (deleting it would leave it half-deleted), or when the
+    # processes can't be listed.
+    $prefix = [IO.Path]::GetFullPath($Dir).TrimEnd('') + ''
+    try {
+        foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+            $path = $null
+            try { $path = [string]$process.Path } catch { }
+            if ($path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
+    }
+    catch { return $true }
+}
+
 function Test-SamePath([string]$A, [string]$B) {
     if (-not $A -or -not $B) { return $false }
     $a1 = [IO.Path]::GetFullPath($A).TrimEnd('\')
@@ -322,8 +338,15 @@ function Invoke-InstallUser {
     if ($install.Code -ne 0 -and $created) {
         # proctrack user install rolls the task back on failure, but whatever the task points at *now* stays on disk:
         # deleting it would leave a task over a missing (or running, half-deleted) folder. Read it again, not $taskAppDir.
+        # A task that existed before is never removed by the rollback, so reading none now means the query failed.
         $taskNow = Get-TaskAppDir $taskName
-        if (-not (Test-SamePath $appDir $taskNow) -and -not (Test-SamePath $appDir $taskAppDir)) {
+        if ($null -eq $taskNow -and $null -ne $taskAppDir) {
+            Write-Output "Kept $appDir`: your scheduled task could not be read to confirm it no longer uses that folder."
+        }
+        elseif (Test-RunningFrom $appDir) {
+            Write-Output "Kept $appDir`: a process still runs from it."
+        }
+        elseif (-not (Test-SamePath $appDir $taskNow) -and -not (Test-SamePath $appDir $taskAppDir)) {
             Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Output "Removed $appDir again, since it was not installed."
         }

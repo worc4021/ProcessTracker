@@ -19,6 +19,8 @@ public sealed class UserInstallTests : IDisposable
     private int _signals;
     private int _stops;
     private bool _stopSucceeds = true;
+    /// <summary>When set, the result of the n-th stop (1-based); otherwise <see cref="_stopSucceeds"/>.</summary>
+    private Func<int, bool>? _stopResult;
 
     public UserInstallTests() => Directory.CreateDirectory(_root);
     public void Dispose() => Directory.Delete(_root, recursive: true);
@@ -63,7 +65,7 @@ public sealed class UserInstallTests : IDisposable
             ProcessId = 4242,
             Health = _ => Task.FromResult(health?.Invoke()),
             SignalExit = () => { _signals++; return true; },
-            StopInstance = _ => { _stops++; return _stopSucceeds; },
+            StopInstance = _ => { _stops++; return _stopResult?.Invoke(_stops) ?? _stopSucceeds; },
             AppVersion = FolderVersion,
             LocalAppData = localAppData ?? _root,
             HealthTimeout = TimeSpan.FromMilliseconds(100),
@@ -198,22 +200,96 @@ public sealed class UserInstallTests : IDisposable
     }
 
     [Fact]
-    public async Task Install_OldVersionDoesNotStop_RollsTaskBackAndRestartsPrevious()
+    public async Task Install_OldVersionDoesNotStop_RollsTaskBackWithoutClaimingItRunsAgain()
     {
         var previous = Path.Combine(Programs, "app-0.9.0");
         TaskXml = UserTask.BuildXml(previous, Sid);
         _stopSucceeds = false;
-        var code = await Make(health: () => Health("user", version: "0.9.0")).InstallAsync(AppDir(), Ct);
+        // One StartedUtc throughout: the same old copy, asked to exit and still answering, never a restarted one.
+        var old = Health("user", version: "0.9.0");
+        var code = await Make(health: () => old).InstallAsync(AppDir(), Ct);
 
         Assert.Equal(1, code);
         Assert.Equal(1, _stops);
         Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered); // registration restored
         var changes = _schtasks.Where(c => !c.StartsWith("/Query")).ToList();
-        Assert.Equal(3, changes.Count); // /Create new, /Create previous, /Run
-        Assert.StartsWith("/Run", changes[2]);
+        Assert.StartsWith("/Create", changes[1]);
+        Assert.All(changes.Skip(2), c => Assert.StartsWith("/Run", c)); // the previous copy is asked to start again
         Assert.Contains("did not stop", _err.ToString());
+        Assert.DoesNotContain("running again", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_OldVersionStopsLate_RollbackStartsPreviousAgain()
+    {
+        var previous = Path.Combine(Programs, "app-0.9.0");
+        TaskXml = UserTask.BuildXml(previous, Sid);
+        _stopSucceeds = false;
+        // The old copy answers for a while after the (timed-out) stop, then exits; a /Run issued after that starts the
+        // previous version again (one issued while the old copy still ran is ignored, as MultipleInstancesPolicy IgnoreNew does).
+        var old = Health("user", version: "0.9.0");
+        var polls = 0;
+        var runsWhenGone = -1;
+        HealthDto? restarted = null;
+        HealthDto? Answer()
+        {
+            polls++;
+            if (_stops == 0 || polls < 6) return old;
+            var runs = _schtasks.Count(c => c.StartsWith("/Run"));
+            if (runsWhenGone < 0) runsWhenGone = runs;
+            if (runs > runsWhenGone) restarted ??= Health("user", version: "0.9.0");
+            return restarted;
+        }
+
+        var code = await Make(health: Answer, startRetry: TimeSpan.FromMilliseconds(20)).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered);
+        Assert.True(_schtasks.Count(c => c.StartsWith("/Run")) >= 2, string.Join(" | ", _schtasks));
         Assert.Contains("previous version 0.9.0 is running again", _err.ToString());
-        Assert.DoesNotContain("next logon", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_NewVersionDoesNotStop_RestoresTaskWithoutStartingPrevious()
+    {
+        var previous = Path.Combine(Programs, "app-0.9.0");
+        TaskXml = UserTask.BuildXml(previous, Sid);
+        _stopResult = n => n == 1; // the old copy stops; the failed new one hangs and keeps the instance mutex
+        var old = Health("user", version: "0.9.0");
+        var code = await Make(health: () => _stops == 0 ? old : null).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Equal(2, _stops);
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered);
+        var changes = _schtasks.Where(c => !c.StartsWith("/Query")).ToList();
+        Assert.StartsWith("/Create", changes[^1]); // the hung copy holds the mutex: starting the previous one is pointless
+        Assert.Contains("did not stop", _err.ToString());
+        Assert.DoesNotContain("running again", _err.ToString());
+        Assert.Contains("points at the previous version 0.9.0", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_OtherUserAnswersAfterStart_RollsBack()
+    {
+        var previous = Path.Combine(Programs, "app-0.9.0");
+        TaskXml = UserTask.BuildXml(previous, Sid);
+        var polls = 0;
+        var code = await Make(health: () => ++polls == 1 ? null : Health("user", owner: @"PC\someoneelse")).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered); // registration restored
+        Assert.Contains("belongs to another user", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_FirstInstall_OtherUserAnswersAfterStart_RemovesTheTask()
+    {
+        var polls = 0;
+        var code = await Make(health: () => ++polls == 1 ? null : Health("user", owner: @"PC\someoneelse")).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.StartsWith("/Delete", _schtasks.Where(c => !c.StartsWith("/Query")).Last());
+        Assert.Contains("belongs to another user", _err.ToString());
     }
 
     [Fact]

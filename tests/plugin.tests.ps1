@@ -154,12 +154,16 @@ $installFakes = {
     function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) [void]$script:calls.Add("extract $DestinationPath") }
     $script:installCode = 0
     $script:taskAfterInstall = $null   # when set, proctrack user install leaves the task pointing at this folder
+    $script:taskUnreadableAfterInstall = $false   # when set, schtasks /Query fails after proctrack user install
+    $script:runningFrom = @()          # folders a process still runs from
+    function Test-RunningFrom([string]$Dir) { $script:runningFrom -contains $Dir }
     function Invoke-Native([string]$Exe, [string[]]$Arguments) {
         [void]$script:calls.Add("run $Exe $($Arguments -join ' ')")
         $code = 0
         if ($Arguments[0] -eq 'user') {
             $code = $script:installCode
             if ($script:taskAfterInstall) { $script:taskAppDir = $script:taskAfterInstall }
+            if ($script:taskUnreadableAfterInstall) { $script:taskAppDir = $null }
         }
         @{ Code = $code; Output = 'fake output' }
     }
@@ -393,6 +397,56 @@ Invoke-Case 'install removes its folder when the task was rolled back after a fa
         Check (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'))) 'rolled-back user install: the folder this run extracted is removed'
         Check (Test-Path -LiteralPath (Join-Path $previous 'marker.txt')) 'rolled-back user install: the previous folder is kept'
     }
+}
+
+Invoke-Case 'install keeps its folder when the task cannot be read after a failed user install' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $script:taskAppDir = New-AppDir '0.1.0' $true      # before: the task runs 0.1.0
+        $script:taskUnreadableAfterInstall = $true         # a transient schtasks /Query failure afterwards
+        $script:installCode = 1
+        $out = Invoke-InstallUser | Out-String
+        $new = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'
+        Check (Test-Path -LiteralPath (Join-Path $new 'bin\proctrack.exe')) 'task unreadable after a failed user install: the extracted folder is kept'
+        Check ($out -match 'Kept .*app-0\.2\.0') 'task unreadable after a failed user install: says the folder was kept'
+    }
+}
+
+Invoke-Case 'install keeps its folder while a process still runs from it' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $script:taskAppDir = New-AppDir '0.1.0' $true      # before and after: the task runs 0.1.0 (rolled back)
+        $new = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'
+        $script:runningFrom = @($new)                      # the failed new copy did not stop
+        $script:installCode = 1
+        $out = Invoke-InstallUser | Out-String
+        Check (Test-Path -LiteralPath (Join-Path $new 'bin\proctrack.exe')) 'a folder a process still runs from is kept after a failed user install'
+        Check ($out -match 'Kept .*app-0\.2\.0') 'a folder a process still runs from: says the folder was kept'
+    }
+}
+
+Invoke-Case 'running-from check' {
+    . $installScript
+    $own = Split-Path -Parent (Get-Process -Id $PID).Path
+    Check (Test-RunningFrom $own) 'Test-RunningFrom: the folder of this PowerShell is in use'
+    $empty = New-TestDir
+    try { Check (-not (Test-RunningFrom $empty)) 'Test-RunningFrom: an empty folder is not in use' }
+    finally { Remove-Item -LiteralPath $empty -Recurse -Force }
+    Check (-not (Test-RunningFrom ($own + 'x'))) 'Test-RunningFrom: a sibling folder whose name only starts the same is not in use'
 }
 
 Invoke-Case 'install keeps a failed task folder it extracted' {
