@@ -281,9 +281,102 @@ Invoke-Case 'install follows allowlisted redirect' {
         param($root)
         . $installScript
         . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
         $script:redirect = 'https://release-assets.githubusercontent.com/abc/ProcessTracker-0.2.0-x64.zip.bin?sig=1'
-        try { Invoke-InstallUser | Out-Null } catch { }   # the fake extract leaves no proctrack.exe; only the hops matter
+        $script:ExitCode = $null
+        Invoke-InstallUser | Out-Null
         Check (@($script:calls | Where-Object { $_ -like 'get https://release-assets.githubusercontent.com/*' }).Count -eq 1) 'redirect to release-assets.githubusercontent.com is followed'
+        Check ($script:ExitCode -eq 0) 'install through an allowlisted redirect completes'
+    }
+}
+
+Invoke-Case 'install refuses a non-https redirect' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:redirect = 'http://release-assets.githubusercontent.com/abc/ProcessTracker-0.2.0-x64.zip'
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'only https') 'a redirect to http:// on an allowlisted host is refused'
+        Check (@($script:calls | Where-Object { $_ -like 'get http://*' }).Count -eq 0) 'the http:// URL is never fetched'
+    }
+}
+
+Invoke-Case 'install gives up after 5 redirects' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        # Every hop of the zip answers 302 back to itself.
+        $script:redirect = 'https://github.com/worc4021/ProcessTracker/releases/download/v0.2.0/ProcessTracker-0.2.0-x64.zip'
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'more than 5 redirects') 'a redirect loop is refused'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' }).Count -eq 6) 'the first request and 5 redirects, no more'
+        Check (@($script:calls | Where-Object { $_ -like 'extract *' }).Count -eq 0) 'nothing extracted after a redirect loop'
+    }
+}
+
+Invoke-Case 'install refuses a release asset outside the repository' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:release = @{
+            tag_name = 'v0.2.0'
+            assets   = @(
+                @{ name = 'ProcessTracker-0.2.0-x64.zip'; browser_download_url = 'https://evil.example/ProcessTracker-0.2.0-x64.zip' },
+                @{ name = 'SHA256SUMS.txt'; browser_download_url = 'https://github.com/worc4021/ProcessTracker/releases/download/v0.2.0/SHA256SUMS.txt' })
+        } | ConvertTo-Json -Depth 5
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'outside the repository') 'an asset URL outside the repository''s releases is refused'
+        Check (@($script:calls | Where-Object { $_ -like '*evil.example*' -or $_ -like 'get *.zip' }).Count -eq 0) 'nothing is downloaded'
+    }
+}
+
+Invoke-Case 'install refuses a tag that is not vX.Y.Z' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:release = @{ tag_name = 'v0.2'; assets = @() } | ConvertTo-Json -Depth 5
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'not vX\.Y\.Z') 'a latest tag that is not vX.Y.Z is refused'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' -or $_ -like 'get *SHA256SUMS*' }).Count -eq 0) 'nothing is downloaded'
+    }
+}
+
+Invoke-Case 'install refuses a zip without proctrack.exe' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes   # its Expand-Archive extracts nothing
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'has no bin\\proctrack\.exe') 'a zip without bin\proctrack.exe is refused'
+        $programs = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker'
+        Check (-not (Test-Path -LiteralPath (Join-Path $programs 'app-0.2.0')) -and -not (Test-Path -LiteralPath (Join-Path $programs 'app-0.2.0.partial'))) 'neither app-0.2.0 nor its staging folder is left behind'
+        Check (@($script:calls | Where-Object { $_ -like 'run *' }).Count -eq 0) 'nothing is run'
+    }
+}
+
+Invoke-Case 'install refuses another user''s running copy' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Get-Health { [pscustomobject]@{ version = '0.2.0'; mode = 'user'; owner = 'OTHERPC\someoneelse' } }
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'belongs to another user \(OTHERPC\\someoneelse\)') 'another user''s user-mode copy: refused, naming its owner'
+        Check (@($script:calls | Where-Object { $_ -like 'get *' -or $_ -like 'run *' }).Count -eq 0) 'another user''s copy: nothing downloaded or run'
     }
 }
 
@@ -599,6 +692,22 @@ Invoke-Case 'session-start starts an existing user task' {
     Check ($script:runs -contains "schtasks.exe /Run /TN \ProcessTracker\User-$sid") 'runs schtasks /Run on \ProcessTracker\User-<SID>'
     Check ($out -match 'started' -and $out -notmatch '/process-tracker:install') 'prints one line saying it was started'
     Check (@($out -split "`n" | Where-Object { $_.Trim() }).Count -eq 1) 'one line'
+}
+
+Invoke-Case 'session-start reports a failed task start' {
+    . $sessionScript
+    . $sessionFakes
+    $script:taskExists = $true
+    function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:runs.Add("$Exe $($Arguments -join ' ')"); @{ Code = 1; Output = 'ERROR: Access is denied.' } }
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        throw (New-ConnectionRefused)
+    }
+    $out = Invoke-SessionStart '{}'
+    Check (@($script:runs | Where-Object { $_ -like 'schtasks.exe /Run*' }).Count -eq 1) 'a failed /Run is tried once'
+    Check ($out -match 'failed' -and $out -match '/process-tracker:status' -and $out -notmatch 'started your') 'a failed /Run: says starting failed and points at status'
 }
 
 Invoke-Case 'session-start 403' {

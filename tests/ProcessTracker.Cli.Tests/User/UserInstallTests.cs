@@ -456,7 +456,7 @@ public sealed class UserInstallTests : IDisposable
     [Fact]
     public async Task Uninstall_PathWithQuotesAndSpace_TravelsOnlyInEnvironment()
     {
-        var local = Path.Combine(_root, "O'Brien ’x‘ dir");
+        var local = Path.Combine(_root, "O'Brien \u2019x\u2018 dir");
         var programs = Path.Combine(local, "Programs", "ProcessTracker");
         Directory.CreateDirectory(programs);
 
