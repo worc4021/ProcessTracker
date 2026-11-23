@@ -40,7 +40,7 @@ public sealed class ReleaseClientTests : IDisposable
     }
 
     private static string ReleaseJson(string tag) => $$"""
-        {"tag_name":"{{tag}}","assets":[
+        {"tag_name":{{System.Text.Json.JsonSerializer.Serialize(tag)}},"assets":[
           {"name":"ProcessTracker-0.3.0-x64.msi","browser_download_url":"https://github.com/x/a.msi"},
           {"name":"{{Asset}}","browser_download_url":"{{AssetUrl}}"},
           {"name":"SHA256SUMS.txt","browser_download_url":"{{SumsUrl}}"}]}
@@ -72,6 +72,9 @@ public sealed class ReleaseClientTests : IDisposable
     [InlineData("v0.3.0-rc1")]
     [InlineData("0.3.0")]
     [InlineData("v0.3")]
+    [InlineData("v0.3.0\n")]
+    [InlineData("v٣.0.0")]
+    [InlineData("v2147483648.0.0")]
     public async Task ReleaseClient_PrereleaseTag_ReturnsNull(string tag)
     {
         var client = Client(new FakeHandler(_ => Ok(ReleaseJson(tag))));
@@ -102,6 +105,7 @@ public sealed class ReleaseClientTests : IDisposable
         await Client(handler).GetLatestAsync(TestContext.Current.CancellationToken);
         var req = Assert.Single(handler.Requests);
         Assert.Equal(ReleaseClient.LatestReleaseUri, req.RequestUri);
+        Assert.Contains("application/vnd.github+json", req.Headers.Accept.ToString());
         Assert.StartsWith("ProcessTracker/", req.Headers.UserAgent.ToString());
         Assert.Contains("0.2.0", req.Headers.UserAgent.ToString());
     }
@@ -183,6 +187,7 @@ public sealed class ReleaseClientTests : IDisposable
             _ => Redirect("http://github.com/x.zip"),
         }));
         Assert.Null(await client.DownloadVerifiedAsync(Release(), Asset, _dir, TestContext.Current.CancellationToken));
+        Assert.Empty(Directory.GetFiles(_dir));
     }
 
     [Fact]
@@ -225,6 +230,147 @@ public sealed class ReleaseClientTests : IDisposable
         });
         var client = Client(new FakeHandler(_ => Ok("x")));
         Assert.Null(await client.DownloadVerifiedAsync(release, "..\\evil.zip", _dir, TestContext.Current.CancellationToken));
+    }
+
+    private sealed class FailingContent(byte[] first) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.CompletedTask;
+        protected override bool TryComputeLength(out long length) { length = -1; return false; }
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new FailingStream(first));
+    }
+
+    private sealed class FailingStream(byte[] first) : Stream
+    {
+        private bool _gave;
+        public override int Read(byte[] buffer, int offset, int count) => throw new IOException("boom");
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (_gave) throw new IOException("boom");
+            _gave = true;
+            first.CopyTo(buffer);
+            return ValueTask.FromResult(first.Length);
+        }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task Download_FailedDownload_KeepsPreExistingFile()
+    {
+        Directory.CreateDirectory(_dir);
+        var existing = Path.Combine(_dir, Asset);
+        await File.WriteAllTextAsync(existing, "old", TestContext.Current.CancellationToken);
+        var client = Client(new FakeHandler(_ => new HttpResponseMessage(HttpStatusCode.NotFound)));
+
+        Assert.Null(await client.DownloadVerifiedAsync(Release(), Asset, _dir, TestContext.Current.CancellationToken));
+        Assert.Equal("old", await File.ReadAllTextAsync(existing, TestContext.Current.CancellationToken));
+        Assert.Single(Directory.GetFiles(_dir));
+    }
+
+    [Fact]
+    public async Task Download_HashMismatch_KeepsPreExistingFile()
+    {
+        Directory.CreateDirectory(_dir);
+        var existing = Path.Combine(_dir, Asset);
+        await File.WriteAllTextAsync(existing, "old", TestContext.Current.CancellationToken);
+        var sums = $"{HashOf([9])}  {Asset}\n";
+        var client = Client(new FakeHandler(r => r.RequestUri!.AbsoluteUri == SumsUrl ? Ok(sums) : Ok("new")));
+
+        Assert.Null(await client.DownloadVerifiedAsync(Release(), Asset, _dir, TestContext.Current.CancellationToken));
+        Assert.Equal("old", await File.ReadAllTextAsync(existing, TestContext.Current.CancellationToken));
+        Assert.Single(Directory.GetFiles(_dir));
+    }
+
+    [Fact]
+    public async Task Download_Success_ReplacesPreExistingFile()
+    {
+        Directory.CreateDirectory(_dir);
+        await File.WriteAllTextAsync(Path.Combine(_dir, Asset), "old", TestContext.Current.CancellationToken);
+        var data = "new-bytes"u8.ToArray();
+        var sums = $"{HashOf(data)}  {Asset}\n";
+        var client = Client(new FakeHandler(r => r.RequestUri!.AbsoluteUri == SumsUrl ? Ok(sums) : Ok(data)));
+
+        var path = await client.DownloadVerifiedAsync(Release(), Asset, _dir, TestContext.Current.CancellationToken);
+        Assert.Equal(data, await File.ReadAllBytesAsync(path!, TestContext.Current.CancellationToken));
+        Assert.DoesNotContain(Directory.GetFiles(_dir), f => f.EndsWith(".partial"));
+    }
+
+    [Fact]
+    public async Task Download_UrlOutsideThisRepo_ReturnsNullWithoutRequest()
+    {
+        var release = new ReleaseInfo(new Version(0, 3, 0), "v0.3.0", new Dictionary<string, Uri>
+        {
+            [Asset] = new("https://github.com/someone-else/ProcessTracker/releases/download/v0.3.0/" + Asset),
+            ["SHA256SUMS.txt"] = new(SumsUrl),
+        });
+        var handler = new FakeHandler(_ => Ok("x"));
+        Assert.Null(await Client(handler).DownloadVerifiedAsync(release, Asset, _dir, TestContext.Current.CancellationToken));
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Download_DoesNotSendGitHubAcceptHeader()
+    {
+        var data = "zip"u8.ToArray();
+        var sums = $"{HashOf(data)}  {Asset}\n";
+        var handler = new FakeHandler(r => r.RequestUri!.AbsoluteUri == SumsUrl ? Ok(sums) : Ok(data));
+        await Client(handler).DownloadVerifiedAsync(Release(), Asset, _dir, TestContext.Current.CancellationToken);
+        Assert.All(handler.Requests, r => Assert.Empty(r.Headers.Accept));
+    }
+
+    [Fact]
+    public async Task Download_StreamFailsMidAsset_ReturnsNullAndLeavesNoFiles()
+    {
+        var sums = $"{HashOf([1])}  {Asset}\n";
+        var client = Client(new FakeHandler(r => r.RequestUri!.AbsoluteUri == SumsUrl
+            ? Ok(sums)
+            : new HttpResponseMessage(HttpStatusCode.OK) { Content = new FailingContent(new byte[] { 1, 2 }) }));
+
+        Assert.Null(await client.DownloadVerifiedAsync(Release(), Asset, _dir, TestContext.Current.CancellationToken));
+        Assert.Empty(Directory.GetFiles(_dir));
+    }
+
+    [Fact]
+    public async Task Download_Cancelled_LeavesNoFiles()
+    {
+        var data = "zip"u8.ToArray();
+        var sums = $"{HashOf(data)}  {Asset}\n";
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var client = Client(new FakeHandler(r =>
+        {
+            if (r.RequestUri!.AbsoluteUri == SumsUrl) return Ok(sums);
+            cts.Cancel();
+            return Ok(data);
+        }));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => client.DownloadVerifiedAsync(Release(), Asset, _dir, cts.Token));
+        Assert.Empty(Directory.GetFiles(_dir));
+    }
+
+    [Fact]
+    public async Task ReleaseClient_BodyStreamFails_ReturnsNull()
+    {
+        var client = Client(new FakeHandler(_ =>
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new FailingContent(new byte[] { (byte)'{' }) }));
+        Assert.Null(await client.GetLatestAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task Download_TargetDirIsAFile_ReturnsNull()
+    {
+        Directory.CreateDirectory(_dir);
+        var blocker = Path.Combine(_dir, "blocker");
+        await File.WriteAllTextAsync(blocker, "x", TestContext.Current.CancellationToken);
+        var client = Client(new FakeHandler(_ => Ok("x")));
+        Assert.Null(await client.DownloadVerifiedAsync(Release(), Asset, blocker, TestContext.Current.CancellationToken));
     }
 
     [Fact]

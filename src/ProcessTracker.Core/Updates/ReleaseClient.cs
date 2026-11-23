@@ -27,6 +27,8 @@ public sealed partial class ReleaseClient
     /// <summary>Maximum number of manual redirects followed per request.</summary>
     public const int MaxRedirects = 5;
 
+    private const string ReleaseDownloadPrefix = "https://github.com/worc4021/ProcessTracker/releases/download/";
+
     private static readonly HashSet<string> AllowedDownloadHosts = new(StringComparer.OrdinalIgnoreCase)
     {
         "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
@@ -34,7 +36,7 @@ public sealed partial class ReleaseClient
 
     private readonly HttpClient _http;
 
-    [GeneratedRegex(@"^v\d+\.\d+\.\d+$")]
+    [GeneratedRegex(@"^v[0-9]+\.[0-9]+\.[0-9]+\z")]
     private static partial Regex TagPattern();
 
     /// <summary>Creates a client over <paramref name="handler"/> (which must not auto-follow redirects).</summary>
@@ -46,21 +48,20 @@ public sealed partial class ReleaseClient
             throw new ArgumentException("The handler must have AllowAutoRedirect = false.", nameof(handler));
         _http = new HttpClient(handler, disposeHandler: false);
         _http.DefaultRequestHeaders.UserAgent.ParseAdd($"ProcessTracker/{userAgentVersion}");
-        _http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
     }
 
     /// <summary>True only when <paramref name="candidate"/> is strictly greater than <paramref name="installed"/>.</summary>
     public static bool IsNewer(Version candidate, Version installed) => candidate > installed;
 
     /// <summary>
-    /// Fetches the latest release. Returns null on 403/404/5xx, network failure, malformed JSON, a missing tag or a
-    /// tag that is not <c>vX.Y.Z</c> (pre-releases are ignored).
+    /// Fetches the latest release. Returns null on 403/404/5xx, network or I/O failure, malformed JSON, a missing
+    /// tag or a tag that is not <c>vX.Y.Z</c> (pre-releases are ignored).
     /// </summary>
     public async Task<ReleaseInfo?> GetLatestAsync(CancellationToken ct)
     {
         try
         {
-            using var response = await SendFollowingRedirectsAsync(LatestReleaseUri, allowApiHost: true, ct);
+            using var response = await SendFollowingRedirectsAsync(LatestReleaseUri, isApi: true, ct);
             if (response is null || !response.IsSuccessStatusCode) return null;
 
             await using var stream = await response.Content.ReadAsStreamAsync(ct);
@@ -70,7 +71,8 @@ public sealed partial class ReleaseClient
                 || !root.TryGetProperty("tag_name", out var tagEl) || tagEl.ValueKind != JsonValueKind.String)
                 return null;
             var tag = tagEl.GetString();
-            if (tag is null || !TagPattern().IsMatch(tag)) return null;
+            if (tag is null || !TagPattern().IsMatch(tag) || !Version.TryParse(tag[1..], out var version))
+                return null;
 
             var assets = new Dictionary<string, Uri>(StringComparer.Ordinal);
             if (root.TryGetProperty("assets", out var assetsEl) && assetsEl.ValueKind == JsonValueKind.Array)
@@ -84,9 +86,9 @@ public sealed partial class ReleaseClient
                     assets[n.GetString()!] = uri;
                 }
             }
-            return new ReleaseInfo(Version.Parse(tag[1..]), tag, assets);
+            return new ReleaseInfo(version, tag, assets);
         }
-        catch (Exception e) when (IsTransient(e, ct) || e is JsonException)
+        catch (Exception e) when (IsTransient(e, ct) || e is JsonException or IOException)
         {
             return null;
         }
@@ -94,8 +96,10 @@ public sealed partial class ReleaseClient
 
     /// <summary>
     /// Downloads <c>SHA256SUMS.txt</c> and <paramref name="assetName"/> into <paramref name="targetDir"/>.
-    /// Returns the asset's path only when its SHA-256 matches the sums file; on any failure both files are deleted
-    /// and null is returned, so nothing unverified is left behind.
+    /// Returns the asset's path only when its SHA-256 matches the sums file. Both files are streamed to
+    /// <c>.partial</c> names and renamed to their final names only after verification, so an unverified file is
+    /// never present at a final name. On failure only files created by this call are deleted; pre-existing files
+    /// are never touched. Asset URLs outside this repository's release downloads are refused without a request.
     /// </summary>
     public async Task<string?> DownloadVerifiedAsync(
         ReleaseInfo release, string assetName, string targetDir, CancellationToken ct)
@@ -105,26 +109,30 @@ public sealed partial class ReleaseClient
         if (!release.Assets.TryGetValue(SumsAssetName, out var sumsUri)
             || !release.Assets.TryGetValue(assetName, out var assetUri))
             return null;
+        if (!IsPinnedReleaseUri(sumsUri) || !IsPinnedReleaseUri(assetUri)) return null;
 
-        Directory.CreateDirectory(targetDir);
         var sumsPath = Path.Combine(targetDir, SumsAssetName);
         var assetPath = Path.Combine(targetDir, assetName);
+        var sumsPartial = sumsPath + ".partial";
+        var assetPartial = assetPath + ".partial";
+        var assetRenamed = false;
         var verified = false;
         try
         {
-            if (!await DownloadToFileAsync(sumsUri, sumsPath, ct)) return null;
+            Directory.CreateDirectory(targetDir);
+            if (await DownloadToFileAsync(sumsUri, sumsPartial, ct) is null) return null;
 
             IReadOnlyDictionary<string, string> sums;
-            try { sums = Sha256Sums.Parse(await File.ReadAllTextAsync(sumsPath, ct)); }
+            try { sums = Sha256Sums.Parse(await File.ReadAllTextAsync(sumsPartial, ct)); }
             catch (FormatException) { return null; }
             if (!sums.TryGetValue(assetName, out var expected)) return null;
 
-            if (!await DownloadToFileAsync(assetUri, assetPath, ct)) return null;
+            var actual = await DownloadToFileAsync(assetUri, assetPartial, ct);
+            if (actual is null || !string.Equals(actual, expected, StringComparison.Ordinal)) return null;
 
-            string actual;
-            await using (var fs = File.OpenRead(assetPath))
-                actual = Convert.ToHexStringLower(await SHA256.HashDataAsync(fs, ct));
-            if (!string.Equals(actual, expected, StringComparison.Ordinal)) return null;
+            File.Move(assetPartial, assetPath, overwrite: true);
+            assetRenamed = true;
+            File.Move(sumsPartial, sumsPath, overwrite: true);
 
             verified = true;
             return assetPath;
@@ -135,13 +143,14 @@ public sealed partial class ReleaseClient
         }
         finally
         {
-            if (!verified)
-            {
-                TryDelete(sumsPath);
-                TryDelete(assetPath);
-            }
+            TryDelete(sumsPartial);
+            TryDelete(assetPartial);
+            if (!verified && assetRenamed) TryDelete(assetPath);
         }
     }
+
+    private static bool IsPinnedReleaseUri(Uri uri) =>
+        uri.IsAbsoluteUri && uri.AbsoluteUri.StartsWith(ReleaseDownloadPrefix, StringComparison.Ordinal);
 
     // Network failures and timeouts are "no result"; caller-requested cancellation still propagates.
     private static bool IsTransient(Exception e, CancellationToken ct) =>
@@ -151,28 +160,38 @@ public sealed partial class ReleaseClient
         name.Length > 0 && name == Path.GetFileName(name) && name is not ("." or "..")
         && name.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
 
-    private async Task<bool> DownloadToFileAsync(Uri uri, string path, CancellationToken ct)
+    /// <summary>Streams the response to <paramref name="path"/> and returns its lower-case SHA-256, or null on HTTP failure.</summary>
+    private async Task<string?> DownloadToFileAsync(Uri uri, string path, CancellationToken ct)
     {
-        using var response = await SendFollowingRedirectsAsync(uri, allowApiHost: false, ct);
-        if (response is null || !response.IsSuccessStatusCode) return false;
+        using var response = await SendFollowingRedirectsAsync(uri, isApi: false, ct);
+        if (response is null || !response.IsSuccessStatusCode) return null;
         await using var src = await response.Content.ReadAsStreamAsync(ct);
         await using var dst = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-        await src.CopyToAsync(dst, ct);
-        return true;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[81920];
+        int n;
+        while ((n = await src.ReadAsync(buffer, ct)) > 0)
+        {
+            hash.AppendData(buffer, 0, n);
+            await dst.WriteAsync(buffer.AsMemory(0, n), ct);
+        }
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
     }
 
     /// <summary>
     /// Sends a GET, following redirects manually. Every hop (including the first) must be https on an allowed host;
-    /// otherwise returns null. Also null when the redirect limit is exceeded.
+    /// otherwise returns null. Also null when the redirect limit is exceeded. The GitHub <c>Accept</c> header is
+    /// sent only for the API request.
     /// </summary>
-    private async Task<HttpResponseMessage?> SendFollowingRedirectsAsync(Uri uri, bool allowApiHost, CancellationToken ct)
+    private async Task<HttpResponseMessage?> SendFollowingRedirectsAsync(Uri uri, bool isApi, CancellationToken ct)
     {
         var current = uri;
         for (var hop = 0; hop <= MaxRedirects; hop++)
         {
-            if (!IsAllowed(current, allowApiHost)) return null;
-            var response = await _http.SendAsync(
-                new HttpRequestMessage(HttpMethod.Get, current), HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!IsAllowed(current, isApi)) return null;
+            using var request = new HttpRequestMessage(HttpMethod.Get, current);
+            if (isApi) request.Headers.Accept.ParseAdd("application/vnd.github+json");
+            var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
             if (!IsRedirect(response.StatusCode)) return response;
 
             var location = response.Headers.Location;
