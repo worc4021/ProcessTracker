@@ -1,13 +1,13 @@
 using System.Diagnostics;
 using System.Text;
 
-namespace ProcessTracker.Service.Updates;
+namespace ProcessTracker.Native;
 
 /// <summary>
-/// Runs a short-lived tool (schtasks for <see cref="ProcessTracker.Native.UserTask"/>) and returns its exit code and
-/// combined output; the process is killed after the timeout. The service's counterpart of the CLI's ProcessRunner.
+/// Runs a short-lived tool (schtasks, winget, claude) and returns its exit code and combined output; the process is
+/// killed after the timeout. The CLI and the service both run their tools through it.
 /// </summary>
-public static class ProcessRunner
+public static class ToolRunner
 {
     /// <summary>Exit code reported when the process had to be killed after the timeout.</summary>
     public const int TimedOut = -1;

@@ -201,7 +201,7 @@ public sealed record HistorySeriesDto(
 /// Both are null when read from a service that predates them.
 /// </summary>
 public sealed record HealthDto(
-    string Version, DateTime StartedUtc, DateTime? LastTickUtc, double? TickAgeSeconds, string Mode,
+    string Version, DateTime StartedUtc, DateTime? LastTickUtc, double? TickAgeSeconds, string? Mode,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Owner);
 
 /// <summary>A kill performed by a client. TsUtc defaults to the time the service receives the record.</summary>

@@ -49,12 +49,6 @@ public sealed class SelfUpdateWorker(
         return root is not null && string.Equals(root, expected, StringComparison.OrdinalIgnoreCase) ? root : null;
     }
 
-    /// <summary>The X.Y.Z of an informational version such as <c>0.3.0</c> or <c>0.3.0-dev.202611231200</c>; null otherwise.</summary>
-    public static Version? NumericVersion(string informational)
-    {
-        var core = informational.Split('+', '-')[0];
-        return Version.TryParse(core, out var v) && v.Build >= 0 && v.Revision < 0 ? new Version(v.Major, v.Minor, v.Build) : null;
-    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

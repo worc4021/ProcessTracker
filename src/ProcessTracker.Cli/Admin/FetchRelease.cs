@@ -18,14 +18,8 @@ public sealed class FetchRelease(ReleaseClient releases, Version installed, Text
 
     /// <summary>The numeric X.Y.Z of this proctrack build (what the MSI installed), or null for an unparseable version.</summary>
     public static Version? InstalledVersion() =>
-        NumericVersion(typeof(FetchRelease).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "");
+        ReleaseVersion.Numeric(typeof(FetchRelease).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "");
 
-    /// <summary>X.Y.Z of an informational version such as <c>0.3.0</c>, <c>0.3.0-dev.stamp</c> or <c>0.3.0+hash</c>.</summary>
-    public static Version? NumericVersion(string informational)
-    {
-        var core = informational.Split('+', '-')[0];
-        return Version.TryParse(core, out var v) && v.Build >= 0 && v.Revision < 0 ? new Version(v.Major, v.Minor, v.Build) : null;
-    }
 
     /// <summary>The release asset name for <paramref name="asset"/> (only <c>msi</c>) at <paramref name="version"/>.</summary>
     public static string AssetName(string asset, Version version) => asset switch

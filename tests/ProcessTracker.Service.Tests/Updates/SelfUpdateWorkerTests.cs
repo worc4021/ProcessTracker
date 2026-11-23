@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using ProcessTracker.Core.Updates;
+using ProcessTracker.Service.Tests.Fakes;
 using ProcessTracker.Service.Updates;
 
 namespace ProcessTracker.Service.Tests.Updates;
@@ -21,7 +22,8 @@ public sealed class SelfUpdateWorkerTests : IDisposable
 
     public void Dispose() => _temp.Dispose();
 
-    private SelfUpdateWorker Worker(TimeSpan? firstCheck = null, TimeSpan? interval = null, TimeSpan? downloadTimeout = null) => new(
+    private SelfUpdateWorker Worker(TimeSpan? firstCheck = null, TimeSpan? interval = null, TimeSpan? downloadTimeout = null,
+        TimeProvider? time = null) => new(
         new ReleaseClient(_github, "0.2.0"),
         new SelfUpdateEnvironment
         {
@@ -35,7 +37,7 @@ public sealed class SelfUpdateWorkerTests : IDisposable
             Interval = interval ?? TimeSpan.FromHours(24),
             DownloadTimeout = downloadTimeout ?? TimeSpan.FromMinutes(15),
         },
-        TimeProvider.System,
+        time ?? TimeProvider.System,
         NullLogger<SelfUpdateWorker>.Instance);
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
@@ -182,31 +184,45 @@ public sealed class SelfUpdateWorkerTests : IDisposable
         Assert.Equal(UpdateCheck.StartFailed, await Worker().CheckOnceAsync(Ct));
     }
 
+    /// <summary>Waits (real time, bounded) for something the worker does on its own thread after a timer fired.</summary>
+    private static async Task Until(Func<bool> condition, string what)
+    {
+        for (var i = 0; i < 200 && !condition(); i++) await Task.Delay(25, Ct);
+        Assert.True(condition(), what);
+    }
+
     [Fact]
     public async Task Worker_FirstCheckWaitsForTheFirstDelay()
     {
         _machineService = true; // each check only probes
-        using var worker = Worker(firstCheck: TimeSpan.FromHours(1));
+        var time = new SteppedTimeProvider();
+        using var worker = Worker(firstCheck: TimeSpan.FromMinutes(10), time: time);
 
         await worker.StartAsync(Ct);
-        await Task.Delay(300, Ct);
+        await Until(() => time.ArmedTimers == 1, "the worker waits on the first delay");
+        time.Advance(TimeSpan.FromMinutes(10) - TimeSpan.FromSeconds(1));
+        Assert.Equal(0, Volatile.Read(ref _probes)); // no timer fired, so nothing can have run
+        time.Advance(TimeSpan.FromSeconds(1));
+        await Until(() => Volatile.Read(ref _probes) == 1, "the first check runs once the first delay has passed");
         await worker.StopAsync(Ct);
-
-        Assert.Equal(0, _probes);
     }
 
     [Fact]
     public async Task Worker_ChecksOnceThenWaitsForTheInterval()
     {
         _machineService = true;
-        using var worker = Worker(firstCheck: TimeSpan.Zero, interval: TimeSpan.FromHours(1));
+        var time = new SteppedTimeProvider();
+        using var worker = Worker(firstCheck: TimeSpan.FromMinutes(10), interval: TimeSpan.FromHours(24), time: time);
 
         await worker.StartAsync(Ct);
-        for (var i = 0; i < 100 && Volatile.Read(ref _probes) == 0; i++) await Task.Delay(50, Ct);
-        await Task.Delay(300, Ct);
+        await Until(() => time.ArmedTimers == 1, "the worker waits on the first delay");
+        time.Advance(TimeSpan.FromMinutes(10));
+        await Until(() => Volatile.Read(ref _probes) == 1 && time.ArmedTimers == 1, "one check, then a wait on the interval");
+        time.Advance(TimeSpan.FromHours(24) - TimeSpan.FromSeconds(1));
+        Assert.Equal(1, Volatile.Read(ref _probes));
+        time.Advance(TimeSpan.FromSeconds(1));
+        await Until(() => Volatile.Read(ref _probes) == 2, "the second check runs after the interval");
         await worker.StopAsync(Ct);
-
-        Assert.Equal(1, _probes);
     }
 
     [Theory]
@@ -220,12 +236,4 @@ public sealed class SelfUpdateWorkerTests : IDisposable
     public void InstallRootFor_OnlyTheUserModeLayout(string appDir, string? expected) =>
         Assert.Equal(expected, SelfUpdateWorker.InstallRootFor(appDir, @"C:\Users\x\AppData\Local"));
 
-    [Theory]
-    [InlineData("0.2.0", "0.2.0")]
-    [InlineData("0.2.0-dev.202611231200", "0.2.0")]
-    [InlineData("1.10.3+abc", "1.10.3")]
-    [InlineData("garbage", null)]
-    [InlineData("1.2", null)]
-    public void NumericVersion_TakesXyz(string informational, string? expected) =>
-        Assert.Equal(expected is null ? null : Version.Parse(expected), SelfUpdateWorker.NumericVersion(informational));
 }

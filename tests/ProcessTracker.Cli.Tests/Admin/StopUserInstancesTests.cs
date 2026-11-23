@@ -37,6 +37,7 @@ public class StopUserInstancesTests
 
         Assert.False(result.Ok); // AdminCommand reports a failed result with exit code 1
         Assert.True(instanceEvent.WaitOne(0)); // the instance was asked to exit
+        Assert.Equal("User-mode ProcessTracker did not stop within 0.3 s.", result.Message);
     }
 
     [Fact]
@@ -73,6 +74,7 @@ public class StopUserInstancesTests
         var result = new StopUserInstances(evt, mutex, TimeSpan.FromMilliseconds(300)).Run();
 
         Assert.False(result.Ok, result.Message);
+        Assert.Equal($"{mutex} is still held after 0.3 s and no user-mode exit event appeared.", result.Message);
     }
 
     /// <summary>

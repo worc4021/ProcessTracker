@@ -154,12 +154,16 @@ $installFakes = {
     function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) [void]$script:calls.Add("extract $DestinationPath") }
     $script:installCode = 0
     $script:taskAfterInstall = $null   # when set, proctrack user install leaves the task pointing at this folder
+    $script:taskUnreadableAfterInstall = $false   # when set, schtasks /Query fails after proctrack user install
+    $script:runningFrom = @()          # folders a process still runs from
+    function Test-RunningFrom([string]$Dir) { $script:runningFrom -contains $Dir }
     function Invoke-Native([string]$Exe, [string[]]$Arguments) {
         [void]$script:calls.Add("run $Exe $($Arguments -join ' ')")
         $code = 0
         if ($Arguments[0] -eq 'user') {
             $code = $script:installCode
             if ($script:taskAfterInstall) { $script:taskAppDir = $script:taskAfterInstall }
+            if ($script:taskUnreadableAfterInstall) { $script:taskAppDir = $null }
         }
         @{ Code = $code; Output = 'fake output' }
     }
@@ -277,9 +281,102 @@ Invoke-Case 'install follows allowlisted redirect' {
         param($root)
         . $installScript
         . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
         $script:redirect = 'https://release-assets.githubusercontent.com/abc/ProcessTracker-0.2.0-x64.zip.bin?sig=1'
-        try { Invoke-InstallUser | Out-Null } catch { }   # the fake extract leaves no proctrack.exe; only the hops matter
+        $script:ExitCode = $null
+        Invoke-InstallUser | Out-Null
         Check (@($script:calls | Where-Object { $_ -like 'get https://release-assets.githubusercontent.com/*' }).Count -eq 1) 'redirect to release-assets.githubusercontent.com is followed'
+        Check ($script:ExitCode -eq 0) 'install through an allowlisted redirect completes'
+    }
+}
+
+Invoke-Case 'install refuses a non-https redirect' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:redirect = 'http://release-assets.githubusercontent.com/abc/ProcessTracker-0.2.0-x64.zip'
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'only https') 'a redirect to http:// on an allowlisted host is refused'
+        Check (@($script:calls | Where-Object { $_ -like 'get http://*' }).Count -eq 0) 'the http:// URL is never fetched'
+    }
+}
+
+Invoke-Case 'install gives up after 5 redirects' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        # Every hop of the zip answers 302 back to itself.
+        $script:redirect = 'https://github.com/worc4021/ProcessTracker/releases/download/v0.2.0/ProcessTracker-0.2.0-x64.zip'
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'more than 5 redirects') 'a redirect loop is refused'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' }).Count -eq 6) 'the first request and 5 redirects, no more'
+        Check (@($script:calls | Where-Object { $_ -like 'extract *' }).Count -eq 0) 'nothing extracted after a redirect loop'
+    }
+}
+
+Invoke-Case 'install refuses a release asset outside the repository' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:release = @{
+            tag_name = 'v0.2.0'
+            assets   = @(
+                @{ name = 'ProcessTracker-0.2.0-x64.zip'; browser_download_url = 'https://evil.example/ProcessTracker-0.2.0-x64.zip' },
+                @{ name = 'SHA256SUMS.txt'; browser_download_url = 'https://github.com/worc4021/ProcessTracker/releases/download/v0.2.0/SHA256SUMS.txt' })
+        } | ConvertTo-Json -Depth 5
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'outside the repository') 'an asset URL outside the repository''s releases is refused'
+        Check (@($script:calls | Where-Object { $_ -like '*evil.example*' -or $_ -like 'get *.zip' }).Count -eq 0) 'nothing is downloaded'
+    }
+}
+
+Invoke-Case 'install refuses a tag that is not vX.Y.Z' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:release = @{ tag_name = 'v0.2'; assets = @() } | ConvertTo-Json -Depth 5
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'not vX\.Y\.Z') 'a latest tag that is not vX.Y.Z is refused'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' -or $_ -like 'get *SHA256SUMS*' }).Count -eq 0) 'nothing is downloaded'
+    }
+}
+
+Invoke-Case 'install refuses a zip without proctrack.exe' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes   # its Expand-Archive extracts nothing
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'has no bin\\proctrack\.exe') 'a zip without bin\proctrack.exe is refused'
+        $programs = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker'
+        Check (-not (Test-Path -LiteralPath (Join-Path $programs 'app-0.2.0')) -and -not (Test-Path -LiteralPath (Join-Path $programs 'app-0.2.0.partial'))) 'neither app-0.2.0 nor its staging folder is left behind'
+        Check (@($script:calls | Where-Object { $_ -like 'run *' }).Count -eq 0) 'nothing is run'
+    }
+}
+
+Invoke-Case 'install refuses another user''s running copy' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Get-Health { [pscustomobject]@{ version = '0.2.0'; mode = 'user'; owner = 'OTHERPC\someoneelse' } }
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'belongs to another user \(OTHERPC\\someoneelse\)') 'another user''s user-mode copy: refused, naming its owner'
+        Check (@($script:calls | Where-Object { $_ -like 'get *' -or $_ -like 'run *' }).Count -eq 0) 'another user''s copy: nothing downloaded or run'
     }
 }
 
@@ -393,6 +490,58 @@ Invoke-Case 'install removes its folder when the task was rolled back after a fa
         Check (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'))) 'rolled-back user install: the folder this run extracted is removed'
         Check (Test-Path -LiteralPath (Join-Path $previous 'marker.txt')) 'rolled-back user install: the previous folder is kept'
     }
+}
+
+Invoke-Case 'install keeps its folder when the task cannot be read after a failed user install' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $script:taskAppDir = New-AppDir '0.1.0' $true      # before: the task runs 0.1.0
+        $script:taskUnreadableAfterInstall = $true         # a transient schtasks /Query failure afterwards
+        $script:installCode = 1
+        $out = Invoke-InstallUser | Out-String
+        $new = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'
+        Check (Test-Path -LiteralPath (Join-Path $new 'bin\proctrack.exe')) 'task unreadable after a failed user install: the extracted folder is kept'
+        Check ($out -match 'Kept .*app-0\.2\.0') 'task unreadable after a failed user install: says the folder was kept'
+    }
+}
+
+Invoke-Case 'install keeps its folder while a process still runs from it' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $script:taskAppDir = New-AppDir '0.1.0' $true      # before and after: the task runs 0.1.0 (rolled back)
+        $new = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'
+        $script:runningFrom = @($new)                      # the failed new copy did not stop
+        $script:installCode = 1
+        $out = Invoke-InstallUser | Out-String
+        Check (Test-Path -LiteralPath (Join-Path $new 'bin\proctrack.exe')) 'a folder a process still runs from is kept after a failed user install'
+        Check ($out -match 'Kept .*app-0\.2\.0') 'a folder a process still runs from: says the folder was kept'
+    }
+}
+
+Invoke-Case 'running-from check' {
+    . $installScript
+    $own = Split-Path -Parent (Get-Process -Id $PID).Path
+    Check (Test-RunningFrom $own) 'Test-RunningFrom: the folder of this PowerShell is in use'
+    $empty = New-TestDir
+    try { Check (-not (Test-RunningFrom $empty)) 'Test-RunningFrom: an empty folder is not in use' }
+    finally { Remove-Item -LiteralPath $empty -Recurse -Force }
+    Check (-not (Test-RunningFrom ($own + 'x'))) 'Test-RunningFrom: a sibling folder whose name only starts the same is not in use'
+    $exe = (Get-Process -Id $PID).Path
+    Check (-not (Test-RunningFrom ($exe -replace '\.exe$', ''))) 'Test-RunningFrom: a folder named like the start of a running exe is not in use'
 }
 
 Invoke-Case 'install keeps a failed task folder it extracted' {
@@ -547,6 +696,22 @@ Invoke-Case 'session-start starts an existing user task' {
     Check (@($out -split "`n" | Where-Object { $_.Trim() }).Count -eq 1) 'one line'
 }
 
+Invoke-Case 'session-start reports a failed task start' {
+    . $sessionScript
+    . $sessionFakes
+    $script:taskExists = $true
+    function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:runs.Add("$Exe $($Arguments -join ' ')"); @{ Code = 1; Output = 'ERROR: Access is denied.' } }
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        throw (New-ConnectionRefused)
+    }
+    $out = Invoke-SessionStart '{}'
+    Check (@($script:runs | Where-Object { $_ -like 'schtasks.exe /Run*' }).Count -eq 1) 'a failed /Run is tried once'
+    Check ($out -match 'failed' -and $out -match '/process-tracker:status' -and $out -notmatch 'started your') 'a failed /Run: says starting failed and points at status'
+}
+
 Invoke-Case 'session-start 403' {
     . $sessionScript
     . $sessionFakes
@@ -604,11 +769,23 @@ Invoke-Case 'session-start refuses a foreign verdict' {
     Check ($script:lookups -contains '47811') 'the listeners of port 47811 are looked up'
 }
 
-Invoke-Case 'session-start posts on a trusted, absent or unknown verdict' {
+$unknownLine = "ProcessTracker: could not check which account's process holds port 47811; not using it."
+
+Invoke-Case 'session-start refuses an unknown verdict' {
     . $sessionScript
     . $sessionFakes
     . $postOk
-    foreach ($v in @('trusted', 'none', $null)) {
+    $script:verdict = 'unknown'
+    $out = Invoke-SessionStart '{"session_id":"s1"}'
+    Check ($out -eq $unknownLine) 'listeners that cannot be checked: prints the one line'
+    Check ($script:posts.Count -eq 0) 'listeners that cannot be checked: the payload is not posted'
+}
+
+Invoke-Case 'session-start posts on a trusted or absent verdict' {
+    . $sessionScript
+    . $sessionFakes
+    . $postOk
+    foreach ($v in @('trusted', 'none')) {
         $script:posts.Clear()
         $script:verdict = $v
         $out = Invoke-SessionStart '{}'
@@ -625,6 +802,8 @@ $ownerFakes = {
     $script:owners = @{}
     $script:servicePid = 0
     $script:tcpThrows = $false
+    $script:portListening = $false  # what the fallback listener check sees (it runs when the query lists nothing)
+    function Test-PortListening([int]$Port) { $script:portListening }
     $script:cimHangs = $false
     $script:cimTimeouts = New-Object System.Collections.ArrayList
     function Test-MachineService { $false }
@@ -718,23 +897,42 @@ Invoke-Case 'owner check: lookup failures' {
     . $ownerFakes
     . $postOk
     $script:tcpThrows = $true
+    $script:portListening = $true
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'the listener query fails while something listens: refused, nothing posted'
+    $script:portListening = $false
     Invoke-SessionStart '{}' | Out-Null
-    Check ($script:posts.Count -eq 1) 'the listener query fails (no cmdlet): falls back and posts'
+    Check ($script:posts.Count -eq 1) 'the listener query fails and nothing listens: posts'
     $script:tcpThrows = $false
     $script:posts.Clear()
     $script:listeners = @()
     Invoke-SessionStart '{}' | Out-Null
     Check ($script:posts.Count -eq 1) 'nothing listens on the port at all: posts'
     $script:posts.Clear()
+    $script:portListening = $true   # the query failed quietly (a non-terminating error) while something listens
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'the query lists nothing but something listens: refused, nothing posted'
+    $script:portListening = $false
+    $script:posts.Clear()
     $script:listeners = @(New-Listener '127.0.0.1' 906)
     $script:cimHangs = $true
     $out = Invoke-SessionStart '{}'
-    Check ($out -eq $foreignLine -and $script:posts.Count -eq 0) 'WMI times out on a listener''s owner: refused, nothing posted'
+    Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'WMI times out on a listener''s owner: says it could not check, nothing posted'
     $script:cimHangs = $false
     $script:cimTimeouts.Clear()
     $script:owners = @{ 906 = $script:me }
     Invoke-SessionStart '{}' | Out-Null
     Check ($script:cimTimeouts.Count -gt 0 -and @($script:cimTimeouts | Where-Object { $_ -ne 3 }).Count -eq 0) 'every CIM call passes -OperationTimeoutSec 3'
+}
+
+Invoke-Case 'fallback listener check' {
+    . $sessionScript
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    try { Check (Test-PortListening $port) 'Test-PortListening: a listener on 127.0.0.1 is seen' }
+    finally { $listener.Stop() }
+    Check (-not (Test-PortListening $port)) 'Test-PortListening: a closed port is not'
 }
 
 Invoke-Case 'session-start with the machine service installed but stopped' {

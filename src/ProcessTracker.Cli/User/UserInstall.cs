@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Updates;
 using ProcessTracker.Native;
 
 namespace ProcessTracker.Cli.User;
@@ -56,12 +57,12 @@ public sealed class UserInstallEnvironment
         {
             var exe = Path.Combine(appDir, UserTask.ServiceExeName);
             if (File.Exists(exe) && FileVersionInfo.GetVersionInfo(exe).ProductVersion is { } product
-                && Admin.FetchRelease.NumericVersion(product) is { } fromExe)
+                && ReleaseVersion.Numeric(product) is { } fromExe)
                 return fromExe;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException) { }
         var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(appDir));
-        return name.StartsWith("app-", StringComparison.OrdinalIgnoreCase) ? Admin.FetchRelease.NumericVersion(name[4..]) : null;
+        return name.StartsWith("app-", StringComparison.OrdinalIgnoreCase) ? ReleaseVersion.Numeric(name[4..]) : null;
     }
 
     public static bool DefaultRunningFrom(string dir) =>
@@ -112,7 +113,7 @@ public sealed class UserInstall(UserInstallEnvironment env)
         // This user's instance already runs: keep it when it is this version from this folder; otherwise it is an older
         // (or relocated) copy that re-registering alone would leave running, so it is restarted below.
         var restart = wasRunning
-                      && ((target is not null && FetchReleaseVersion(before!.Version) != target)
+                      && ((target is not null && ReleaseVersion.Numeric(before!.Version) != target)
                           || (previousAppDir is not null && !SamePath(previousAppDir, appDir)));
 
         if (env.Task.Register(appDir) != 0) return Refused;
@@ -148,15 +149,16 @@ public sealed class UserInstall(UserInstallEnvironment env)
                 env.Task.Start();
                 lastStart.Restart();
             }
-            if (running == Running.Mine && (target is null || FetchReleaseVersion(health!.Version) == target))
+            if (running == Running.Mine && (target is null || ReleaseVersion.Numeric(health!.Version) == target))
             {
                 env.Out.WriteLine($"ProcessTracker {health!.Version} user mode is running.");
                 return Ok;
             }
             if (running == Running.Other)
             {
+                // Another account took the port while ours started: undo, and stop whatever of ours may still run.
                 env.Err.WriteLine(OtherUser);
-                return Refused;
+                return await RollBackAsync(appDir, previousAppDir, wasRunning ? before : null, stopNew: true, ct);
             }
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
@@ -169,13 +171,14 @@ public sealed class UserInstall(UserInstallEnvironment env)
     /// After a failed (re)install: points the task back at <paramref name="previousAppDir"/> (or removes the task when
     /// there was none), and when a copy was running before (<paramref name="previouslyRunning"/>) starts it again and
     /// says whether it answers. <paramref name="stopNew"/> first stops whatever the failed start left running, so it
-    /// releases the instance mutex and its folder. Always returns <see cref="Refused"/>.
+    /// releases the instance mutex and its folder; when that copy does not stop, the previous one could not start
+    /// beside it, so it is left to the next logon. Always returns <see cref="Refused"/>.
     /// </summary>
     private async Task<int> RollBackAsync(string appDir, string? previousAppDir, HealthDto? previouslyRunning, bool stopNew,
         CancellationToken ct)
     {
-        if (stopNew && !env.StopInstance(env.StopTimeout))
-            env.Err.WriteLine($"The new version did not stop within {env.StopTimeout.TotalSeconds:0} s either.");
+        var stuck = stopNew && !env.StopInstance(env.StopTimeout);
+        if (stuck) env.Err.WriteLine($"The new version did not stop within {env.StopTimeout.TotalSeconds:0} s either.");
 
         if (previousAppDir is null)
         {
@@ -183,37 +186,64 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine(removed
                 ? $"The task was removed again; nothing of {appDir} is registered."
                 : $"Removing the task {env.Task.TaskName} failed; 'proctrack user uninstall' removes it.");
+            // A copy ran without a task (started by hand, or its task was deleted): there is nothing to start it with.
+            if (previouslyRunning is not null)
+                env.Err.WriteLine($"The ProcessTracker {previouslyRunning.Version} that was running was stopped and is not running now; "
+                                  + "it had no scheduled task to start it again.");
             return Refused;
         }
-        if (!SamePath(previousAppDir, appDir) && env.Task.Register(previousAppDir) != 0)
+        var samePlace = SamePath(previousAppDir, appDir);
+        if (!samePlace && env.Task.Register(previousAppDir) != 0)
         {
             env.Err.WriteLine($"Pointing the task back at {previousAppDir} failed; it still points at {appDir}.");
             return Refused;
         }
         if (previouslyRunning is null)
         {
-            env.Err.WriteLine($"The task points at the previous version in {previousAppDir} again.");
+            env.Err.WriteLine(samePlace
+                ? $"The task still points at {appDir}."
+                : $"The task points at the previous version in {previousAppDir} again.");
+            return Refused;
+        }
+        if (stuck)
+        {
+            env.Err.WriteLine($"The task points at the previous version {previouslyRunning.Version} again; it starts at your next logon, "
+                              + "or when /process-tracker:install runs again after the stuck copy has exited.");
             return Refused;
         }
 
+        // Only a copy started after this install began counts: the previous one may still be exiting after a stop that
+        // timed out, and it answers with the same StartedUtc until it is gone. While nothing answers, the task is started
+        // again (it ignores /Run while it still counts the exiting copy as running).
         env.Task.Start();
         var clock = Stopwatch.StartNew();
+        var lastStart = Stopwatch.StartNew();
         while (true)
         {
-            if (Classify(await env.Health(ct)) == Running.Mine)
+            var health = await env.Health(ct);
+            var running = Classify(health);
+            if (running == Running.Mine && health!.StartedUtc != previouslyRunning.StartedUtc)
             {
                 env.Err.WriteLine($"The new version did not start; the previous version {previouslyRunning.Version} is running again.");
                 return Refused;
+            }
+            if (running == Running.Other)
+            {
+                env.Err.WriteLine($"The task points at the previous version {previouslyRunning.Version} again, but another user's ProcessTracker answers on the port.");
+                return Refused;
+            }
+            if (running == Running.None && lastStart.Elapsed >= env.StartRetryInterval)
+            {
+                env.Task.Start();
+                lastStart.Restart();
             }
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
         }
         env.Err.WriteLine($"The new version did not start; the task points at the previous version {previouslyRunning.Version} again, "
-                          + $"but it did not answer within {env.HealthTimeout.TotalSeconds:0} s. /process-tracker:status shows details.");
+                          + $"but no restarted copy answered within {env.HealthTimeout.TotalSeconds:0} s. /process-tracker:status shows details.");
         return Refused;
     }
-
-    private static Version? FetchReleaseVersion(string informational) => Admin.FetchRelease.NumericVersion(informational);
 
     private static string Describe(Version? version) => version?.ToString(3) ?? "(version unknown)";
 
