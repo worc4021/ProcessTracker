@@ -40,6 +40,23 @@ public sealed class HostConfigurationTests
         Assert.Contains(errors, e => e.StartsWith(key, StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("(unclosed")]
+    [InlineData("")]
+    public void InvalidHeavyCommandPattern_IsRejected(string pattern)
+    {
+        var errors = Resolve(("HeavyCommandPatterns:0", @"\bbazel\b"),("HeavyCommandPatterns:1", pattern)).Validate();
+        Assert.Contains(errors, e => e.StartsWith("HeavyCommandPatterns[1]", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void HeavyCommandPatterns_AreCompiledCaseInsensitive()
+    {
+        var o = Resolve(("HeavyCommandPatterns:0", @"\bbazel\s+build"));
+        Assert.Empty(o.Validate());
+        Assert.Matches(Assert.Single(o.HeavyCommandRegexes()), "BAZEL build //...");
+    }
+
     [Fact]
     public void OutOfRangePort_OnCommandLine_IsRejected()
     {

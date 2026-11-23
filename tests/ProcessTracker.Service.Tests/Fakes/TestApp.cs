@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using ProcessTracker.Core.Hooks;
 
 namespace ProcessTracker.Service.Tests.Fakes;
 
@@ -31,6 +32,9 @@ public sealed class TestApp : WebApplicationFactory<Program>
     /// <summary>Replaces the owner gate when set; null keeps the production one.</summary>
     public IRequestOwnerGate? OwnerGate { get; init; }
 
+    /// <summary>Replaces the last-input probe when set; null keeps the mode's own.</summary>
+    public IUserActivity? UserActivity { get; init; }
+
     /// <summary>The temporary data folder in user mode; null otherwise.</summary>
     public string? DataDir => _dataDir;
 
@@ -52,6 +56,11 @@ public sealed class TestApp : WebApplicationFactory<Program>
             {
                 s.RemoveAll<IRequestOwnerGate>();
                 s.AddSingleton(OwnerGate);
+            }
+            if (UserActivity is not null)
+            {
+                s.RemoveAll<IUserActivity>();
+                s.AddSingleton(UserActivity);
             }
             foreach (var d in s.Where(d => d.ImplementationType == typeof(CollectorWorker)).ToList()) s.Remove(d);
         });

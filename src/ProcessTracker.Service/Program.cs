@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Logging.EventLog;
 using Microsoft.Extensions.Primitives;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Hooks;
 using ProcessTracker.Core.Updates;
 using ProcessTracker.Native;
 using ProcessTracker.Service;
@@ -208,6 +209,9 @@ try
     builder.Services.AddSingleton<ICallerResolver, CallerResolver>();
     builder.Services.AddSingleton<IRequestOwnerGate, OwnerGate>();
     builder.Services.AddSingleton<OverviewCache>();
+    // The user's last input is readable only in their own desktop session, not by the service in session 0.
+    builder.Services.AddSingleton<IUserActivity>(runMode == RunMode.Service ? new NoUserActivity() : new LastInputProbe());
+    builder.Services.AddSingleton(sp => new HookWarningLimiter(sp.GetRequiredService<TimeProvider>()));
     builder.Services.AddHttpContextAccessor(); // MCP tools resolve the caller from the current request
     builder.Services.AddMcpServer(o => o.ServerInstructions = ProcessTrackerTools.ServerInstructions)
         .WithHttpTransport(o => o.Stateless = true)
@@ -258,6 +262,7 @@ try
 
     app.UseDashboardHeaders();
     app.MapRestEndpoints();
+    app.MapHookEndpoints();
     app.MapDashboard();
     app.MapMcp("/mcp");
 

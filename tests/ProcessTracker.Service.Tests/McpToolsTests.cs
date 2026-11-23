@@ -72,6 +72,9 @@ public sealed class McpToolsTests : IDisposable
         Assert.Contains("get_machine_load", instructions);
         Assert.Contains("suggestedParallelism", instructions);
         Assert.Contains("Critical", instructions);
+        Assert.Contains("Weigh what the user has told you", instructions);
+        Assert.DoesNotContain("do not start", instructions, StringComparison.OrdinalIgnoreCase);
+        Assert.True(instructions.Length < 1500, $"instructions are {instructions.Length} characters");
         Assert.Equal(Mcp.ProcessTrackerTools.ServerInstructions, instructions);
     }
 

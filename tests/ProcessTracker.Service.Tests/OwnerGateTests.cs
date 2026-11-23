@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text;
 using Microsoft.AspNetCore.Http;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Hooks;
 using ProcessTracker.Service.Tests.Fakes;
 
 namespace ProcessTracker.Service.Tests;
@@ -15,24 +17,43 @@ public sealed class OwnerGateTests
 
     private static readonly DateTime Now = new(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
 
+    private sealed class CountingActivity : IUserActivity
+    {
+        public int Calls;
+
+        public TimeSpan? SinceLastInput()
+        {
+            Interlocked.Increment(ref Calls);
+            return TimeSpan.FromSeconds(1);
+        }
+    }
+
+    private const string HeavyHook = """{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Task","tool_input":{}}""";
+
     private static readonly KillAuditDto Kill = new("1234@5678", "MATLAB.exe", null, "proctrack.exe", Tree: true, Result: "killed");
 
-    // Until the hook endpoint exists (Task 7), POST /api/audit/kill stands in for it: a POST with a body whose handler
-    // is observable through FakeTrackerHost.Kills, so no recorded kill proves the request never reached the handler.
+    // The PreToolUse hook is what another user's sessions would hit on every tool call. A heavy Task call always reaches
+    // the advisor, which asks IUserActivity for the last input, so no probe call proves the advisor never ran. The kill
+    // audit is observable through FakeTrackerHost.Kills: no recorded kill proves that handler never ran either.
     [Fact]
     public async Task OwnerGate_OtherUser_Gets403AndHandlerNotRun()
     {
         var ct = TestContext.Current.CancellationToken;
-        await using var app = new TestApp(Now, RunMode.User) { OwnerGate = new FixedGate(false) };
+        var activity = new CountingActivity();
+        await using var app = new TestApp(Now, RunMode.User) { OwnerGate = new FixedGate(false), UserActivity = activity };
         using var http = app.CreateLocalClient();
 
         var load = await http.GetAsync("/api/load", ct);
         var audit = await http.PostAsJsonAsync("/api/audit/kill", Kill, ContractJson.Options, ct);
+        var hook = await http.PostAsync("/api/hooks/pre-tool-use", new StringContent(HeavyHook, Encoding.UTF8, "application/json"), ct);
 
         Assert.Equal(HttpStatusCode.Forbidden, load.StatusCode);
         Assert.Equal(HttpStatusCode.Forbidden, audit.StatusCode);
         Assert.Equal(OwnerGate.ForbiddenMessage, await audit.Content.ReadAsStringAsync(ct));
         Assert.Empty(app.Tracker.Kills);
+        Assert.Equal(HttpStatusCode.Forbidden, hook.StatusCode);
+        Assert.Equal(OwnerGate.ForbiddenMessage, await hook.Content.ReadAsStringAsync(ct));
+        Assert.Equal(0, activity.Calls);
     }
 
     [Fact]
@@ -76,6 +97,8 @@ public sealed class OwnerGateTests
         using var http = app.CreateLocalClient();
 
         Assert.Equal(HttpStatusCode.OK, (await http.GetAsync("/api/load", ct)).StatusCode);
+        var hook = await http.PostAsync("/api/hooks/pre-tool-use", new StringContent(HeavyHook, Encoding.UTF8, "application/json"), ct);
+        Assert.Equal(HttpStatusCode.OK, hook.StatusCode);
         var audit = await http.PostAsJsonAsync("/api/audit/kill", Kill, ContractJson.Options, ct);
 
         Assert.Equal(HttpStatusCode.NoContent, audit.StatusCode);

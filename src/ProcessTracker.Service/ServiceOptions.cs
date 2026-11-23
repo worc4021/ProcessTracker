@@ -1,3 +1,6 @@
+using System.Text.RegularExpressions;
+using ProcessTracker.Core.Hooks;
+
 namespace ProcessTracker.Service;
 
 /// <summary>
@@ -36,6 +39,18 @@ public sealed class ServiceOptions
 
     public double OrphanIdleAlertMinutes { get; set; } = 30;
 
+    /// <summary>
+    /// Extra regular expressions (case-insensitive) that mark a Bash or PowerShell command as heavy work for the
+    /// PreToolUse hook, on top of the built-in list in <see cref="HeavyCommandClassifier"/>.
+    /// </summary>
+    public string[] HeavyCommandPatterns { get; set; } = [];
+
+    private Regex[]? _heavyCommandRegexes;
+
+    /// <summary><see cref="HeavyCommandPatterns"/> compiled once (call only after <see cref="Validate"/> passed).</summary>
+    public IReadOnlyList<Regex> HeavyCommandRegexes() =>
+        _heavyCommandRegexes ??= HeavyCommandPatterns.Select(HeavyCommandClassifier.CreatePattern).ToArray();
+
     public TimeSpan Retention => TimeSpan.FromHours(Math.Max(MinRetentionHours, RetentionHours));
 
     public TimeSpan OrphanIdleAlert => TimeSpan.FromMinutes(OrphanIdleAlertMinutes);
@@ -49,6 +64,17 @@ public sealed class ServiceOptions
             errors.Add($"RetentionHours must be > 0 and <= {MaxRetentionHours} (was {RetentionHours}); values below {MinRetentionHours} are raised to {MinRetentionHours}");
         if (!double.IsFinite(OrphanIdleAlertMinutes) || OrphanIdleAlertMinutes <= 0 || OrphanIdleAlertMinutes > MaxOrphanIdleAlertMinutes)
             errors.Add($"OrphanIdleAlertMinutes must be > 0 and <= {MaxOrphanIdleAlertMinutes} (was {OrphanIdleAlertMinutes})");
+        for (var i = 0; i < HeavyCommandPatterns.Length; i++)
+        {
+            // An empty pattern would match every command.
+            if (string.IsNullOrWhiteSpace(HeavyCommandPatterns[i]))
+            {
+                errors.Add($"HeavyCommandPatterns[{i}] must not be empty");
+                continue;
+            }
+            try { HeavyCommandClassifier.CreatePattern(HeavyCommandPatterns[i]); }
+            catch (ArgumentException e) { errors.Add($"HeavyCommandPatterns[{i}] is not a valid regular expression: {e.Message}"); }
+        }
         return errors;
     }
 
