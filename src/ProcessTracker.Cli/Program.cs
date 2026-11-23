@@ -18,6 +18,7 @@ public static class Program
             KillCommand.Create(),
             McpCommand.Create(),
             UpgradeTaskCommand.Create(),
+            UserCommand.Create(),
             AdminCommand.Create(),
         };
         return root.Parse(args).InvokeAsync();
