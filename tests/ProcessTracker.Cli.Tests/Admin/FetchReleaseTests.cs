@@ -97,18 +97,4 @@ public sealed class FetchReleaseTests : IDisposable
         Assert.Equal("", _out.ToString());
     }
 
-    [Theory]
-    [InlineData("0.3.0", "0.3.0")]
-    [InlineData("0.3.0-dev.202611231200", "0.3.0")]
-    [InlineData("1.2.3+abc", "1.2.3")]
-    public void FetchRelease_NumericVersion(string informational, string expected)
-    {
-        Assert.Equal(Version.Parse(expected), FetchRelease.NumericVersion(informational));
-    }
-
-    [Fact]
-    public void FetchRelease_NumericVersion_RejectsGarbage()
-    {
-        Assert.Null(FetchRelease.NumericVersion("not-a-version"));
-    }
 }

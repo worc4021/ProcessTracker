@@ -236,12 +236,4 @@ public sealed class SelfUpdateWorkerTests : IDisposable
     public void InstallRootFor_OnlyTheUserModeLayout(string appDir, string? expected) =>
         Assert.Equal(expected, SelfUpdateWorker.InstallRootFor(appDir, @"C:\Users\x\AppData\Local"));
 
-    [Theory]
-    [InlineData("0.2.0", "0.2.0")]
-    [InlineData("0.2.0-dev.202611231200", "0.2.0")]
-    [InlineData("1.10.3+abc", "1.10.3")]
-    [InlineData("garbage", null)]
-    [InlineData("1.2", null)]
-    public void NumericVersion_TakesXyz(string informational, string? expected) =>
-        Assert.Equal(expected is null ? null : Version.Parse(expected), SelfUpdateWorker.NumericVersion(informational));
 }

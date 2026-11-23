@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Updates;
 using ProcessTracker.Native;
 
 namespace ProcessTracker.Cli.User;
@@ -56,12 +57,12 @@ public sealed class UserInstallEnvironment
         {
             var exe = Path.Combine(appDir, UserTask.ServiceExeName);
             if (File.Exists(exe) && FileVersionInfo.GetVersionInfo(exe).ProductVersion is { } product
-                && Admin.FetchRelease.NumericVersion(product) is { } fromExe)
+                && ReleaseVersion.Numeric(product) is { } fromExe)
                 return fromExe;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException) { }
         var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(appDir));
-        return name.StartsWith("app-", StringComparison.OrdinalIgnoreCase) ? Admin.FetchRelease.NumericVersion(name[4..]) : null;
+        return name.StartsWith("app-", StringComparison.OrdinalIgnoreCase) ? ReleaseVersion.Numeric(name[4..]) : null;
     }
 
     public static bool DefaultRunningFrom(string dir) =>
@@ -112,7 +113,7 @@ public sealed class UserInstall(UserInstallEnvironment env)
         // This user's instance already runs: keep it when it is this version from this folder; otherwise it is an older
         // (or relocated) copy that re-registering alone would leave running, so it is restarted below.
         var restart = wasRunning
-                      && ((target is not null && FetchReleaseVersion(before!.Version) != target)
+                      && ((target is not null && ReleaseVersion.Numeric(before!.Version) != target)
                           || (previousAppDir is not null && !SamePath(previousAppDir, appDir)));
 
         if (env.Task.Register(appDir) != 0) return Refused;
@@ -148,7 +149,7 @@ public sealed class UserInstall(UserInstallEnvironment env)
                 env.Task.Start();
                 lastStart.Restart();
             }
-            if (running == Running.Mine && (target is null || FetchReleaseVersion(health!.Version) == target))
+            if (running == Running.Mine && (target is null || ReleaseVersion.Numeric(health!.Version) == target))
             {
                 env.Out.WriteLine($"ProcessTracker {health!.Version} user mode is running.");
                 return Ok;
@@ -236,8 +237,6 @@ public sealed class UserInstall(UserInstallEnvironment env)
                           + $"but no restarted copy answered within {env.HealthTimeout.TotalSeconds:0} s. /process-tracker:status shows details.");
         return Refused;
     }
-
-    private static Version? FetchReleaseVersion(string informational) => Admin.FetchRelease.NumericVersion(informational);
 
     private static string Describe(Version? version) => version?.ToString(3) ?? "(version unknown)";
 

@@ -145,7 +145,7 @@ try
             {
                 NewAppDir = AppFolders.Normalize(AppContext.BaseDirectory),
                 LocalAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                Task = new UserTask(ProcessRunner.Run),
+                Task = new UserTask(ToolRunner.Run),
                 Starter = new DetachedProcessStarter(),
                 ReleaseInstance = () =>
                 {
@@ -323,7 +323,7 @@ static void AddSelfUpdate(IServiceCollection services)
 {
     var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
     if (SelfUpdateWorker.InstallRootFor(AppContext.BaseDirectory, localAppData) is not { } installRoot
-        || SelfUpdateWorker.NumericVersion(RestEndpoints.Version) is not { } currentVersion)
+        || ReleaseVersion.Numeric(RestEndpoints.Version) is not { } currentVersion)
         return;
     services.AddHostedService(sp => new SelfUpdateWorker(
         new ReleaseClient(new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(30) },

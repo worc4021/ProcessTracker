@@ -2,7 +2,7 @@ using System.Text.Json;
 using ProcessTracker.Core.Hooks;
 using ProcessTracker.Core.Load;
 using ProcessTracker.Core.Tracking;
-using ProcessTracker.Service.Updates;
+using ProcessTracker.Core.Updates;
 
 namespace ProcessTracker.Service.Api;
 
@@ -57,8 +57,8 @@ public static class HookEndpoints
         var caller = FindSession(host.View, Str(input, "session_id"));
         var load = RestEndpoints.Load(host, caller?.Info.UnitId);
         // An unparseable tracker version (never in a release build) leaves out the version-skew line.
-        var trackerVersion = SelfUpdateWorker.NumericVersion(RestEndpoints.Version);
-        var pluginVersion = trackerVersion is not null && Str(input, "plugin_version") is { } p ? SelfUpdateWorker.NumericVersion(p) : null;
+        var trackerVersion = ReleaseVersion.Numeric(RestEndpoints.Version);
+        var pluginVersion = trackerVersion is not null && Str(input, "plugin_version") is { } p ? ReleaseVersion.Numeric(p) : null;
         var text = HookAdvisor.SessionStart(load, options.Mode.WireName(), activity.SinceLastInput(), pluginVersion,
             trackerVersion ?? new Version(0, 0, 0));
         return Context("SessionStart", text);
