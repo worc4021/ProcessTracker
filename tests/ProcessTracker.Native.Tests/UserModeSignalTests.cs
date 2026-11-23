@@ -64,6 +64,35 @@ public class UserModeSignalTests
     }
 
     [Fact]
+    public void CreateForInstance_ExistingEventWithOurDaclButForeignOwner_Throws()
+    {
+        // A squatter can create the name with exactly our DACL and keep a full-access handle; only the owner tells it
+        // apart. One process cannot create an object owned by another account, so the test narrows the trusted owners
+        // to an account that is not this process (whatever owner its token gives the squatter: the user, or
+        // Administrators when elevated).
+        var name = TestEventName();
+        var user = WindowsIdentity.GetCurrent().User!;
+        var ours = new EventWaitHandleSecurity();
+        ours.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (var sid in new[] { user, new(WellKnownSidType.LocalSystemSid, null), new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null) })
+            ours.AddAccessRule(new EventWaitHandleAccessRule(sid, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+        using var squatter = EventWaitHandleAcl.Create(false, EventResetMode.ManualReset, name, out var createdNew, ours);
+        Assert.True(createdNew);
+        var someoneElse = new SecurityIdentifier("S-1-5-21-1-2-3-1001");
+
+        Assert.Throws<UnauthorizedAccessException>(() => UserModeSignal.CreateForInstance(name, trustedOwners: [someoneElse]));
+    }
+
+    [Fact]
+    public void CreateForInstance_OwnerIsTrusted()
+    {
+        using var instance = UserModeSignal.CreateForInstance(TestEventName());
+
+        var owner = instance.GetAccessControl().GetOwner(typeof(SecurityIdentifier))!.Value;
+        Assert.Contains(owner, new[] { WindowsIdentity.GetCurrent().User!.Value, "S-1-5-18", "S-1-5-32-544" });
+    }
+
+    [Fact]
     public void CreateForInstance_IsManualReset()
     {
         var name = TestEventName();

@@ -4,9 +4,11 @@ using ProcessTracker.Native;
 namespace ProcessTracker.Cli.Admin;
 
 /// <summary>
-/// Asks every running user-mode instance to exit (the MSI runs this as SYSTEM before it starts the machine service),
-/// then waits until the single-instance mutex is free. The names are parameters for tests; production uses the
-/// defaults.
+/// Asks every running user-mode instance to exit (the MSI runs this as SYSTEM before it starts the machine service)
+/// and waits until the single-instance mutex is free. While the mutex is held the exit event is signalled again on
+/// every retry: an instance may hold the mutex before it has created its event, or still hold it after closing it.
+/// Succeeds only once the mutex could be acquired (and was released again) or does not exist. The names are
+/// parameters for tests; production uses the defaults.
 /// </summary>
 public sealed class StopUserInstances(
     string eventName = UserModeSignal.ExitEventName,
@@ -19,43 +21,50 @@ public sealed class StopUserInstances(
 
     public SetupResult Run()
     {
-        bool signalled;
-        try { signalled = UserModeSignal.TrySignal(eventName); }
-        catch (UnauthorizedAccessException)
-        {
-            return new SetupResult(false, "A user-mode ProcessTracker is running under another account; run this elevated.");
-        }
-        if (!signalled) return new SetupResult(true, "No user-mode ProcessTracker is running.");
-
-        return WaitForMutexFree()
-            ? new SetupResult(true, "User-mode ProcessTracker stopped.")
-            : new SetupResult(false, $"User-mode ProcessTracker did not stop within {_timeout.TotalSeconds:0.#} s.");
-    }
-
-    /// <summary>True once the mutex could be acquired (and was released again) within the timeout.</summary>
-    private bool WaitForMutexFree()
-    {
         var clock = Stopwatch.StartNew();
+        var signalled = false;
         while (true)
         {
+            try { signalled |= UserModeSignal.TrySignal(eventName); }
+            catch (UnauthorizedAccessException)
+            {
+                return new SetupResult(false, "A user-mode ProcessTracker is running under another account; run this elevated.");
+            }
+
             var remaining = _timeout - clock.Elapsed;
-            if (remaining <= TimeSpan.Zero) return false;
-            Mutex mutex;
-            try { mutex = new Mutex(initiallyOwned: false, mutexName); }
-            catch (UnauthorizedAccessException) // held under a DACL that excludes us: wait for its owner to go away
-            {
-                Thread.Sleep(remaining < RetryDelay ? remaining : RetryDelay);
-                continue;
-            }
-            using (mutex)
-            {
-                bool acquired;
-                try { acquired = mutex.WaitOne(remaining); }
-                catch (AbandonedMutexException) { acquired = true; } // the instance died holding it: free now
-                if (!acquired) return false;
-                mutex.ReleaseMutex();
-                return true;
-            }
+            if (MutexFree(remaining < RetryDelay ? remaining : RetryDelay))
+                return signalled
+                    ? new SetupResult(true, "User-mode ProcessTracker stopped.")
+                    : new SetupResult(true, "No user-mode ProcessTracker is running.");
+            if (clock.Elapsed >= _timeout)
+                return new SetupResult(false, signalled
+                    ? $"User-mode ProcessTracker did not stop within {_timeout.TotalSeconds:0.#} s."
+                    : $"{mutexName} is still held after {_timeout.TotalSeconds:0.#} s and no user-mode exit event appeared.");
+        }
+    }
+
+    /// <summary>True when the mutex does not exist, or could be acquired (and was released again) within <paramref name="wait"/>.</summary>
+    private bool MutexFree(TimeSpan wait)
+    {
+        if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
+        Mutex? mutex;
+        try
+        {
+            if (!Mutex.TryOpenExisting(mutexName, out mutex)) return true;
+        }
+        catch (UnauthorizedAccessException) // held under a DACL that excludes us: wait for its owner to go away
+        {
+            Thread.Sleep(wait);
+            return false;
+        }
+        using (mutex)
+        {
+            bool acquired;
+            try { acquired = mutex.WaitOne(wait); }
+            catch (AbandonedMutexException) { acquired = true; } // the instance died holding it: ours now, so free
+            if (!acquired) return false;
+            mutex.ReleaseMutex();
+            return true;
         }
     }
 }

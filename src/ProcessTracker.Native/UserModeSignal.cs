@@ -19,15 +19,22 @@ public static class UserModeSignal
     /// <summary>
     /// Creates (or opens) the manual-reset exit event for the instance that now holds the single-instance mutex, and
     /// resets it: a signal left set for a previous instance that is still closing its handle is not for us.
-    /// Throws <see cref="UnauthorizedAccessException"/> when the event already exists under a DACL other than ours:
-    /// another user pre-creating the name must not be able to stop this instance (or keep it from starting quietly).
+    /// Throws <see cref="UnauthorizedAccessException"/> when the event already exists under a DACL other than ours, or
+    /// is owned by anyone but this user, SYSTEM or Administrators: another user pre-creating the name (even with our
+    /// exact DACL, keeping a handle of their own) must not be able to stop this instance.
     /// </summary>
-    public static EventWaitHandle CreateForInstance(string name = ExitEventName)
+    public static EventWaitHandle CreateForInstance(string name = ExitEventName) => CreateForInstance(name, trustedOwners: null);
+
+    /// <param name="name">The event name.</param>
+    /// <param name="trustedOwners">Owners an existing event may have; null for this user, SYSTEM and Administrators.
+    /// Tests narrow it, as one process cannot create an object owned by another account.</param>
+    internal static EventWaitHandle CreateForInstance(string name, IReadOnlyCollection<SecurityIdentifier>? trustedOwners)
     {
-        var owner = CurrentUser();
+        var user = CurrentUser();
+        var allowed = AllowedSids(user);
         var handle = EventWaitHandleAcl.Create(initialState: false, EventResetMode.ManualReset, name, out var createdNew,
-            OwnerOnlySecurity(owner));
-        if (!createdNew && !GrantsOnly(handle, AllowedSids(owner)))
+            OwnerOnlySecurity(user));
+        if (!createdNew && !IsOurs(handle, allowed, trustedOwners ?? allowed))
         {
             handle.Dispose();
             throw new UnauthorizedAccessException($@"{name} exists but was not created by a ProcessTracker instance of this user.");
@@ -67,10 +74,16 @@ public static class UserModeSignal
         return security;
     }
 
-    /// <summary>True when every allow entry of the event's DACL names one of <paramref name="allowed"/>.</summary>
-    private static bool GrantsOnly(EventWaitHandle handle, SecurityIdentifier[] allowed)
+    /// <summary>
+    /// True when the event's owner is one of <paramref name="trustedOwners"/> and every allow entry of its DACL names
+    /// one of <paramref name="allowed"/>.
+    /// </summary>
+    private static bool IsOurs(EventWaitHandle handle, SecurityIdentifier[] allowed, IReadOnlyCollection<SecurityIdentifier> trustedOwners)
     {
-        var rules = handle.GetAccessControl().GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier));
+        var security = handle.GetAccessControl();
+        if (security.GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner || !trustedOwners.Contains(owner))
+            return false;
+        var rules = security.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier));
         return rules.Cast<EventWaitHandleAccessRule>()
             .All(r => r.AccessControlType == AccessControlType.Deny || allowed.Contains((SecurityIdentifier)r.IdentityReference));
     }
