@@ -69,6 +69,9 @@ public sealed class UserTask(Func<string, IReadOnlyList<string>, TimeSpan, (int 
         finally { try { File.Delete(file); } catch (IOException) { } }
     }
 
+    /// <summary>Starts the task now: Task Scheduler launches it in the user's logon session, with no inherited handles and outside the caller's job.</summary>
+    public int Start() => Run("/Run", "/TN", TaskName);
+
     public int Remove() => Run("/Delete", "/TN", TaskName, "/F");
 
     /// <summary>The app folder the task starts from (its action path's directory); null when the task is not registered.</summary>

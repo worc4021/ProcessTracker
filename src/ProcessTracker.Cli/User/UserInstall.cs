@@ -13,30 +13,42 @@ public sealed class UserInstallEnvironment
     public required UserTask Task { get; init; }
     public required Func<bool> IsElevated { get; init; }
     public required Func<bool> MachineServiceInstalled { get; init; }
-    /// <summary>Starts the exe detached from this console, in the given working directory.</summary>
-    public required Action<string, string> StartDetached { get; init; }
+    /// <summary>The account this process runs as (DOMAIN\user); compared with the health answer's owner.</summary>
+    public required Func<string> CurrentUser { get; init; }
+    /// <summary>True when the running proctrack.exe lives inside the folder (it is locked while it runs).</summary>
+    public required Func<string, bool> RunningFrom { get; init; }
+    /// <summary>Starts a detached, windowless process (exe, command line); used for the deferred folder cleanup.</summary>
+    public required Action<string, string> StartCleanup { get; init; }
     /// <summary>The health answer of the production port; null when nothing answers.</summary>
     public required Func<CancellationToken, Task<HealthDto?>> Health { get; init; }
     public required Func<bool> SignalExit { get; init; }
-    public required string ProgramsDir { get; init; }
-    public required string DataDir { get; init; }
+    /// <summary>%LOCALAPPDATA%; the only root anything is deleted under.</summary>
+    public required string LocalAppData { get; init; }
+    public int ProcessId { get; init; } = Environment.ProcessId;
     public TimeSpan HealthTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan StopTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(500);
     public TextWriter Out { get; init; } = Console.Out;
     public TextWriter Err { get; init; } = Console.Error;
 
-    public static string DefaultProgramsDir() =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "ProcessTracker");
+    public string ProgramsDir => Path.Combine(LocalAppData, "Programs", "ProcessTracker");
+    public string DataDir => Path.Combine(LocalAppData, "ProcessTracker");
 
-    public static string DefaultDataDir() =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessTracker");
+    public static string DefaultLocalAppData() => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+    public static bool DefaultRunningFrom(string dir) =>
+        Environment.ProcessPath is { } exe
+        && Path.GetFullPath(exe).StartsWith(Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>proctrack user install | uninstall | status: the per-user (no admin) ProcessTracker.</summary>
 public sealed class UserInstall(UserInstallEnvironment env)
 {
     public const int Ok = 0, Refused = 1;
+    private const string OtherUser = "this ProcessTracker belongs to another user; ask an admin to install the machine-wide service";
+
+    private enum Running { None, Mine, Other }
 
     public async Task<int> InstallAsync(string appDir, CancellationToken ct = default)
     {
@@ -50,6 +62,11 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine("The machine-wide ProcessTracker service is installed; it serves every user, so user mode is not needed. Nothing was changed.");
             return Refused;
         }
+        if (await RunningAsync(ct) == Running.Other)
+        {
+            env.Err.WriteLine(OtherUser);
+            return Refused;
+        }
         appDir = Path.GetFullPath(appDir);
         var exe = Path.Combine(appDir, UserTask.ServiceExeName);
         if (!File.Exists(exe))
@@ -61,15 +78,22 @@ public sealed class UserInstall(UserInstallEnvironment env)
         if (env.Task.Register(appDir) != 0) return Refused;
         env.Out.WriteLine($"Registered {env.Task.TaskName}.");
 
-        if (await HealthModeAsync(ct) != "user") env.StartDetached(exe, appDir);
+        // Task Scheduler starts it, as at logon: no handles inherited from this console, outside this process's job.
+        if (await RunningAsync(ct) != Running.Mine && env.Task.Start() != 0) return Refused;
 
         var clock = Stopwatch.StartNew();
         while (true)
         {
-            if (await HealthModeAsync(ct) == "user")
+            var running = await RunningAsync(ct);
+            if (running == Running.Mine)
             {
                 env.Out.WriteLine("ProcessTracker user mode is running.");
                 return Ok;
+            }
+            if (running == Running.Other)
+            {
+                env.Err.WriteLine(OtherUser);
+                return Refused;
             }
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
@@ -80,6 +104,12 @@ public sealed class UserInstall(UserInstallEnvironment env)
 
     public async Task<int> UninstallAsync(bool purgeData, CancellationToken ct = default)
     {
+        if (!DeletionRootsValid())
+        {
+            env.Err.WriteLine($"Refusing to delete: %LOCALAPPDATA% ('{env.LocalAppData}') is not a usable absolute folder. Nothing was changed.");
+            return Refused;
+        }
+
         try { env.SignalExit(); }
         catch (UnauthorizedAccessException)
         {
@@ -87,7 +117,7 @@ public sealed class UserInstall(UserInstallEnvironment env)
         }
         // Give the instance a moment to release its files before they are deleted.
         var clock = Stopwatch.StartNew();
-        while (await env.Health(ct) is not null && clock.Elapsed < env.StopTimeout)
+        while (await RunningAsync(ct) == Running.Mine && clock.Elapsed < env.StopTimeout)
             await Task.Delay(env.PollInterval, ct);
 
         var code = Ok;
@@ -107,13 +137,43 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.MachineServiceInstalled());
     }
 
-    private async Task<string?> HealthModeAsync(CancellationToken ct) => (await env.Health(ct))?.Mode;
+    /// <summary>The PowerShell command line that waits for <paramref name="pid"/> to exit, then removes <paramref name="dir"/>.</summary>
+    public static string CleanupCommandLine(string dir, int pid) =>
+        $"-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Wait-Process -Id {pid} -Timeout 60 -ErrorAction SilentlyContinue; "
+        + $"Remove-Item -LiteralPath '{dir.Replace("'", "''")}' -Recurse -Force -ErrorAction SilentlyContinue\"";
+
+    public static string CleanupExe => Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
+
+    /// <summary>Whether a user-mode instance answers on the port, and whether it is this user's.</summary>
+    private async Task<Running> RunningAsync(CancellationToken ct)
+    {
+        var health = await env.Health(ct);
+        if (health is not { Mode: "user" }) return Running.None;
+        return string.Equals(health.Owner, env.CurrentUser(), StringComparison.OrdinalIgnoreCase) ? Running.Mine : Running.Other;
+    }
+
+    private bool DeletionRootsValid()
+    {
+        var root = env.LocalAppData;
+        if (string.IsNullOrWhiteSpace(root) || !Path.IsPathFullyQualified(root)) return false;
+        if (Path.GetPathRoot(root) is { } r && Path.TrimEndingDirectorySeparator(r) == Path.TrimEndingDirectorySeparator(root)) return false;
+        return Path.IsPathFullyQualified(env.ProgramsDir) && Path.IsPathFullyQualified(env.DataDir);
+    }
 
     private int DeleteDir(string dir)
     {
         try
         {
-            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            if (!Directory.Exists(dir)) return Ok;
+            if (!env.RunningFrom(dir))
+            {
+                Directory.Delete(dir, recursive: true);
+                return Ok;
+            }
+            // proctrack.exe itself is in there and locked: remove what can go now, let a detached helper finish.
+            DeleteBestEffort(dir);
+            env.StartCleanup(CleanupExe, CleanupCommandLine(dir, env.ProcessId));
+            env.Out.WriteLine($"Removal of {dir} finishes when this command exits.");
             return Ok;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -121,5 +181,14 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine($"Could not delete {dir}: {e.Message}");
             return Refused;
         }
+    }
+
+    private static void DeleteBestEffort(string dir)
+    {
+        foreach (var file in Directory.EnumerateFiles(dir))
+            try { File.Delete(file); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        foreach (var sub in Directory.EnumerateDirectories(dir))
+            DeleteBestEffort(sub);
+        try { Directory.Delete(dir); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 }

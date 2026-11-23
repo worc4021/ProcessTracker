@@ -1,5 +1,6 @@
 using System.CommandLine;
 using System.Diagnostics;
+using System.Security.Principal;
 using System.Text.Json;
 using ProcessTracker.Cli.Admin;
 using ProcessTracker.Cli.User;
@@ -45,8 +46,10 @@ public static class UserCommand
         Task = new UserTask(new ProcessRunner().Run),
         IsElevated = DataFolderSetup.IsElevated,
         MachineServiceInstalled = ServiceProbe.IsMachineServiceInstalled,
-        StartDetached = (exe, dir) =>
-            Process.Start(new ProcessStartInfo(exe, "--user") { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = dir })?.Dispose(),
+        CurrentUser = () => WindowsIdentity.GetCurrent().Name,
+        RunningFrom = UserInstallEnvironment.DefaultRunningFrom,
+        StartCleanup = (exe, commandLine) =>
+            Process.Start(new ProcessStartInfo(exe, commandLine) { UseShellExecute = false, CreateNoWindow = true })?.Dispose(),
         Health = async ct =>
         {
             using var client = new ApiClient(ApiClient.ResolveBaseUrl(dev: false));
@@ -54,7 +57,6 @@ public static class UserCommand
             catch (Exception e) when (e is ServiceUnreachableException or ApiException) { return null; }
         },
         SignalExit = () => UserModeSignal.TrySignal(),
-        ProgramsDir = UserInstallEnvironment.DefaultProgramsDir(),
-        DataDir = UserInstallEnvironment.DefaultDataDir(),
+        LocalAppData = UserInstallEnvironment.DefaultLocalAppData(),
     });
 }
