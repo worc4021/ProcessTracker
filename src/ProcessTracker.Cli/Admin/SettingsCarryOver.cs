@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ProcessTracker.Core.Hooks;
 using System.Text.RegularExpressions;
 
 namespace ProcessTracker.Cli.Admin;
@@ -28,6 +29,9 @@ public static partial class SettingsCarryOver
                     if (Number(doc.RootElement, "OrphanIdleAlertMinutes", MaxOrphanIdleAlertMinutes) is { } minutes)
                         kept["OrphanIdleAlertMinutes"] = minutes;
                     if (ProfilePath(doc.RootElement) is { } profile) kept["UserProfilePath"] = profile;
+                    if (Strings(doc.RootElement, "OrphanAlertImages", _ => true) is { } images) kept["OrphanAlertImages"] = images;
+                    if (Strings(doc.RootElement, "HeavyCommandPatterns", IsValidPattern) is { } patterns) kept["HeavyCommandPatterns"] = patterns;
+                    if (Thresholds(doc.RootElement) is { } thresholds) kept["ActivityThresholds"] = thresholds;
                 }
             }
             catch (JsonException) { /* unparseable: carry nothing over */ }
@@ -41,6 +45,52 @@ public static partial class SettingsCarryOver
         && double.IsFinite(v) && v > 0 && v <= max
             ? v
             : null;
+
+    /// <summary>A non-empty array of non-blank strings that all pass <paramref name="valid"/>; anything else drops the key.</summary>
+    private static string[]? Strings(JsonElement root, string name, Func<string, bool> valid)
+    {
+        if (!root.TryGetProperty(name, out var e) || e.ValueKind != JsonValueKind.Array) return null;
+        var list = new List<string>();
+        foreach (var item in e.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String || item.GetString() is not { } s || string.IsNullOrWhiteSpace(s) || !valid(s))
+                return null;
+            list.Add(s);
+        }
+        return list.Count == 0 ? null : list.ToArray();
+    }
+
+    private static bool IsValidPattern(string pattern)
+    {
+        try { HeavyCommandClassifier.CreatePattern(pattern); return true; }
+        catch (ArgumentException) { return false; }
+    }
+
+    /// <summary>
+    /// Image name to thresholds; every present field must be a number &gt;= 0 (mirrors ServiceOptions.Validate),
+    /// otherwise the whole key is dropped.
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, double>>? Thresholds(JsonElement root)
+    {
+        if (!root.TryGetProperty("ActivityThresholds", out var e) || e.ValueKind != JsonValueKind.Object) return null;
+        string[] fields = ["CpuCores", "IoOps", "WriteOps", "ContextSwitches"];
+        var result = new Dictionary<string, Dictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var image in e.EnumerateObject())
+        {
+            if (string.IsNullOrWhiteSpace(image.Name) || image.Value.ValueKind != JsonValueKind.Object) return null;
+            var values = new Dictionary<string, double>();
+            foreach (var field in image.Value.EnumerateObject())
+            {
+                if (!fields.Contains(field.Name, StringComparer.OrdinalIgnoreCase)
+                    || field.Value.ValueKind != JsonValueKind.Number || !field.Value.TryGetDouble(out var v)
+                    || !double.IsFinite(v) || v < 0)
+                    return null;
+                values[field.Name] = v;
+            }
+            result[image.Name] = values;
+        }
+        return result.Count == 0 ? null : result;
+    }
 
     /// <summary>
     /// Only a drive-letter rooted path (C:\...). ServiceOptions does not validate UserProfilePath, so this is the only

@@ -42,6 +42,8 @@ public sealed class TrackerHost : ITrackerHost, IDisposable
             DataDir = options.DataDir,
             Retention = options.Retention,
             OrphanIdleAlert = options.OrphanIdleAlert,
+            OrphanAlertImages = options.OrphanAlertImages,
+            Activity = options.ToActivityOptions(),
             UserProfilePath = options.UserProfilePath,
         }, log, time, new ProfileResolver());
         _historyDir = Path.Combine(options.DataDir, "history");

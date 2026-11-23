@@ -27,10 +27,10 @@ public sealed class TrackerTests : IDisposable
         try { if (Directory.Exists(_dir)) Directory.Delete(_dir, true); } catch (IOException) { }
     }
 
-    private Tracker NewTracker(FakeInspector? inspector = null, string userProfile = "")
+    private Tracker NewTracker(FakeInspector? inspector = null, string userProfile = "", string[]? orphanAlertImages = null)
     {
         var t = new Tracker(_src, inspector ?? _insp,
-            new TrackerOptions { DataDir = _dir, UserProfilePath = userProfile },
+            new TrackerOptions { DataDir = _dir, UserProfilePath = userProfile, OrphanAlertImages = orphanAlertImages ?? [] },
             NullLogger<Tracker>.Instance, _time);
         _trackers.Add(t);
         return t;
@@ -97,16 +97,16 @@ public sealed class TrackerTests : IDisposable
     public void Tick_AnchorExits_ChildrenBecomeOrphans()
     {
         var claude = AddAnchor();
-        var matlab = _src.Add(11, 200, 10, "MATLAB.exe");
+        var engine = _src.Add(11, 200, 10, "engine.exe");
         var t = NewTracker();
-        Assert.Equal(ProcessState.Normal, t.Tick().Processes[matlab].State);
+        Assert.Equal(ProcessState.Normal, t.Tick().Processes[engine].State);
 
         _src.Remove(claude);
         Step();
         var v = t.Tick();
 
         Assert.False(v.Processes.ContainsKey(claude));
-        Assert.Equal(ProcessState.Orphan, v.Processes[matlab].State);
+        Assert.Equal(ProcessState.Orphan, v.Processes[engine].State);
         var s = Assert.Single(v.Sessions);
         Assert.False(s.IsLive);
         Assert.Equal(T0 + TickInterval, s.Info.EndedUtc);
@@ -149,7 +149,7 @@ public sealed class TrackerTests : IDisposable
     {
         // Two claude.exe of the same desktop session, both launched from outside it (e.g. overlapping a resume).
         var older = AddAnchor(pid: 10, create: 100);
-        var child = _src.Add(11, 200, 10, "MATLAB.exe");
+        var child = _src.Add(11, 200, 10, "engine.exe");
         var newer = AddAnchor(pid: 20, create: 300);
         var t = NewTracker();
         Assert.Equal(newer, Assert.Single(t.Tick().Sessions).Info.Anchor);
@@ -172,7 +172,7 @@ public sealed class TrackerTests : IDisposable
         // State left by the bug: the session's anchor is a nested claude.exe that exited, so the session is ended,
         // while the real (older) anchor is still running and recorded with IsAnchor=true.
         var anchor = AddAnchor();
-        var matlab = _src.Add(11, 200, 10, "MATLAB.exe");
+        var engine = _src.Add(11, 200, 10, "engine.exe");
         var nested = new ProcessKey(12, 300);
         var ended = T0 - TimeSpan.FromMinutes(1);
         var unit = new Attr(AttributionKind.Session, "host:h1", null, true);
@@ -182,7 +182,7 @@ public sealed class TrackerTests : IDisposable
             store.SaveTick(ended,
             [
                 new ProcessRecord(anchor, null, "claude.exe", ClaudePath, null, unit, T0 - TimeSpan.FromHours(1), null),
-                new ProcessRecord(matlab, anchor, "MATLAB.exe", null, null, unit with { IsAnchor = false },
+                new ProcessRecord(engine, anchor, "engine.exe", null, null, unit with { IsAnchor = false },
                     T0 - TimeSpan.FromMinutes(30), null),
                 new ProcessRecord(nested, anchor, "claude.exe", ClaudePath, null, unit,
                     T0 - TimeSpan.FromMinutes(2), ended),
@@ -198,7 +198,7 @@ public sealed class TrackerTests : IDisposable
         Assert.True(s.IsLive);
         Assert.Equal(anchor, s.Info.Anchor);
         Assert.Null(s.Info.EndedUtc);
-        Assert.Equal(ProcessState.Normal, v.Processes[matlab].State);
+        Assert.Equal(ProcessState.Normal, v.Processes[engine].State);
         Assert.Equal(ProcessState.Normal, v.Processes[anchor].State);
         var saved = t.State.Load().Sessions.Single();
         Assert.Equal(anchor, saved.Anchor);
@@ -247,26 +247,26 @@ public sealed class TrackerTests : IDisposable
     public void Restore_ContinuesDeltasAcrossDowntime()
     {
         AddAnchor();
-        var matlab = _src.Add(11, 200, 10, "MATLAB.exe", cpuTicks: 1_000_000_000);
+        var engine = _src.Add(11, 200, 10, "engine.exe", cpuTicks: 1_000_000_000);
         var t1 = NewTracker();
         t1.Tick();
         t1.Dispose();
 
-        // Service down for 5 s, during which MATLAB burned 5 s of CPU (one full core).
+        // Service down for 5 s, during which engine.exe burned 5 s of CPU (one full core).
         Step(TimeSpan.FromSeconds(5));
         _time.Advance(TimeSpan.FromSeconds(5));
-        _src.SetCpu(matlab, 1_000_000_000 + 50_000_000);
+        _src.SetCpu(engine, 1_000_000_000 + 50_000_000);
         var insp2 = new FakeInspector();
         var t2 = NewTracker(insp2);
         t2.Restore();
         var v = t2.Tick();
 
-        var p = v.Processes[matlab];
+        var p = v.Processes[engine];
         Assert.Equal(1.0, p.Latest.CpuCores, 0.001);
         Assert.Equal(T0 + TimeSpan.FromSeconds(5), p.Activity.LastCpuAt);
         Assert.Equal(T0, p.Record.FirstSeenUtc);
         Assert.Equal("host:h1", p.Record.Attribution.UnitId);
-        Assert.Equal(0, insp2.Calls(matlab));
+        Assert.Equal(0, insp2.Calls(engine));
         Assert.True(Assert.Single(v.Sessions).IsLive);
     }
 
@@ -274,19 +274,19 @@ public sealed class TrackerTests : IDisposable
     public void Tick_LiveCountersPersistedEvery30s_RecordsEveryTick()
     {
         AddAnchor();
-        var matlab = _src.Add(11, 200, 10, "MATLAB.exe", cpuTicks: 1_000);
+        var engine = _src.Add(11, 200, 10, "engine.exe", cpuTicks: 1_000);
         var t = NewTracker();
         t.Tick();
         Assert.Equal(T0, t.State.Load().LastTickUtc);
 
         // Ticks inside the 30 s window: new records are saved at once, counters and last tick are not.
         Step();
-        _src.SetCpu(matlab, 2_000);
+        _src.SetCpu(engine, 2_000);
         var late = _src.Add(12, 300, 10, "cmd.exe");
         t.Tick();
         var st = t.State.Load();
         Assert.Equal(T0, st.LastTickUtc);
-        Assert.Equal(1_000, st.Live[matlab].Counters.KernelTime + st.Live[matlab].Counters.UserTime);
+        Assert.Equal(1_000, st.Live[engine].Counters.KernelTime + st.Live[engine].Counters.UserTime);
         Assert.Contains(st.Processes, r => r.Key == late);
         Assert.False(st.Live.ContainsKey(late));
 
@@ -301,54 +301,54 @@ public sealed class TrackerTests : IDisposable
         t.Tick();
         st = t.State.Load();
         Assert.Equal(T0 + TimeSpan.FromSeconds(30), st.LastTickUtc);
-        Assert.Equal(2_000, st.Live[matlab].Counters.KernelTime + st.Live[matlab].Counters.UserTime);
+        Assert.Equal(2_000, st.Live[engine].Counters.KernelTime + st.Live[engine].Counters.UserTime);
         Assert.True(st.Live.ContainsKey(late));
     }
 
     [Fact]
     public void Dispose_PersistsLatestLiveCounters()
     {
-        var matlab = _src.Add(11, 200, 1, "MATLAB.exe", cpuTicks: 1_000);
+        var engine = _src.Add(11, 200, 1, "engine.exe", cpuTicks: 1_000);
         var t = NewTracker();
         t.Tick();
         Step();
-        _src.SetCpu(matlab, 5_000);
+        _src.SetCpu(engine, 5_000);
         t.Tick();
         t.Dispose();
 
         using var store = new ProcessTracker.Core.Storage.StateStore(Path.Combine(_dir, "state.db"));
         var st = store.Load();
         Assert.Equal(T0 + TickInterval, st.LastTickUtc);
-        Assert.Equal(5_000, st.Live[matlab].Counters.KernelTime + st.Live[matlab].Counters.UserTime);
+        Assert.Equal(5_000, st.Live[engine].Counters.KernelTime + st.Live[engine].Counters.UserTime);
     }
 
     [Fact]
     public void Restore_AfterCrash_FirstDeltaSpansFromLastCounterSave()
     {
         AddAnchor();
-        var matlab = _src.Add(11, 200, 10, "MATLAB.exe", cpuTicks: 1_000_000_000);
+        var engine = _src.Add(11, 200, 10, "engine.exe", cpuTicks: 1_000_000_000);
         var t1 = NewTracker();
         t1.Tick(); // counters saved at T0
         Step();
-        _src.SetCpu(matlab, 1_000_000_000 + 20_000_000); // one core for 2 s; not persisted (throttled)
+        _src.SetCpu(engine, 1_000_000_000 + 20_000_000); // one core for 2 s; not persisted (throttled)
         t1.Tick();
         // Crash: t1 is never disposed before the restart.
 
         Step(TimeSpan.FromSeconds(5));
         _time.Advance(TimeSpan.FromSeconds(7));
-        _src.SetCpu(matlab, 1_000_000_000 + 70_000_000); // one core throughout the 7 s since the last save
+        _src.SetCpu(engine, 1_000_000_000 + 70_000_000); // one core throughout the 7 s since the last save
         var t2 = NewTracker(new FakeInspector());
         t2.Restore();
         var v = t2.Tick();
 
-        Assert.Equal(1.0, v.Processes[matlab].Latest.CpuCores, 0.001);
+        Assert.Equal(1.0, v.Processes[engine].Latest.CpuCores, 0.001);
     }
 
     [Fact]
     public void Restore_LoadFails_FirstTickStillClosesRecordsOfVanishedProcesses()
     {
         var keep = _src.Add(41, 510, 1, "keep.exe");
-        var gone = _src.Add(42, 520, 1, "dymosim.exe");
+        var gone = _src.Add(42, 520, 1, "worker.exe");
         var t1 = NewTracker();
         t1.Tick();
         t1.Dispose();
@@ -372,7 +372,7 @@ public sealed class TrackerTests : IDisposable
     [Fact]
     public void Restore_PidReusedWithDifferentCreateTime_TreatsAsNewProcess()
     {
-        var old = _src.Add(40, 500, 1, "MATLAB.exe");
+        var old = _src.Add(40, 500, 1, "engine.exe");
         _insp.Set(old, FakeInspector.Ok(sessionId: "s1"));
         var t1 = NewTracker();
         t1.Tick();
@@ -400,7 +400,7 @@ public sealed class TrackerTests : IDisposable
     [Fact]
     public void Restore_ProcessGoneDuringDowntime_MarkedExited()
     {
-        var p = _src.Add(41, 510, 1, "dymosim.exe");
+        var p = _src.Add(41, 510, 1, "worker.exe");
         var keep = _src.Add(42, 520, 1, "keep.exe");
         var t1 = NewTracker();
         t1.Tick();
@@ -426,7 +426,7 @@ public sealed class TrackerTests : IDisposable
     public void Restore_AnchorDiedDuringDowntime_SessionEnded()
     {
         var claude = AddAnchor();
-        var matlab = _src.Add(11, 200, 10, "MATLAB.exe");
+        var engine = _src.Add(11, 200, 10, "engine.exe");
         var t1 = NewTracker();
         Assert.True(Assert.Single(t1.Tick().Sessions).IsLive);
         t1.Dispose();
@@ -442,28 +442,46 @@ public sealed class TrackerTests : IDisposable
         var s = Assert.Single(v.Sessions);
         Assert.False(s.IsLive);
         Assert.Equal(restoredAt, s.Info.EndedUtc);
-        Assert.Equal(ProcessState.Orphan, v.Processes[matlab].State);
+        Assert.Equal(ProcessState.Orphan, v.Processes[engine].State);
     }
 
     [Fact]
     public void Tick_PreexistingOrphan_AnchorNeverSeen_IsOrphanFirstTick()
     {
-        var matlab = _src.Add(50, 600, 4, "MATLAB.exe");
-        _insp.Set(matlab, FakeInspector.Ok(sessionId: "ended-session"));
+        var engine = _src.Add(50, 600, 4, "engine.exe");
+        _insp.Set(engine, FakeInspector.Ok(sessionId: "ended-session"));
         var t = NewTracker();
 
         var v = t.Tick();
 
-        var p = v.Processes[matlab];
+        var p = v.Processes[engine];
         Assert.Equal(ProcessState.Orphan, p.State);
         Assert.False(p.Alertable);
         var s = Assert.Single(v.Sessions);
         Assert.False(s.IsLive);
         Assert.Null(s.Info.Anchor);
 
-        // Idle for longer than the alert threshold: a watched orphan becomes alertable.
+        // Idle for longer than the alert threshold: with no watch list, any orphan becomes alertable.
         Step(TimeSpan.FromMinutes(31));
-        Assert.True(t.Tick().Processes[matlab].Alertable);
+        Assert.True(t.Tick().Processes[engine].Alertable);
+    }
+
+    [Fact]
+    public void Tick_OrphanAlertImages_OnlyMatchingImagesAreAlertable()
+    {
+        var match = _src.Add(50, 600, 4, "engine_a.exe");
+        var other = _src.Add(51, 601, 4, "other.exe");
+        _insp.Set(match, FakeInspector.Ok(sessionId: "ended-session"));
+        _insp.Set(other, FakeInspector.Ok(sessionId: "ended-session"));
+        var t = NewTracker(orphanAlertImages: ["engine*.exe"]);
+        t.Tick();
+
+        Step(TimeSpan.FromMinutes(31));
+        var v = t.Tick();
+
+        Assert.True(v.Processes[match].Alertable);
+        Assert.False(v.Processes[other].Alertable);
+        Assert.Equal(ProcessState.Orphan, v.Processes[other].State);
     }
 
     [Fact]
@@ -608,7 +626,7 @@ public sealed class TrackerTests : IDisposable
     public void Tick_ParentPidReusedByNewerProcess_NotTreatedAsParent()
     {
         // The child's real parent (pid 10) died and pid 10 now belongs to a process created after the child.
-        var child = _src.Add(11, 200, 10, "MATLAB.exe");
+        var child = _src.Add(11, 200, 10, "engine.exe");
         var impostor = AddAnchor(pid: 10, create: 300);
 
         var v = NewTracker().Tick();

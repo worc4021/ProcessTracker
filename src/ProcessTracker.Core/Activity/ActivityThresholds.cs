@@ -9,10 +9,6 @@ public sealed class ActivityOptions
 {
     public ActivityThresholds Default { get; set; } = new();
 
-    public Dictionary<string, ActivityThresholds> PerImage { get; set; } =
-        new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["MATLAB.exe"] = new ActivityThresholds(0.05f, 1, 1, 2000),
-            ["Dymola.exe"] = new ActivityThresholds(0.05f, 1, 1, 2000),
-        };
+    /// <summary>Thresholds for images that differ from <see cref="Default"/>; empty by default.</summary>
+    public Dictionary<string, ActivityThresholds> PerImage { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }

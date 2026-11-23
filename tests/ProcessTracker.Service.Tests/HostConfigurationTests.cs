@@ -58,6 +58,58 @@ public sealed class HostConfigurationTests
     }
 
     [Fact]
+    public void OrphanAlertImages_DefaultEmpty_AndBound()
+    {
+        Assert.Empty(Resolve().OrphanAlertImages);
+        var o = Resolve(("OrphanAlertImages:0", "solver.exe"), ("OrphanAlertImages:1", "engine*.exe"));
+        Assert.Empty(o.Validate());
+        Assert.Equal(["solver.exe", "engine*.exe"], o.OrphanAlertImages);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void BlankOrphanAlertImage_IsRejected(string entry)
+    {
+        var errors = Resolve(("OrphanAlertImages:0", "solver.exe"), ("OrphanAlertImages:1", entry)).Validate();
+        Assert.Contains(errors, e => e.StartsWith("OrphanAlertImages[1]", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ActivityThresholds_DefaultEmpty_ToActivityOptionsHasNoPerImage()
+    {
+        var o = Resolve();
+        Assert.Empty(o.ActivityThresholds);
+        Assert.Empty(o.ToActivityOptions().PerImage);
+    }
+
+    [Fact]
+    public void ActivityThresholds_Bound_MissingFieldsTakeDefaults_CaseInsensitiveKeys()
+    {
+        var o = Resolve(("ActivityThresholds:solver.exe:CpuCores", "0.05"), ("ActivityThresholds:solver.exe:ContextSwitches", "2000"));
+        Assert.Empty(o.Validate());
+
+        var perImage = o.ToActivityOptions().PerImage;
+        var t = perImage["SOLVER.EXE"];
+        Assert.Equal(0.05f, t.CpuCores);
+        Assert.Equal(2000, t.ContextSwitches);
+        Assert.Equal(new ProcessTracker.Core.Activity.ActivityThresholds().IoOps, t.IoOps);
+        Assert.Equal(new ProcessTracker.Core.Activity.ActivityThresholds().WriteOps, t.WriteOps);
+    }
+
+    [Theory]
+    [InlineData("CpuCores", "-0.1")]
+    [InlineData("CpuCores", "NaN")]
+    [InlineData("IoOps", "-1")]
+    [InlineData("WriteOps", "-1")]
+    [InlineData("ContextSwitches", "-5")]
+    public void NegativeActivityThreshold_IsRejected(string field, string value)
+    {
+        var errors = Resolve(($"ActivityThresholds:solver.exe:{field}", value)).Validate();
+        Assert.Contains(errors, e => e.StartsWith("ActivityThresholds[solver.exe]", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void OutOfRangePort_OnCommandLine_IsRejected()
     {
         var errors = ServiceOptions.Resolve(Config(("Port", "70000")), Config(("Port", "70000")), RunMode.Dev).Validate();

@@ -106,8 +106,8 @@ public sealed class RestEndpointsTests : IDisposable
     {
         _app.Tracker.View = View(T0,
         [
-            Proc(1, "MATLAB.exe", UnitA, state: ProcessState.Orphan, privateBytes: 100),
-            Proc(2, "MATLAB.exe", UnitA, state: ProcessState.Orphan, alertable: true, privateBytes: 10),
+            Proc(1, "engine.exe", UnitA, state: ProcessState.Orphan, privateBytes: 100),
+            Proc(2, "engine.exe", UnitA, state: ProcessState.Orphan, alertable: true, privateBytes: 10),
             Proc(3, "node.exe", UnitA, state: ProcessState.Orphan, privateBytes: 500),
             Proc(4, "claude.exe", UnitA, state: ProcessState.Normal, privateBytes: 9999),
             Proc(5, "cmd.exe", UnitA, state: ProcessState.Detached, privateBytes: 9999),
@@ -127,7 +127,7 @@ public sealed class RestEndpointsTests : IDisposable
         [
             Proc(10, "claude.exe", UnitA),
             Proc(11, "node.exe", UnitA, parentPid: 10),
-            Proc(12, "MATLAB.exe", UnitA, parentPid: 11),
+            Proc(12, "engine.exe", UnitA, parentPid: 11),
             Proc(13, "cmd.exe", UnitA, parentPid: 10),
             Proc(20, "claude.exe", "host:local_b"),
             Proc(21, "node.exe", "host:local_b", parentPid: 10), // foreign process, even with a parent in the tree
@@ -189,13 +189,13 @@ public sealed class RestEndpointsTests : IDisposable
     [Fact]
     public async Task AuditKill_IsRecorded()
     {
-        var dto = new KillAuditDto("1234@5678", "MATLAB.exe", UnitA, "proctrack.exe", Tree: true, Result: "killed");
+        var dto = new KillAuditDto("1234@5678", "engine.exe", UnitA, "proctrack.exe", Tree: true, Result: "killed");
 
         var response = await _http.PostAsJsonAsync("/api/audit/kill", dto, ContractJson.Options, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
         var kill = Assert.Single(_app.Tracker.Kills);
-        Assert.Equal(new KillAudit(T0, new ProcessKey(1234, 5678), "MATLAB.exe", UnitA, "proctrack.exe", true, "killed"), kill);
+        Assert.Equal(new KillAudit(T0, new ProcessKey(1234, 5678), "engine.exe", UnitA, "proctrack.exe", true, "killed"), kill);
     }
 
     [Fact]

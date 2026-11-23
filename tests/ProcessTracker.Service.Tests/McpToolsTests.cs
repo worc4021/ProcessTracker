@@ -148,7 +148,7 @@ public sealed class McpToolsTests : IDisposable
     public async Task Mcp_GetProcessHistory_CoversLastMinutes()
     {
         var key = new ProcessKey(42, 1_000_042);
-        var record = new ProcessRecord(key, null, "MATLAB.exe", null, null, Attribution.Unattributed, T0, null);
+        var record = new ProcessRecord(key, null, "engine.exe", null, null, Attribution.Unattributed, T0, null);
         var sample = new ProcessSample(key, T0.AddMinutes(-5), 2f, 3 * Gb, 3 * Gb, 0, 0, 0, 0, 0, 0, 0, 10, 2);
         _app.Tracker.View = new TrackerView(T0, default,
             new Dictionary<ProcessKey, ProcessView> { [key] = new(record, sample, default, null, default, false) }.ToFrozenDictionary(), []);
@@ -163,7 +163,7 @@ public sealed class McpToolsTests : IDisposable
         Assert.NotEqual(true, result.IsError);
         var series = Json<HistorySeriesDto>(result);
         Assert.Equal(key.ToString(), series.Key);
-        Assert.Equal("MATLAB.exe", series.Name);
+        Assert.Equal("engine.exe", series.Name);
         Assert.Equal(T0.AddMinutes(-10), series.FromUtc);
         Assert.Equal(T0, series.ToUtc);
         Assert.Equal(T0.AddMinutes(-5), Assert.Single(series.Points).TimestampUtc);

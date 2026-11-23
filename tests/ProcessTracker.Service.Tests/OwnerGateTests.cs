@@ -48,7 +48,7 @@ public sealed class OwnerGateTests
         app.Tracker.View = new TrackerView(Now, new SystemSample(Now, 10, 1.6f, 16, 62 * Gb + Gb / 2, 64 * Gb, 8 * Gb, 32 * Gb),
             FrozenDictionary<ProcessKey, ProcessView>.Empty, []);
 
-    private static readonly KillAuditDto Kill = new("1234@5678", "MATLAB.exe", null, "proctrack.exe", Tree: true, Result: "killed");
+    private static readonly KillAuditDto Kill = new("1234@5678", "engine.exe", null, "proctrack.exe", Tree: true, Result: "killed");
 
     // The PreToolUse hook is what another user's sessions would hit on every tool call. With the machine at Critical, a
     // heavy Task call that got past the gate would reach the advisor and ask IUserActivity for the last input (the owner

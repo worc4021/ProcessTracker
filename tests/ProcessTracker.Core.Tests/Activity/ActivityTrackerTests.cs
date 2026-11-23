@@ -46,32 +46,51 @@ public class ActivityTrackerTests
     }
 
     [Fact]
+    public void DefaultPerImage_IsEmpty_SoNoImageGetsSpecialThresholds()
+    {
+        Assert.Empty(new ActivityOptions().PerImage);
+        var tracker = new ActivityTracker(new ActivityOptions());
+        var k = Key(1);
+        tracker.Update(Sample(k, T, cpu: 0.03f, ctx: 1500), "engine.exe");
+        Assert.NotNull(tracker.Get(k).LastActiveAt);
+    }
+
+    /// <summary>Per-image thresholds that suppress a JVM-like noise profile for engine.exe only.</summary>
+    private static ActivityOptions NoisyEngineOptions() => new()
+    {
+        PerImage = new Dictionary<string, ActivityThresholds>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["engine.exe"] = new ActivityThresholds(0.05f, 1, 1, 2000),
+        },
+    };
+
+    [Fact]
     public void Update_ReportsWhetherAnySignalFired_UsingPerImageThresholds()
     {
-        var tracker = new ActivityTracker(new ActivityOptions());
+        var tracker = new ActivityTracker(NoisyEngineOptions());
         Assert.True(tracker.Update(Sample(Key(1), T, ctx: 150), "foo.exe"));
         Assert.False(tracker.Update(Sample(Key(2), T, ctx: 1, cpu: 0.001f), "foo.exe"));
-        Assert.False(tracker.Update(Sample(Key(3), T, cpu: 0.03f, ctx: 1500), "MATLAB.exe"));
-        Assert.True(tracker.Update(Sample(Key(4), T, writeOps: 1), "MATLAB.exe"));
+        Assert.False(tracker.Update(Sample(Key(3), T, cpu: 0.03f, ctx: 1500), "engine.exe"));
+        Assert.True(tracker.Update(Sample(Key(4), T, writeOps: 1), "engine.exe"));
         // Still active although nothing changed in the stored state.
         Assert.True(tracker.Update(Sample(Key(1), T, ctx: 150), "foo.exe"));
     }
 
     [Fact]
-    public void MatlabJvmNoise_NotActive()
+    public void ConfiguredNoisyImage_NotActive()
     {
-        var tracker = new ActivityTracker(new ActivityOptions());
+        var tracker = new ActivityTracker(NoisyEngineOptions());
         var k = Key(1);
-        tracker.Update(Sample(k, T, cpu: 0.03f, ctx: 1500), "MATLAB.exe");
+        tracker.Update(Sample(k, T, cpu: 0.03f, ctx: 1500), "engine.exe");
         Assert.Null(tracker.Get(k).LastActiveAt);
     }
 
     [Fact]
     public void ImageLookupIsCaseInsensitive()
     {
-        var tracker = new ActivityTracker(new ActivityOptions());
+        var tracker = new ActivityTracker(NoisyEngineOptions());
         var k = Key(1);
-        tracker.Update(Sample(k, T, cpu: 0.03f, ctx: 1500), "matlab.EXE");
+        tracker.Update(Sample(k, T, cpu: 0.03f, ctx: 1500), "ENGINE.exe");
         Assert.Null(tracker.Get(k).LastActiveAt);
         // Same sample under a default-threshold image does fire.
         var k2 = Key(2);
@@ -83,14 +102,14 @@ public class ActivityTrackerTests
     public void EffectiveLastActive_TakesBusyGrandchild()
     {
         var tracker = new ActivityTracker(new ActivityOptions());
-        var dymola = Key(1); var child = Key(2); var dymosim = Key(3);
+        var solver = Key(1); var child = Key(2); var worker = Key(3);
         var table = new ProcessTable();
-        table.SetLive([(dymola, null), (child, dymola), (dymosim, child)]);
+        table.SetLive([(solver, null), (child, solver), (worker, child)]);
 
-        tracker.Update(Sample(dymola, T), "Dymola.exe");
-        tracker.Update(Sample(dymosim, T.AddSeconds(5), cpu: 1f), "dymosim.exe");
+        tracker.Update(Sample(solver, T), "solver.exe");
+        tracker.Update(Sample(worker, T.AddSeconds(5), cpu: 1f), "worker.exe");
 
-        Assert.Equal(T.AddSeconds(5), tracker.EffectiveLastActive(dymola, table));
+        Assert.Equal(T.AddSeconds(5), tracker.EffectiveLastActive(solver, table));
     }
 
     [Fact]
@@ -100,8 +119,8 @@ public class ActivityTrackerTests
         var parent = Key(1); var child = Key(2);
         var table = new ProcessTable();
         table.SetLive([(parent, null), (child, parent)]);
-        tracker.Update(Sample(parent, T, cpu: 1f), "Dymola.exe");
-        tracker.Update(Sample(child, T.AddSeconds(5), cpu: 1f), "dymosim.exe");
+        tracker.Update(Sample(parent, T, cpu: 1f), "solver.exe");
+        tracker.Update(Sample(child, T.AddSeconds(5), cpu: 1f), "worker.exe");
 
         table.SetLive([(parent, null)]);
 

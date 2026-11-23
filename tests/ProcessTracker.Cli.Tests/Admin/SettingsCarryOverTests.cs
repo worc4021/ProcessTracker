@@ -27,6 +27,34 @@ public class SettingsCarryOverTests
         Assert.Contains('\n', text); // indented
     }
 
+    [Fact]
+    public void Rewrite_KeepsValidMatchingSettings()
+    {
+        var output = Parse(SettingsCarryOver.Rewrite("""
+            {"OrphanAlertImages":["solver.exe","engine*.exe"],
+             "ActivityThresholds":{"solver.exe":{"CpuCores":0.05,"ContextSwitches":2000}},
+             "HeavyCommandPatterns":["\bsolver\b"]}
+            """));
+        Assert.Equal(["solver.exe", "engine*.exe"], output.GetProperty("OrphanAlertImages").EnumerateArray().Select(e => e.GetString()));
+        Assert.Equal(2000, output.GetProperty("ActivityThresholds").GetProperty("solver.exe").GetProperty("ContextSwitches").GetInt64());
+        Assert.Equal(0.05, output.GetProperty("ActivityThresholds").GetProperty("solver.exe").GetProperty("CpuCores").GetDouble());
+        Assert.Single(output.GetProperty("HeavyCommandPatterns").EnumerateArray());
+    }
+
+    [Theory]
+    [InlineData("""{"OrphanAlertImages":["ok.exe",""]}""")]
+    [InlineData("""{"OrphanAlertImages":"solver.exe"}""")]
+    [InlineData("""{"OrphanAlertImages":[1]}""")]
+    [InlineData("""{"ActivityThresholds":{"solver.exe":{"CpuCores":-1}}}""")]
+    [InlineData("""{"ActivityThresholds":{"solver.exe":{"IoOps":"many"}}}""")]
+    [InlineData("""{"ActivityThresholds":[1]}""")]
+    [InlineData("""{"HeavyCommandPatterns":["(unclosed"]}""")]
+    [InlineData("""{"HeavyCommandPatterns":[""]}""")]
+    public void Rewrite_InvalidMatchingSettings_AreDropped(string input)
+    {
+        Assert.Empty(Parse(SettingsCarryOver.Rewrite(input)).EnumerateObject());
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]

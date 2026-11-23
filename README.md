@@ -2,7 +2,7 @@
 
 An always-on Windows process that records every process's resource use and attributes each process to
 the **Claude Code session** that launched it, even after its parent has exited. It finds **orphans** (processes
-whose session is gone, such as MATLAB or Dymola engines left behind), keeps a rolling on-disk history for
+whose session is gone, such as simulation or solver engines left behind), keeps a rolling on-disk history for
 post-mortems, and lets agents ask how loaded the machine is before they start heavy work.
 
 It has three parts:
@@ -252,9 +252,23 @@ an admin to install the machine-wide MSI instead: the service holds the port fro
   | Setting | Default | Notes |
   |---|---|---|
   | `RetentionHours` | 24 | Minimum 2 |
-  | `OrphanIdleAlertMinutes` | 30 | |
-  | `HeavyCommandPatterns` | built-in list | Optional list of regular expressions that mark a command as heavy for the [hooks](#hooks) |
+  | `OrphanIdleAlertMinutes` | 30 | An orphan idle this long is alertable |
+  | `OrphanAlertImages` | empty | Optional list of image-name patterns (`*` and `?` wildcards, case-insensitive). Empty: every idle orphan is alertable. Set: only matching images are |
+  | `ActivityThresholds` | empty | Optional per-image thresholds that decide what counts as activity: image name to `CpuCores`, `IoOps`, `WriteOps`, `ContextSwitches` (all >= 0). A field left out keeps its default (0.01, 1, 1, 100). Use it to stop a noisy image that idles with background activity from looking active |
+  | `HeavyCommandPatterns` | empty | Optional list of regular expressions that mark a command as heavy for the [hooks](#hooks), on top of the built-in list (builds, test runs, explicit parallelism) |
   | `UserProfilePath` | | Optional override. By default the service resolves each session's user profile itself; set this only to force one profile |
+
+  Example (the image names are placeholders):
+
+  ```json
+  {
+    "OrphanAlertImages": [ "solver.exe", "engine*.exe" ],
+    "ActivityThresholds": {
+      "solver.exe": { "CpuCores": 0.05, "ContextSwitches": 2000 }
+    },
+    "HeavyCommandPatterns": [ "\\bsolver\\b", "engine_run" ]
+  }
+  ```
 
   A `Port` set there is ignored, because `deploy.ps1` and the CLI both use 47811. Only `--Port` on the
   command line changes the port, which is meant for development and tests.
@@ -326,7 +340,7 @@ The tools are all read-only. There are no kill tools.
 
 The server sends **instructions** when a session connects, and Claude Code adds them to that session's system prompt.
 So every session with the MCP entry is told, with no CLAUDE.md change, to call `get_machine_load` before builds,
-test suites, simulations, MATLAB or Dymola engines, parallel jobs or subagents doing these. The policy is to **warn,
+test suites, simulations, solver engines, parallel jobs or subagents doing these. The policy is to **warn,
 not to block**:
 
 | Pressure | What the session does |
@@ -344,7 +358,7 @@ sessions without the MCP entry, add this to `%USERPROFILE%\.claude\CLAUDE.md`:
 ```markdown
 # Machine load
 
-- Before starting heavy local work (builds, test suites, simulations, MATLAB/Dymola engines, parallel jobs, or
+- Before starting heavy local work (builds, test suites, simulations, solver engines, parallel jobs, or
   subagents that will do these), check the load with the process-tracker MCP tool `get_machine_load`
   (or `proctrack load --json` if the MCP is unavailable).
 - Low/Moderate: run at most `suggestedParallelism` tasks at once. High/Critical: the machine is close to unusable for
@@ -379,7 +393,7 @@ tracker is not running; SessionStart tells the agent what is going on.
   - a user-only install exists but is not running: it starts it and says so;
   - the tracker belongs to another Windows user (the 403 case): it says so and points to the machine-wide service.
 - **PreToolUse** runs before `Bash`, `PowerShell`, `Task` and `Agent` calls. The service decides whether the command is
-  heavy (builds, test runs, MATLAB or Dymola launches, explicit parallelism, and subagent launches). Other commands, and
+  heavy (builds, test runs, explicit parallelism, and subagent launches). Other commands, and
   any command at Low pressure, get no output.
 
 What the agent sees for a heavy command:
