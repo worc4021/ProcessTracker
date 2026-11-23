@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
@@ -17,7 +18,7 @@ using ProcessTracker.Service.Updates;
 // Flags: --console (run as a console app instead of a Windows service), --dev (port 47812, dev data dir, no
 // single-instance mutex) and --user (run as the logged-in user, with data, settings and a log file in
 // %LOCALAPPDATA%\ProcessTracker). They are also accepted as configuration keys Console/Dev/User, e.g. "--Dev=true".
-// With --user, --takeover <previousAppDir> asks the running user-mode instance to exit and waits up to 30 s for it;
+// With --user, --takeover <previousAppDir> asks the running user-mode instance to exit and waits up to 2 min for it;
 // if this version then completes no collector tick within 60 s, it starts the previous one again (Updates/Takeover).
 // Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running (or holds the exit event),
 // 3 the server ended up listening on a non-loopback address, 4 user mode refused: the machine service is installed,
@@ -99,6 +100,16 @@ using var mutex = instanceChecks ? SingleInstance.TryAcquire(takeover ? SingleIn
 if (instanceChecks && mutex is null)
 {
     Console.Error.WriteLine(@"Another ProcessTracker instance holds Global\ProcessTracker.Service; exiting.");
+    if (takeover)
+    {
+        // The old instance was told to exit but still holds the mutex after the full wait: it is hung (or belongs to
+        // another user). Nothing runs now; the logon task starts the installed version at the next logon.
+        using var log = new FileLoggerProvider(logDir);
+        log.CreateLogger("ProcessTracker.Takeover").LogError(
+            @"Takeover from {Previous} gave up: Global\ProcessTracker.Service was not released within {Seconds} s. " +
+            "The running instance did not exit; ProcessTracker will start again at the next logon. Exiting (code 2)",
+            previousAppDir, SingleInstance.TakeoverWait.TotalSeconds);
+    }
     return 2;
 }
 
@@ -111,6 +122,7 @@ Task<int>? takeoverRun = null;
 ITrackerHost? takeoverTracker = null;
 Action? stopHost = null;
 var exitRequested = false;
+ExceptionDispatchInfo? hostFailure = null;
 var hostEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 var instanceReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 int exitCode;
@@ -129,6 +141,7 @@ try
             new TakeoverEnvironment
             {
                 NewAppDir = AppFolders.Normalize(AppContext.BaseDirectory),
+                LocalAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 Task = new UserTask(ProcessRunner.Run),
                 Starter = new DetachedProcessStarter(),
                 ReleaseInstance = () =>
@@ -136,7 +149,13 @@ try
                     Volatile.Read(ref stopHost)?.Invoke();
                     return instanceReleased.Task;
                 },
-                ExitRequested = () => Volatile.Read(ref exitRequested),
+                // Read the event itself, so an MSI stop that lands during the 60 s window is seen even while the host
+                // is still running; once the event is disposed (host gone), the value read after app.Run stands.
+                ExitRequested = () =>
+                {
+                    try { return exitEvent!.WaitOne(0) || Volatile.Read(ref exitRequested); }
+                    catch (ObjectDisposedException) { return Volatile.Read(ref exitRequested); }
+                },
                 Log = fileLog!.CreateLogger("ProcessTracker.Takeover"),
             });
     }
@@ -152,6 +171,10 @@ try
         builder.Logging.AddFilter<FileLoggerProvider>(null, LogLevel.Information);
         builder.Logging.AddFilter<FileLoggerProvider>("Microsoft.AspNetCore", LogLevel.Warning);
         builder.Logging.AddFilter<FileLoggerProvider>("ModelContextProtocol", LogLevel.Warning);
+
+        // A newer version taking over waits SingleInstance.TakeoverWait (2 min) for this instance to stop and release
+        // the mutex; bound the stop well inside that (the collector's in-flight tick wait is 10 s of it).
+        builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = SingleInstance.UserModeShutdownTimeout);
     }
     else if (!asConsole)
     {
@@ -262,11 +285,13 @@ try
     Volatile.Write(ref exitRequested, exitEvent?.WaitOne(0) == true);
     exitCode = exposed ? 3 : 0;
 }
-catch (Exception e) when (takeoverRun is { IsCompleted: false })
+catch (Exception e) when (takeoverRun is not null)
 {
-    // The new version's host failed before its first tick: Takeover starts the previous one once the mutex is free.
-    fileLog!.CreateLogger("ProcessTracker").LogCritical(e, "The host failed to start");
-    exitCode = Takeover.RolledBack;
+    // A takeover start's host failed. Before the first tick, Takeover rolls back once the mutex is free; the takeover's
+    // result below decides the exit code either way.
+    fileLog!.CreateLogger("ProcessTracker").LogCritical(e, "The host failed");
+    hostFailure = ExceptionDispatchInfo.Capture(e);
+    exitCode = -1; // never returned: replaced by the takeover's code, or the failure is rethrown
 }
 finally
 {
@@ -275,8 +300,14 @@ finally
     instanceReleased.TrySetResult();
 }
 
-// An undecided takeover decides now (hostEnded), and once it has started the previous version its code is the result.
-if (takeoverRun is not null && takeoverRun.GetAwaiter().GetResult() is var takeoverExit and not 0) return takeoverExit;
+// An undecided takeover decides now (hostEnded). Its code is the exit code when it started the previous version (5);
+// when it had already committed (or was asked to exit), a host failure fails the process like any other.
+if (takeoverRun is not null)
+{
+    var takeoverExit = takeoverRun.GetAwaiter().GetResult();
+    if (takeoverExit != 0) return takeoverExit;
+    hostFailure?.Throw();
+}
 return exitCode;
 
 // User mode installed in %LOCALAPPDATA%\Programs\ProcessTracker\app-<X.Y.Z> keeps itself up to date from GitHub
@@ -315,8 +346,14 @@ static EventWaitHandle? CreateExitEvent()
 /// <summary>The machine-wide single-instance guard (not taken with --dev).</summary>
 internal static class SingleInstance
 {
-    /// <summary>How long a --takeover start waits for the instance it replaces to exit.</summary>
-    public static readonly TimeSpan TakeoverWait = TimeSpan.FromSeconds(30);
+    /// <summary>
+    /// How long a --takeover start waits for the instance it replaces to exit (ruling R8): well beyond that instance's
+    /// <see cref="UserModeShutdownTimeout"/> plus disposal, so only a hung instance makes it give up.
+    /// </summary>
+    public static readonly TimeSpan TakeoverWait = TimeSpan.FromMinutes(2);
+
+    /// <summary>User mode's host shutdown timeout (the default is 30 s): bounds how long a takeover waits in practice.</summary>
+    public static readonly TimeSpan UserModeShutdownTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// The owned mutex, or null when another instance (possibly under another account) still holds it after

@@ -9,6 +9,8 @@ public sealed class TakeoverEnvironment
 {
     /// <summary>This (the new) version's folder.</summary>
     public required string NewAppDir { get; init; }
+    /// <summary>%LOCALAPPDATA%: the logon task is updated and old versions deleted only inside its install layout.</summary>
+    public required string LocalAppData { get; init; }
     public required UserTask Task { get; init; }
     public required IProcessStarter Starter { get; init; }
     /// <summary>
@@ -24,8 +26,9 @@ public sealed class TakeoverEnvironment
 
 /// <summary>
 /// The second half of a <c>--takeover &lt;previousAppDir&gt;</c> start, once the previous version has exited and the
-/// mutex is ours. When the collector completes its first tick, the logon task is pointed at this version and the
-/// <c>app-*</c> folders other than this one and the previous one are deleted. If that does not happen within
+/// mutex is ours. When the collector completes its first tick, and this version runs from the user-mode install, the
+/// logon task is pointed at this version and the <c>app-*</c> folders other than this one and the previous one are
+/// deleted. If that does not happen within
 /// <see cref="HealthyWithin"/> (or the host fails to start), this instance stops, releases the mutex, starts the
 /// previous version with <c>--user</c> and exits with <see cref="RolledBack"/>. The failed folder is marked so the
 /// update worker does not try the same version again.
@@ -104,6 +107,15 @@ public static class Takeover
 
     private static void Commit(string previousAppDir, TakeoverEnvironment env)
     {
+        // Only an install in %LOCALAPPDATA%\Programs\ProcessTracker\app-* owns the logon task and its siblings; a manual
+        // run from a build folder must neither repoint the task nor delete anything.
+        if (SelfUpdateWorker.InstallRootFor(env.NewAppDir, env.LocalAppData) is not { } installRoot)
+        {
+            env.Log.LogInformation("{Dir} is not an app folder of the user-mode install; the logon task and old versions are left alone",
+                env.NewAppDir);
+            return;
+        }
+
         int code;
         try { code = env.Task.Register(env.NewAppDir); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException)
@@ -118,25 +130,17 @@ public static class Takeover
             return;
         }
         env.Log.LogInformation("The logon task {Task} now starts {Dir}", env.Task.TaskName, env.NewAppDir);
-        try { Prune(previousAppDir, env); }
+        try { Prune(installRoot, previousAppDir, env); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             env.Log.LogWarning("Listing the old version folders failed: {Error}", e.Message);
         }
     }
 
-    /// <summary>Deletes the <c>app-*</c> folders next to this one, except this one and the previous one.</summary>
-    private static void Prune(string previousAppDir, TakeoverEnvironment env)
+    /// <summary>Deletes the <c>app-*</c> folders in the install root, except this one and the previous one.</summary>
+    private static void Prune(string root, string previousAppDir, TakeoverEnvironment env)
     {
         var current = AppFolders.Normalize(env.NewAppDir);
-        var root = Path.GetDirectoryName(current);
-        if (root is null || !AppFolders.IsAppFolderName(Path.GetFileName(current))
-            || !string.Equals(Path.GetFileName(root), AppFolders.RootName, StringComparison.OrdinalIgnoreCase))
-        {
-            env.Log.LogInformation("{Dir} is not an app folder of a user-mode install; no old versions are deleted", current);
-            return;
-        }
-
         foreach (var dir in Directory.EnumerateDirectories(root))
         {
             if (!AppFolders.IsAppFolderName(Path.GetFileName(dir))) continue;

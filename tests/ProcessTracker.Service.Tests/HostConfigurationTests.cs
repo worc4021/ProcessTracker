@@ -91,4 +91,28 @@ public sealed class HostConfigurationTests
     [InlineData("http://+:47811", false)]
     public void LoopbackGuard_ClassifiesServerAddresses(string address, bool loopback) =>
         Assert.Equal(loopback, LoopbackGuard.IsLoopback(address));
+
+    // A takeover waits for the old user-mode instance to stop; its stop must end well within that wait (ruling R8).
+
+    private static readonly DateTime Now = new(2026, 11, 23, 12, 0, 0, DateTimeKind.Utc);
+
+    private static TimeSpan ShutdownTimeout(TestApp app) =>
+        app.Services.GetRequiredService<IOptions<Microsoft.Extensions.Hosting.HostOptions>>().Value.ShutdownTimeout;
+
+    [Fact]
+    public async Task UserMode_ShutdownTimeoutIs15Seconds()
+    {
+        await using var app = new TestApp(Now, RunMode.User);
+        Assert.Equal(TimeSpan.FromSeconds(15), ShutdownTimeout(app));
+    }
+
+    [Fact]
+    public async Task DevMode_ShutdownTimeoutIsTheDefault()
+    {
+        await using var app = new TestApp(Now);
+        Assert.Equal(new Microsoft.Extensions.Hosting.HostOptions().ShutdownTimeout, ShutdownTimeout(app));
+    }
+
+    [Fact]
+    public void TakeoverWait_IsTwoMinutes() => Assert.Equal(TimeSpan.FromMinutes(2), SingleInstance.TakeoverWait);
 }

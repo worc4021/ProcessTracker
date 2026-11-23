@@ -94,7 +94,7 @@ public sealed class TempDir : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(Path, recursive: true); }
-        catch (DirectoryNotFoundException) { }
+        // Link-safe: Directory.Delete throws on a junction inside the tree (non-admin), hiding a test's real failure.
+        AppFolders.Delete(Path);
     }
 }

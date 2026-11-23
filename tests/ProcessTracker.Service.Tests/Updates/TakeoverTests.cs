@@ -45,9 +45,10 @@ public sealed class TakeoverTests : IDisposable
         return (0, "");
     }
 
-    private TakeoverEnvironment Env() => new()
+    private TakeoverEnvironment Env(string? newAppDir = null) => new()
     {
-        NewAppDir = New,
+        NewAppDir = newAppDir ?? New,
+        LocalAppData = _temp.Path,
         Task = new UserTask(Schtasks, Sid),
         Starter = _starter,
         ReleaseInstance = () => { _events.Add("release"); return Task.CompletedTask; },
@@ -139,21 +140,21 @@ public sealed class TakeoverTests : IDisposable
         Assert.Empty(_schtasks);
     }
 
-    [Fact]
-    public async Task Takeover_OutsideTheInstallLayout_RegistersButDeletesNothing()
+    [Theory]
+    [InlineData(@"bin\Debug")]                              // a manual run from a build folder
+    [InlineData(@"Other\Programs\ProcessTracker\app-0.3.0")] // looks like the layout, but not under LocalAppData
+    public async Task Takeover_OutsideInstallLayout_DoesNotRegister(string relativeNewDir)
     {
-        var devDir = Path.Combine(_temp.Path, "bin", "Debug");
-        Directory.CreateDirectory(devDir);
-        Directory.CreateDirectory(Path.Combine(_temp.Path, "bin", "app-old"));
-        var env = Env();
-        env = new TakeoverEnvironment
-        {
-            NewAppDir = devDir, Task = env.Task, Starter = env.Starter, ReleaseInstance = env.ReleaseInstance,
-            ExitRequested = env.ExitRequested, Log = env.Log,
-        };
+        var newDir = Path.Combine(_temp.Path, relativeNewDir);
+        Directory.CreateDirectory(newDir);
+        var oldSibling = Path.Combine(Path.GetDirectoryName(newDir)!, "app-old");
+        Directory.CreateDirectory(oldSibling);
 
-        Assert.Equal(0, await Takeover.RunAsync(Previous, () => Task.FromResult(true), env));
-        Assert.True(Directory.Exists(Path.Combine(_temp.Path, "bin", "app-old")));
+        Assert.Equal(0, await Takeover.RunAsync(Previous, () => Task.FromResult(true), Env(newDir)));
+
+        Assert.Empty(_schtasks); // the logon task keeps pointing at the installed version
+        Assert.True(Directory.Exists(oldSibling));
+        Assert.Equal(["app-0.1.0", "app-0.2.0", "app-0.3.0"], AppFolders(Root));
     }
 
     // FirstTickAsync: the "healthy" signal the program passes as becameHealthy.
