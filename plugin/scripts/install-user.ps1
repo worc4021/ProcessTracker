@@ -18,8 +18,9 @@
          nothing answers and the highest installed app-<X.Y.Z> is not older; that folder is registered again instead.
          The folder the per-user task runs is never deleted.
       4. Runs app-<v>\bin\proctrack.exe user install --app-dir <that folder> and prints its output; an older copy of
-         yours that is still running is restarted on the new version by it. When that fails, a folder this run
-         extracted is removed again.
+         yours that is still running is restarted on the new version by it; when that fails, it points the task back
+         at the previous version and starts that again. A folder this run extracted is then removed, unless the task
+         points at it afterwards (read again after proctrack returns).
       5. Runs proctrack mcp unregister, so a leftover user-scope MCP entry doesn't duplicate the plugin's.
     Exits with the code of proctrack user install, or 1 when it refuses or fails before that.
 #>
@@ -318,9 +319,14 @@ function Invoke-InstallUser {
     $mcp = Invoke-Native $proctrack @('mcp', 'unregister')
     Write-Output $mcp.Output.TrimEnd()
     $script:ExitCode = $install.Code
-    if ($install.Code -ne 0 -and $created -and -not (Test-SamePath $appDir $taskAppDir)) {
-        Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Output "Removed $appDir again, since it was not installed."
+    if ($install.Code -ne 0 -and $created) {
+        # proctrack user install rolls the task back on failure, but whatever the task points at *now* stays on disk:
+        # deleting it would leave a task over a missing (or running, half-deleted) folder. Read it again, not $taskAppDir.
+        $taskNow = Get-TaskAppDir $taskName
+        if (-not (Test-SamePath $appDir $taskNow) -and -not (Test-SamePath $appDir $taskAppDir)) {
+            Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Output "Removed $appDir again, since it was not installed."
+        }
     }
 }
 

@@ -153,10 +153,14 @@ $installFakes = {
     function Test-UserTask([string]$Name) { $false }
     function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) [void]$script:calls.Add("extract $DestinationPath") }
     $script:installCode = 0
+    $script:taskAfterInstall = $null   # when set, proctrack user install leaves the task pointing at this folder
     function Invoke-Native([string]$Exe, [string[]]$Arguments) {
         [void]$script:calls.Add("run $Exe $($Arguments -join ' ')")
         $code = 0
-        if ($Arguments[0] -eq 'user') { $code = $script:installCode }
+        if ($Arguments[0] -eq 'user') {
+            $code = $script:installCode
+            if ($script:taskAfterInstall) { $script:taskAppDir = $script:taskAfterInstall }
+        }
         @{ Code = $code; Output = 'fake output' }
     }
     function Find-Proctrack { 'C:\fake\proctrack.exe' }
@@ -348,6 +352,46 @@ Invoke-Case 'install replaces an incomplete leftover and cleans up a failed inst
         Check (@($script:calls | Where-Object { $_ -like 'extract *' }).Count -eq 1) 'an incomplete leftover app-<v> is downloaded again'
         Check ($script:ExitCode -eq 1) 'exit code of a failed proctrack user install is kept'
         Check (-not (Test-Path -LiteralPath $dir)) 'app-<v> extracted by this run is removed when user install fails'
+    }
+}
+
+Invoke-Case 'install keeps the folder the task points at after a failed user install' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $previous = New-AppDir '0.1.0' $true
+        $script:taskAppDir = $previous                      # before: the task runs 0.1.0
+        $new = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'
+        $script:taskAfterInstall = $new                     # user install failed without restoring the task
+        $script:installCode = 1
+        Invoke-InstallUser | Out-Null
+        Check (Test-Path -LiteralPath (Join-Path $new 'bin\proctrack.exe')) 'failed user install: the folder the task points at now is kept'
+        Check ($script:ExitCode -eq 1) 'failed user install: its exit code is kept'
+    }
+}
+
+Invoke-Case 'install removes its folder when the task was rolled back after a failed user install' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $previous = New-AppDir '0.1.0' $true
+        $script:taskAppDir = $previous                      # before and after: the task runs 0.1.0 (rolled back)
+        $script:installCode = 1
+        Invoke-InstallUser | Out-Null
+        Check (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'))) 'rolled-back user install: the folder this run extracted is removed'
+        Check (Test-Path -LiteralPath (Join-Path $previous 'marker.txt')) 'rolled-back user install: the previous folder is kept'
     }
 }
 

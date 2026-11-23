@@ -11,6 +11,8 @@ public sealed class UserInstallTests : IDisposable
     private const string Me = @"PC\me";
     private readonly string _root = Path.Combine(Path.GetTempPath(), "proctrack-userinstall-" + Guid.NewGuid().ToString("N"));
     private readonly List<string> _schtasks = [];
+    /// <summary>The app folder of every /Create, in order (read from the task XML the fake is handed).</summary>
+    private readonly List<string> _registered = [];
     private readonly List<(string Exe, string CommandLine, IReadOnlyDictionary<string, string> Env)> _cleanups = [];
     private readonly StringWriter _out = new(), _err = new();
     private string TaskXml = "";
@@ -41,6 +43,12 @@ public sealed class UserInstallTests : IDisposable
         var task = new UserTask((exe, args, _) =>
         {
             _schtasks.Add(string.Join(' ', args.Select(a => a.EndsWith(".xml") ? "<file>" : a)));
+            if (args[0] == "/Create")
+            {
+                var xml = File.ReadAllText(args.First(a => a.EndsWith(".xml")));
+                var command = System.Text.RegularExpressions.Regex.Match(xml, "<Command>([^<]+)</Command>").Groups[1].Value;
+                _registered.Add(Path.GetDirectoryName(command)!);
+            }
             if (args[0] == "/Query") return TaskXml.Length > 0 ? (0, TaskXml) : (1, "not found");
             return (0, "");
         }, Sid);
@@ -109,9 +117,10 @@ public sealed class UserInstallTests : IDisposable
         var code = await Make(health: () => ++polls < 4 ? null : Health("user")).InstallAsync(AppDir(), Ct);
 
         Assert.Equal(0, code);
-        Assert.Equal(2, _schtasks.Count);
-        Assert.Equal($@"/Create /TN \ProcessTracker\User-{Sid} /XML <file> /F", _schtasks[0]);
-        Assert.Equal($@"/Run /TN \ProcessTracker\User-{Sid}", _schtasks[1]);
+        var changes = _schtasks.Where(c => !c.StartsWith("/Query")).ToList();
+        Assert.Equal(2, changes.Count);
+        Assert.Equal($@"/Create /TN \ProcessTracker\User-{Sid} /XML <file> /F", changes[0]);
+        Assert.Equal($@"/Run /TN \ProcessTracker\User-{Sid}", changes[1]);
     }
 
     [Fact]
@@ -171,24 +180,65 @@ public sealed class UserInstallTests : IDisposable
     }
 
     [Fact]
-    public async Task Install_OlderVersionKeepsAnswering_FailsAfterTimeout()
+    public async Task Install_NewVersionNeverHealthy_RollsBackToRunningPrevious()
     {
+        var previous = Path.Combine(Programs, "app-0.9.0");
+        TaskXml = UserTask.BuildXml(previous, Sid);
+        // The new 1.0.0 never answers; only 0.9.0 does (before the stop, and again after the rollback starts it).
         var code = await Make(health: () => Health("user", version: "0.9.0")).InstallAsync(AppDir(), Ct);
 
         Assert.Equal(1, code);
-        Assert.Contains("1.0.0", _err.ToString());
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered); // registration restored
+        Assert.Equal(2, _stops); // the old copy, then whatever the failed start left behind
+        var changes = _schtasks.Where(c => !c.StartsWith("/Query")).ToList();
+        Assert.StartsWith("/Run", changes[^1]); // the previous copy is started again, after the task points at it
+        Assert.Contains("1.0.0 did not start", _err.ToString());
+        Assert.Contains("previous version 0.9.0 is running again", _err.ToString());
+        Assert.DoesNotContain("next logon", _err.ToString());
     }
 
     [Fact]
-    public async Task Install_OldVersionDoesNotStop_RefusesWithoutRunningTask()
+    public async Task Install_OldVersionDoesNotStop_RollsTaskBackAndRestartsPrevious()
     {
+        var previous = Path.Combine(Programs, "app-0.9.0");
+        TaskXml = UserTask.BuildXml(previous, Sid);
         _stopSucceeds = false;
         var code = await Make(health: () => Health("user", version: "0.9.0")).InstallAsync(AppDir(), Ct);
 
         Assert.Equal(1, code);
         Assert.Equal(1, _stops);
-        Assert.DoesNotContain(_schtasks, c => c.StartsWith("/Run"));
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered); // registration restored
+        var changes = _schtasks.Where(c => !c.StartsWith("/Query")).ToList();
+        Assert.Equal(3, changes.Count); // /Create new, /Create previous, /Run
+        Assert.StartsWith("/Run", changes[2]);
         Assert.Contains("did not stop", _err.ToString());
+        Assert.Contains("previous version 0.9.0 is running again", _err.ToString());
+        Assert.DoesNotContain("next logon", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_StoppedPreviousInstall_NewNeverHealthy_RestoresTaskWithoutStartingIt()
+    {
+        var previous = Path.Combine(Programs, "app-0.9.0");
+        TaskXml = UserTask.BuildXml(previous, Sid);
+        var code = await Make(health: () => null).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0"), previous], _registered);
+        var changes = _schtasks.Where(c => !c.StartsWith("/Query")).ToList();
+        Assert.StartsWith("/Create", changes[^1]); // nothing was running before, so nothing is started after the rollback
+        Assert.Contains("points at the previous version", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_FirstInstall_NeverHealthy_RemovesTheTask()
+    {
+        var code = await Make(health: () => null).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Equal([Path.Combine(Programs, "app-1.0.0")], _registered);
+        Assert.StartsWith("/Delete", _schtasks.Where(c => !c.StartsWith("/Query")).Last());
+        Assert.Contains("task was removed", _err.ToString());
     }
 
     [Fact]

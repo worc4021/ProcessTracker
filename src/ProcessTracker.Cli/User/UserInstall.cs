@@ -105,16 +105,15 @@ public sealed class UserInstall(UserInstallEnvironment env)
         }
         var target = env.AppVersion(appDir);
 
+        // What to restore if the new version does not come up: the task's registration and, if one ran, the copy.
+        var previousAppDir = env.Task.RegisteredAppDir();
+        var wasRunning = Classify(before) == Running.Mine;
+
         // This user's instance already runs: keep it when it is this version from this folder; otherwise it is an older
         // (or relocated) copy that re-registering alone would leave running, so it is restarted below.
-        var restart = false;
-        if (Classify(before) == Running.Mine)
-        {
-            var runningVersion = FetchReleaseVersion(before!.Version);
-            var previousAppDir = env.Task.RegisteredAppDir();
-            restart = (target is not null && runningVersion != target)
-                      || (previousAppDir is not null && !SamePath(previousAppDir, appDir));
-        }
+        var restart = wasRunning
+                      && ((target is not null && FetchReleaseVersion(before!.Version) != target)
+                          || (previousAppDir is not null && !SamePath(previousAppDir, appDir)));
 
         if (env.Task.Register(appDir) != 0) return Refused;
         env.Out.WriteLine($"Registered {env.Task.TaskName}.");
@@ -124,14 +123,17 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Out.WriteLine($"Restarting ProcessTracker {before!.Version} to run {Describe(target)} from {appDir}...");
             if (!env.StopInstance(env.StopTimeout))
             {
-                env.Err.WriteLine($"The running ProcessTracker {before.Version} did not stop within {env.StopTimeout.TotalSeconds:0} s; "
-                                  + "the new version starts at your next logon.");
-                return Refused;
+                env.Err.WriteLine($"The running ProcessTracker {before.Version} did not stop within {env.StopTimeout.TotalSeconds:0} s.");
+                return await RollBackAsync(appDir, previousAppDir, before, stopNew: false, ct);
             }
         }
 
         // Task Scheduler starts it, as at logon: no handles inherited from this console, outside this process's job.
-        if ((restart || Classify(await env.Health(ct)) != Running.Mine) && env.Task.Start() != 0) return Refused;
+        if ((restart || Classify(await env.Health(ct)) != Running.Mine) && env.Task.Start() != 0)
+        {
+            env.Err.WriteLine("Starting the task failed.");
+            return await RollBackAsync(appDir, previousAppDir, wasRunning ? before : null, stopNew: false, ct);
+        }
 
         var clock = Stopwatch.StartNew();
         var lastStart = Stopwatch.StartNew();
@@ -159,7 +161,55 @@ public sealed class UserInstall(UserInstallEnvironment env)
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
         }
-        env.Err.WriteLine($"The task is registered, but ProcessTracker {Describe(target)} did not report mode=user within {env.HealthTimeout.TotalSeconds:0} s.");
+        env.Err.WriteLine($"ProcessTracker {Describe(target)} did not start: it did not report mode=user within {env.HealthTimeout.TotalSeconds:0} s.");
+        return await RollBackAsync(appDir, previousAppDir, wasRunning ? before : null, stopNew: true, ct);
+    }
+
+    /// <summary>
+    /// After a failed (re)install: points the task back at <paramref name="previousAppDir"/> (or removes the task when
+    /// there was none), and when a copy was running before (<paramref name="previouslyRunning"/>) starts it again and
+    /// says whether it answers. <paramref name="stopNew"/> first stops whatever the failed start left running, so it
+    /// releases the instance mutex and its folder. Always returns <see cref="Refused"/>.
+    /// </summary>
+    private async Task<int> RollBackAsync(string appDir, string? previousAppDir, HealthDto? previouslyRunning, bool stopNew,
+        CancellationToken ct)
+    {
+        if (stopNew && !env.StopInstance(env.StopTimeout))
+            env.Err.WriteLine($"The new version did not stop within {env.StopTimeout.TotalSeconds:0} s either.");
+
+        if (previousAppDir is null)
+        {
+            var removed = env.Task.Remove() == 0;
+            env.Err.WriteLine(removed
+                ? $"The task was removed again; nothing of {appDir} is registered."
+                : $"Removing the task {env.Task.TaskName} failed; 'proctrack user uninstall' removes it.");
+            return Refused;
+        }
+        if (!SamePath(previousAppDir, appDir) && env.Task.Register(previousAppDir) != 0)
+        {
+            env.Err.WriteLine($"Pointing the task back at {previousAppDir} failed; it still points at {appDir}.");
+            return Refused;
+        }
+        if (previouslyRunning is null)
+        {
+            env.Err.WriteLine($"The task points at the previous version in {previousAppDir} again.");
+            return Refused;
+        }
+
+        env.Task.Start();
+        var clock = Stopwatch.StartNew();
+        while (true)
+        {
+            if (Classify(await env.Health(ct)) == Running.Mine)
+            {
+                env.Err.WriteLine($"The new version did not start; the previous version {previouslyRunning.Version} is running again.");
+                return Refused;
+            }
+            if (clock.Elapsed >= env.HealthTimeout) break;
+            await Task.Delay(env.PollInterval, ct);
+        }
+        env.Err.WriteLine($"The new version did not start; the task points at the previous version {previouslyRunning.Version} again, "
+                          + $"but it did not answer within {env.HealthTimeout.TotalSeconds:0} s. /process-tracker:status shows details.");
         return Refused;
     }
 
