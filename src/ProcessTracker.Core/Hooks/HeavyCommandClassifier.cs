@@ -35,7 +35,7 @@ public static class HeavyCommandClassifier
             @"--parallel",
             @"Start-Job",
             @"ForEach-Object\s+-Parallel",
-        }.Select(p => new Regex(p, Options | RegexOptions.Compiled, MatchTimeout)),
+        }.Select(p => new Regex(p, Options, MatchTimeout)),
     ];
 
     /// <summary>A pattern with the classifier's options and timeout (for the extra patterns in configuration).</summary>
