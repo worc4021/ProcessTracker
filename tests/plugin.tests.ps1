@@ -61,8 +61,9 @@ Invoke-Case 'hooks.json' {
     $preHook = @($pre[0].hooks)
     Check ($pre.Count -eq 1 -and $pre[0].matcher -eq 'Bash|PowerShell|Task|Agent') 'PreToolUse matcher is Bash|PowerShell|Task|Agent'
     Check ($preHook.Count -eq 1 -and $preHook[0].type -eq 'command' -and $preHook[0].command -eq 'cmd.exe') 'hooks.json PreToolUse runs cmd.exe (exec form)'
-    $expected = @('/d', '/s', '/c', 'curl.exe -s -f --connect-timeout 0.25 --max-time 2 --data-binary @- http://127.0.0.1:47811/api/hooks/pre-tool-use & exit /b 0')
-    Check ((@($preHook[0].args) -join "`n") -eq ($expected -join "`n")) 'PreToolUse runs curl.exe through cmd and always exits 0'
+    $expected = @('/d', '/s', '/c', '%SystemRoot%\System32\curl.exe -s -f --connect-timeout 0.25 --max-time 2 --data-binary @- http://127.0.0.1:47811/api/hooks/pre-tool-use & exit /b 0')
+    Check ((@($preHook[0].args) -join "`n") -eq ($expected -join "`n")) 'PreToolUse runs %SystemRoot%\System32\curl.exe through cmd and always exits 0'
+    Check (@($preHook[0].args)[3] -notmatch '(^|[\s&|])curl\.exe') 'PreToolUse never runs a bare curl.exe (a project-folder copy would win)'
     Check ($preHook[0].timeout -eq 3) 'PreToolUse timeout 3'
 
     $start = @($hooks.SessionStart)
@@ -136,6 +137,8 @@ Invoke-Case 'commands' {
     $uninstall = Get-Content -LiteralPath (Join-Path $pluginDir 'commands\uninstall.md') -Raw
     $status = Get-Content -LiteralPath (Join-Path $pluginDir 'commands\status.md') -Raw
     Check ($install.Contains('powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-user.ps1"')) 'install.md runs install-user.ps1'
+    Check ($install.Contains('600000') -and $install -match '10-minute') 'install.md asks for a 10-minute (600000 ms) timeout'
+    Check ($install -match 'not in the background' -and $install -match 'wait') 'install.md says to wait for it, not run it in the background'
     Check ($uninstall.Contains('user uninstall') -and $uninstall.Contains('--purge-data')) 'uninstall.md runs proctrack user uninstall, --purge-data only on request'
     Check ($status.Contains('user status') -and $status.Contains('proctrack load')) 'status.md runs proctrack user status and proctrack load'
 }
@@ -389,6 +392,28 @@ Invoke-Case 'install defers to the machine service' {
     Check (($script:calls -join '|') -eq 'run C:\fake\proctrack.exe mcp unregister') 'service mode: runs only proctrack mcp unregister'
 }
 
+Invoke-Case 'install treats health without a mode as the machine service' {
+    . $installScript
+    . $installFakes
+    function Get-Health { [pscustomobject]@{ version = '0.1.0' } }   # a service that predates the mode field
+    $out = Invoke-InstallUser | Out-String
+    Check ($out -match 'machine-wide service is running') 'health without mode: says the machine-wide service is in use'
+    Check (@($script:calls | Where-Object { $_ -like 'get *' }).Count -eq 0) 'health without mode: no download'
+}
+
+Invoke-Case 'install checks sc query before any download' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Get-Health { [pscustomobject]@{ version = '0.1.0'; mode = 'user'; owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } }
+        function Test-MachineService { $true }
+        $out = Invoke-InstallUser | Out-String
+        Check ($out -match 'machine-wide service is installed') 'user-mode copy answering, service installed: says the machine-wide service is in use'
+        Check (@($script:calls | Where-Object { $_ -like 'get *' -or $_ -like 'extract *' }).Count -eq 0) 'user-mode copy answering, service installed: no download'
+    }
+}
+
 Invoke-Case 'install defers to the machine service without proctrack' {
     . $installScript
     . $installFakes
@@ -422,9 +447,24 @@ Invoke-Case 'SHA256SUMS parsing' {
 $sessionFakes = {
     $script:posts = New-Object System.Collections.ArrayList
     $script:runs = New-Object System.Collections.ArrayList
+    $script:lookups = New-Object System.Collections.ArrayList
     $script:taskExists = $false
+    $script:machineService = $false
+    $script:listenerSid = $null   # nothing listens / the lookup failed
     function Test-UserTask([string]$Name) { $script:taskExists }
+    function Test-MachineService { $script:machineService }
+    function Get-ListenerOwnerSid([string]$Address, [int]$Port) { [void]$script:lookups.Add("${Address}:$Port"); $script:listenerSid }
     function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:runs.Add("$Exe $($Arguments -join ' ')"); @{ Code = 0; Output = '' } }
+}
+# A fake POST that records the call and answers 200 with an empty object.
+$postOk = {
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        [void]$script:posts.Add($Uri)
+        [pscustomobject]@{ StatusCode = 200; Content = '{}' }
+    }
 }
 function New-ConnectionRefused {
     New-Object System.Net.WebException('Unable to connect to the remote server', [System.Net.WebExceptionStatus]::ConnectFailure)
@@ -509,6 +549,95 @@ Invoke-Case 'session-start other status is silent' {
     Check ([string]::IsNullOrEmpty($out)) 'session-start prints nothing on other errors'
 }
 
+Invoke-Case 'session-start refuses another user''s listener' {
+    . $sessionScript
+    . $sessionFakes
+    . $postOk
+    $script:listenerSid = 'S-1-5-21-111-222-333-1001'
+    $out = Invoke-SessionStart '{"session_id":"s1"}'
+    Check ($out -eq "ProcessTracker: port 47811 is held by another Windows user's process; not using it. Ask an admin to install the machine-wide service.") 'another user''s listener: prints the one line'
+    Check ($script:posts.Count -eq 0) 'another user''s listener: the payload is not posted'
+    Check ($script:lookups -contains '127.0.0.1:47811') 'the owner of 127.0.0.1:47811 is looked up'
+}
+
+Invoke-Case 'session-start refuses a listener whose owner is unreadable' {
+    . $sessionScript
+    . $sessionFakes
+    . $postOk
+    $script:listenerSid = ''
+    $out = Invoke-SessionStart '{}'
+    Check ($out -match 'held by another Windows user' -and $script:posts.Count -eq 0) 'unreadable owner (not the machine service): not posted'
+}
+
+Invoke-Case 'session-start posts to its own, SYSTEM''s or an unknown listener' {
+    . $sessionScript
+    . $sessionFakes
+    . $postOk
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    foreach ($sid in @($me, 'S-1-5-18', $null)) {
+        $script:posts.Clear()
+        $script:listenerSid = $sid
+        $out = Invoke-SessionStart '{}'
+        Check ($script:posts.Count -eq 1 -and $out -eq '{}') "listener owned by '$sid': posted and passed through"
+    }
+}
+
+Invoke-Case 'listener owner lookup' {
+    . $sessionScript
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $script:tcp = @([pscustomobject]@{ OwningProcess = 4321 })
+    $script:tcpThrows = $false
+    $script:owner = [pscustomobject]@{ ReturnValue = 0; Sid = $me }
+    $script:servicePid = 0
+    $script:cimThrows = $false
+    function Get-NetTCPConnection {
+        param([string]$LocalAddress, [int]$LocalPort, [string]$State, $ErrorAction)
+        if ($script:tcpThrows) { throw 'No matching MSFT_NetTCPConnection objects found' }
+        $script:tcpArgs = "$LocalAddress $LocalPort $State"
+        $script:tcp
+    }
+    function Get-CimInstance {
+        param([string]$ClassName, [string]$Filter, $ErrorAction)
+        if ($script:cimThrows) { throw 'WMI is unavailable' }
+        if ($ClassName -eq 'Win32_Process') { return [pscustomobject]@{ ProcessId = 4321; Filter = $Filter } }
+        if ($ClassName -eq 'Win32_Service' -and $script:servicePid) { return [pscustomobject]@{ ProcessId = $script:servicePid } }
+        return $null
+    }
+    function Invoke-CimMethod { param($InputObject, [string]$MethodName, $ErrorAction) $script:owner }
+
+    Check ((Get-ListenerOwnerSid '127.0.0.1' 47811) -eq $me -and $script:tcpArgs -eq '127.0.0.1 47811 Listen') 'readable owner: its SID'
+    $script:owner = [pscustomobject]@{ ReturnValue = 2; Sid = $null }
+    $script:servicePid = 4321
+    Check ((Get-ListenerOwnerSid '127.0.0.1' 47811) -eq 'S-1-5-18') 'unreadable owner that is the ProcessTracker service: SYSTEM'
+    $script:servicePid = 999
+    $r = Get-ListenerOwnerSid '127.0.0.1' 47811
+    Check ($null -ne $r -and $r -eq '') 'unreadable owner, not the service: empty (another account)'
+    $script:tcp = @()
+    Check ($null -eq (Get-ListenerOwnerSid '127.0.0.1' 47811)) 'nothing listens: null'
+    $script:tcpThrows = $true
+    Check ($null -eq (Get-ListenerOwnerSid '127.0.0.1' 47811)) 'Get-NetTCPConnection fails: null (fall back)'
+    $script:tcpThrows = $false
+    $script:tcp = @([pscustomobject]@{ OwningProcess = 4321 })
+    $script:cimThrows = $true
+    Check ($null -eq (Get-ListenerOwnerSid '127.0.0.1' 47811)) 'WMI fails: null (fall back)'
+}
+
+Invoke-Case 'session-start with the machine service installed but stopped' {
+    . $sessionScript
+    . $sessionFakes
+    $script:taskExists = $true
+    $script:machineService = $true
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        throw (New-ConnectionRefused)
+    }
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq 'ProcessTracker: the machine-wide service is installed but not running; ask an admin to start it.') 'service installed, nothing answers: says to ask an admin'
+    Check (@($script:runs | Where-Object { $_ -like 'schtasks.exe /Run*' }).Count -eq 0) 'service installed: the leftover user task is not run'
+}
+
 # The real script end to end, pointed at a closed port and a task that doesn't exist through its environment seams, so
 # it neither reaches the real tracker on 47811 nor starts the developer's own task.
 Invoke-Case 'session-start process' {
@@ -527,7 +656,13 @@ Invoke-Case 'session-start process' {
         $env:PROCTRACK_HOOK_URL_BASE = $savedEnv.Url; $env:PROCTRACK_USER_TASK = $savedEnv.Task
     }
     Check ($code -eq 0) 'session-start.ps1 exits 0'
-    Check ($out.Trim() -eq 'ProcessTracker is not running. Offer the user /process-tracker:install once; it installs a user-only copy without admin rights.') 'session-start.ps1 prints only the install offer (no error text)'
+    & sc.exe query ProcessTracker *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Check ($out.Trim() -eq 'ProcessTracker: the machine-wide service is installed but not running; ask an admin to start it.') 'session-start.ps1 prints only the machine-service line (service installed here; no error text)'
+    }
+    else {
+        Check ($out.Trim() -eq 'ProcessTracker is not running. Offer the user /process-tracker:install once; it installs a user-only copy without admin rights.') 'session-start.ps1 prints only the install offer (no error text)'
+    }
 }
 
 Invoke-Case 'session-start seams default to production' {
@@ -538,6 +673,38 @@ Invoke-Case 'session-start seams default to production' {
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         Check ($script:SessionStartUri -eq 'http://127.0.0.1:47811/api/hooks/session-start') 'session-start URL defaults to 127.0.0.1:47811'
         Check ((Get-UserTaskName) -eq "\ProcessTracker\User-$sid") 'session-start task name defaults to \ProcessTracker\User-<SID>'
+    }
+    finally { $env:PROCTRACK_HOOK_URL_BASE = $savedEnv.Url; $env:PROCTRACK_USER_TASK = $savedEnv.Task }
+}
+
+Invoke-Case 'session-start seams accept only loopback and \ProcessTracker\' {
+    $savedEnv = @{ Url = $env:PROCTRACK_HOOK_URL_BASE; Task = $env:PROCTRACK_USER_TASK }
+    try {
+        $urls = [ordered]@{
+            'http://localhost:1/'                 = 'http://localhost:1/api/hooks/session-start'
+            'http://127.0.0.1:1'                  = 'http://127.0.0.1:1/api/hooks/session-start'
+            'http://[::1]:1'                      = 'http://[::1]:1/api/hooks/session-start'
+            'http://evil.example:47811'           = 'http://127.0.0.1:47811/api/hooks/session-start'
+            'http://127.0.0.1@evil.example:47811' = 'http://127.0.0.1:47811/api/hooks/session-start'
+            'http://127.0.0.1.evil.example'       = 'http://127.0.0.1:47811/api/hooks/session-start'
+            'file:///C:/x'                        = 'http://127.0.0.1:47811/api/hooks/session-start'
+            'not a url'                           = 'http://127.0.0.1:47811/api/hooks/session-start'
+        }
+        foreach ($u in $urls.Keys) {
+            $env:PROCTRACK_HOOK_URL_BASE = $u
+            . $sessionScript
+            Check ($script:SessionStartUri -eq $urls[$u]) "PROCTRACK_HOOK_URL_BASE '$u' -> $($urls[$u])"
+        }
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $tasks = [ordered]@{
+            '\ProcessTracker\User-plugin-tests' = '\ProcessTracker\User-plugin-tests'
+            '\Microsoft\Windows\Defrag\ScheduledDefrag' = "\ProcessTracker\User-$sid"
+            'ProcessTracker\User-x' = "\ProcessTracker\User-$sid"
+        }
+        foreach ($t in $tasks.Keys) {
+            $env:PROCTRACK_USER_TASK = $t
+            Check ((Get-UserTaskName) -eq $tasks[$t]) "PROCTRACK_USER_TASK '$t' -> $($tasks[$t])"
+        }
     }
     finally { $env:PROCTRACK_HOOK_URL_BASE = $savedEnv.Url; $env:PROCTRACK_USER_TASK = $savedEnv.Task }
 }

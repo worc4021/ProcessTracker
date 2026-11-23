@@ -7,6 +7,10 @@ Install ProcessTracker for the current Windows user. Run this command once, with
 powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-user.ps1"
 ```
 
+The first install downloads and unpacks about 90 MB, which can take longer than the shell tool's default 2-minute
+limit. Give the call a 10-minute timeout (`timeout: 600000` ms), run it in the foreground, not in the background, and
+wait for it to finish.
+
 Then report the command's output to the user verbatim, together with its exit code.
 
 Rules:

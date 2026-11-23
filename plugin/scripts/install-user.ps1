@@ -5,8 +5,9 @@
 .DESCRIPTION
     Windows PowerShell 5.1 or pwsh, no dependencies.
       1. Refuses when elevated: the user-only copy belongs to the signed-in user, not to an administrator.
-      2. If http://127.0.0.1:47811/api/health answers with mode "service", or nothing answers and the ProcessTracker
-         Windows service is installed (sc query), the machine-wide service is in use and nothing is installed (an
+      2. If http://127.0.0.1:47811/api/health answers with mode "service" (or without a mode: a service that predates
+         it), or the ProcessTracker Windows service is installed (sc query, checked before any download), the
+         machine-wide service is in use and nothing is installed (an
          existing per-user task is pointed out, with the command that removes it), but proctrack mcp unregister still
          runs when proctrack is found (otherwise a hint says to run it). An own running user-mode copy that is already
          at the latest version is left alone; another user's copy is refused.
@@ -16,8 +17,9 @@
          %LOCALAPPDATA%\Programs\ProcessTracker\app-<v>. Nothing is downloaded when app-<v> is already complete, or when
          nothing answers and the highest installed app-<X.Y.Z> is not older; that folder is registered again instead.
          The folder the per-user task runs is never deleted.
-      4. Runs app-<v>\bin\proctrack.exe user install --app-dir <that folder> and prints its output. When that fails, a
-         folder this run extracted is removed again.
+      4. Runs app-<v>\bin\proctrack.exe user install --app-dir <that folder> and prints its output; an older copy of
+         yours that is still running is restarted on the new version by it. When that fails, a folder this run
+         extracted is removed again.
       5. Runs proctrack mcp unregister, so a leftover user-scope MCP entry doesn't duplicate the plugin's.
     Exits with the code of proctrack user install, or 1 when it refuses or fails before that.
 #>
@@ -256,25 +258,32 @@ function Invoke-InstallUser {
 
     $taskName = Get-UserTaskName
     $health = Get-Health
-    if ($null -ne $health -and $health.mode -eq 'service') {
+    # A service that predates the mode field answers without it: that is the machine-wide service (as in session-start).
+    $mode = $null
+    if ($null -ne $health) {
+        $mode = [string]$health.mode
+        if (-not $mode) { $mode = 'service' }
+    }
+    if ($mode -eq 'service') {
         Write-MachineServiceInUse $taskName $true
         $script:ExitCode = 0
         return
     }
-    if ($null -eq $health -and (Test-MachineService)) {
+    # Installed but not the one answering (stopped, or a user-mode copy still holds the port): nothing to download.
+    if (Test-MachineService) {
         Write-MachineServiceInUse $taskName $false
         $script:ExitCode = 0
         return
     }
 
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if ($null -ne $health -and $health.mode -eq 'user' -and $health.owner -and $health.owner -ne $me) {
+    if ($mode -eq 'user' -and $health.owner -and $health.owner -ne $me) {
         throw "The ProcessTracker on this machine belongs to another user ($($health.owner)); ask an admin to install the machine-wide service."
     }
 
     $headers = @{ 'User-Agent' = "ProcessTracker/$(Get-PluginVersion)" }
     $release = Get-LatestRelease $headers
-    if ($null -ne $health -and $health.mode -eq 'user') {
+    if ($mode -eq 'user') {
         $running = ConvertTo-PlainVersion ([string]$health.version)
         if ($null -ne $running -and -not ($release.Version -gt $running)) {
             Write-Output "Your user-only ProcessTracker $running is already installed and running; the latest release is $($release.Version). Nothing to do."
