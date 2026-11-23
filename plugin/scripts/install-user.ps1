@@ -5,15 +5,19 @@
 .DESCRIPTION
     Windows PowerShell 5.1 or pwsh, no dependencies.
       1. Refuses when elevated: the user-only copy belongs to the signed-in user, not to an administrator.
-      2. If http://127.0.0.1:47811/api/health answers with mode "service", the machine-wide service is in use and nothing
-         is installed (an existing per-user task is pointed out, with the command that removes it), but proctrack mcp
-         unregister still runs when proctrack is found (otherwise a hint says to run it). An own user-mode copy
-         that is already at the latest version is left alone; another user's copy is refused.
+      2. If http://127.0.0.1:47811/api/health answers with mode "service", or nothing answers and the ProcessTracker
+         Windows service is installed (sc query), the machine-wide service is in use and nothing is installed (an
+         existing per-user task is pointed out, with the command that removes it), but proctrack mcp unregister still
+         runs when proctrack is found (otherwise a hint says to run it). An own running user-mode copy that is already
+         at the latest version is left alone; another user's copy is refused.
       3. Reads https://api.github.com/repos/worc4021/ProcessTracker/releases/latest, downloads
          ProcessTracker-<v>-x64.zip and SHA256SUMS.txt to %TEMP%, following redirects only to github.com,
          objects.githubusercontent.com and release-assets.githubusercontent.com, checks the SHA-256 and extracts to
-         %LOCALAPPDATA%\Programs\ProcessTracker\app-<v>.
-      4. Runs app-<v>\bin\proctrack.exe user install --app-dir <that folder> and prints its output.
+         %LOCALAPPDATA%\Programs\ProcessTracker\app-<v>. Nothing is downloaded when app-<v> is already complete, or when
+         nothing answers and the highest installed app-<X.Y.Z> is not older; that folder is registered again instead.
+         The folder the per-user task runs is never deleted.
+      4. Runs app-<v>\bin\proctrack.exe user install --app-dir <that folder> and prints its output. When that fails, a
+         folder this run extracted is removed again.
       5. Runs proctrack mcp unregister, so a leftover user-scope MCP entry doesn't duplicate the plugin's.
     Exits with the code of proctrack user install, or 1 when it refuses or fails before that.
 #>
@@ -152,25 +156,59 @@ function Get-ProgramsDir {
     return Join-Path $local 'Programs\ProcessTracker'
 }
 
-function Find-Proctrack {
-    # proctrack.exe on the PATH (the MSI puts it there), else the highest user-mode app-<v>\bin\proctrack.exe; $null if none.
-    $onPath = Get-Command 'proctrack.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $onPath) { return $onPath.Source }
+function Get-InstalledApp {
+    # The highest complete user-mode install: @{ Version; Dir } for %LOCALAPPDATA%\Programs\ProcessTracker\app-<X.Y.Z> with
+    # bin\proctrack.exe, or $null.
     try { $programs = Get-ProgramsDir } catch { return $null }
     if (-not (Test-Path -LiteralPath $programs)) { return $null }
     $best = $null
-    $bestVersion = $null
     foreach ($dir in Get-ChildItem -LiteralPath $programs -Directory -Filter 'app-*') {
-        $v = ConvertTo-PlainVersion ($dir.Name.Substring(4))
-        $exe = Join-Path $dir.FullName 'bin\proctrack.exe'
-        if ($null -eq $v -or $dir.Name.Substring(4) -ne $v.ToString() -or -not (Test-Path -LiteralPath $exe)) { continue }
-        if ($null -eq $bestVersion -or $v -gt $bestVersion) { $best = $exe; $bestVersion = $v }
+        $name = $dir.Name.Substring(4)
+        $v = ConvertTo-PlainVersion $name
+        if ($null -eq $v -or $name -ne $v.ToString() -or -not (Test-AppComplete $dir.FullName)) { continue }
+        if ($null -eq $best -or $v -gt $best.Version) { $best = @{ Version = $v; Dir = $dir.FullName } }
     }
     return $best
 }
 
-function Install-Release($Release, [hashtable]$Headers) {
-    # Downloads and verifies the release zip, extracts it to app-<v> and returns that folder.
+function Test-AppComplete([string]$Dir) { Test-Path -LiteralPath (Join-Path $Dir 'bin\proctrack.exe') }
+
+function Find-Proctrack {
+    # proctrack.exe on the PATH (the MSI puts it there), else the one of the highest user-mode install; $null if none.
+    $onPath = Get-Command 'proctrack.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $onPath) { return $onPath.Source }
+    $installed = Get-InstalledApp
+    if ($null -eq $installed) { return $null }
+    return Join-Path $installed.Dir 'bin\proctrack.exe'
+}
+
+function Test-MachineService {
+    # True when the ProcessTracker Windows service is installed, running or not (sc query needs no admin rights).
+    (Invoke-Native 'sc.exe' @('query', 'ProcessTracker')).Code -eq 0
+}
+
+function Get-TaskAppDir([string]$Name) {
+    # The app folder the per-user task runs (the parent of its service exe), or $null when there is no such task.
+    $q = Invoke-Native 'schtasks.exe' @('/Query', '/TN', $Name, '/XML')
+    if ($q.Code -ne 0 -or $q.Output -notmatch '<Command>\s*([^<]+?)\s*</Command>') { return $null }
+    $command = [Net.WebUtility]::HtmlDecode($Matches[1]).Trim('"')
+    try { return Split-Path -Parent $command } catch { return $null }
+}
+
+function Test-SamePath([string]$A, [string]$B) {
+    if (-not $A -or -not $B) { return $false }
+    $a1 = [IO.Path]::GetFullPath($A).TrimEnd('\')
+    $b1 = [IO.Path]::GetFullPath($B).TrimEnd('\')
+    return [string]::Equals($a1, $b1, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Install-Release($Release, [hashtable]$Headers, [string]$TaskAppDir) {
+    # Downloads and verifies the release zip and extracts it to app-<v> (not already complete). Returns that folder. An
+    # incomplete leftover app-<v> is replaced, unless the per-user task runs it.
+    $appDir = Join-Path (Get-ProgramsDir) "app-$($Release.Version)"
+    if ((Test-Path -LiteralPath $appDir) -and (Test-SamePath $appDir $TaskAppDir)) {
+        throw "$appDir is incomplete but your scheduled task runs it; run 'proctrack user uninstall' (or delete the task) and install again."
+    }
     $temp = Join-Path $env:TEMP ('ProcessTracker-install-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temp | Out-Null
     try {
@@ -184,11 +222,10 @@ function Install-Release($Release, [hashtable]$Headers) {
         $actual = Get-Sha256 $zipPath
         if ($actual -ne $expected) { throw "SHA-256 mismatch for $($Release.ZipName): expected $expected, got $actual. Nothing was installed." }
 
-        $appDir = Join-Path (Get-ProgramsDir) "app-$($Release.Version)"
         $staging = "$appDir.partial"
         if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
         Expand-Archive -LiteralPath $zipPath -DestinationPath $staging -Force
-        if (-not (Test-Path -LiteralPath (Join-Path $staging 'bin\proctrack.exe'))) {
+        if (-not (Test-AppComplete $staging)) {
             Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
             throw "$($Release.ZipName) has no bin\proctrack.exe."
         }
@@ -197,6 +234,18 @@ function Install-Release($Release, [hashtable]$Headers) {
         return $appDir
     }
     finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Write-MachineServiceInUse([string]$TaskName, [bool]$Answering) {
+    if ($Answering) { Write-Output "ProcessTracker's machine-wide service is running on this machine and the plugin uses it; no user-only copy is needed." }
+    else { Write-Output "ProcessTracker's machine-wide service is installed on this machine but not answering; the plugin uses it, so no user-only copy is needed. Ask an admin to start the ProcessTracker service." }
+    if (Test-UserTask $TaskName) {
+        Write-Output "Your user-only copy (scheduled task $TaskName) is no longer used; 'proctrack user uninstall' removes it."
+    }
+    # The plugin provides the MCP entry; a user-scope one from the MSI would list the same server twice.
+    $proctrack = Find-Proctrack
+    if ($proctrack) { Write-Output (Invoke-Native $proctrack @('mcp', 'unregister')).Output.TrimEnd() }
+    else { Write-Output "proctrack was not found; run 'proctrack mcp unregister' to remove a user-scope MCP entry that duplicates the plugin's." }
 }
 
 function Invoke-InstallUser {
@@ -208,14 +257,12 @@ function Invoke-InstallUser {
     $taskName = Get-UserTaskName
     $health = Get-Health
     if ($null -ne $health -and $health.mode -eq 'service') {
-        Write-Output "ProcessTracker's machine-wide service is running on this machine and the plugin uses it; no user-only copy is needed."
-        if (Test-UserTask $taskName) {
-            Write-Output "Your user-only copy (scheduled task $taskName) is no longer used; 'proctrack user uninstall' removes it."
-        }
-        # The plugin provides the MCP entry; a user-scope one from the MSI would list the same server twice.
-        $proctrack = Find-Proctrack
-        if ($proctrack) { Write-Output (Invoke-Native $proctrack @('mcp', 'unregister')).Output.TrimEnd() }
-        else { Write-Output "proctrack was not found; run 'proctrack mcp unregister' to remove a user-scope MCP entry that duplicates the plugin's." }
+        Write-MachineServiceInUse $taskName $true
+        $script:ExitCode = 0
+        return
+    }
+    if ($null -eq $health -and (Test-MachineService)) {
+        Write-MachineServiceInUse $taskName $false
         $script:ExitCode = 0
         return
     }
@@ -236,8 +283,25 @@ function Invoke-InstallUser {
         }
     }
 
-    Write-Output "Downloading ProcessTracker $($release.Version)..."
-    $appDir = Install-Release $release $headers
+    # Download only what isn't on disk yet: a complete app-<latest>, or (nothing answering) an installed copy that is not
+    # older than the latest release, is registered again instead, which also repairs a stopped install.
+    $taskAppDir = Get-TaskAppDir $taskName
+    $latestDir = Join-Path (Get-ProgramsDir) "app-$($release.Version)"
+    $installed = Get-InstalledApp
+    $created = $false
+    if (Test-AppComplete $latestDir) {
+        Write-Output "ProcessTracker $($release.Version) is already on disk; registering it."
+        $appDir = $latestDir
+    }
+    elseif ($null -eq $health -and $null -ne $installed -and -not ($release.Version -gt $installed.Version)) {
+        Write-Output "ProcessTracker $($installed.Version) is already on disk and the latest release is $($release.Version); registering it."
+        $appDir = $installed.Dir
+    }
+    else {
+        Write-Output "Downloading ProcessTracker $($release.Version)..."
+        $appDir = Install-Release $release $headers $taskAppDir
+        $created = $true
+    }
     $proctrack = Join-Path $appDir 'bin\proctrack.exe'
 
     $install = Invoke-Native $proctrack @('user', 'install', '--app-dir', $appDir)
@@ -245,6 +309,10 @@ function Invoke-InstallUser {
     $mcp = Invoke-Native $proctrack @('mcp', 'unregister')
     Write-Output $mcp.Output.TrimEnd()
     $script:ExitCode = $install.Code
+    if ($install.Code -ne 0 -and $created -and -not (Test-SamePath $appDir $taskAppDir)) {
+        Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Output "Removed $appDir again, since it was not installed."
+    }
 }
 
 # Dot-sourcing (tests/plugin.tests.ps1) only loads the functions.

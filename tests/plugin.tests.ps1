@@ -58,7 +58,7 @@ Invoke-Case 'hooks.json' {
     $preHook = @($pre[0].hooks)
     Check ($pre.Count -eq 1 -and $pre[0].matcher -eq 'Bash|PowerShell|Task|Agent') 'PreToolUse matcher is Bash|PowerShell|Task|Agent'
     Check ($preHook.Count -eq 1 -and $preHook[0].type -eq 'command' -and $preHook[0].command -eq 'cmd.exe') 'hooks.json PreToolUse runs cmd.exe (exec form)'
-    $expected = @('/d', '/s', '/c', 'curl.exe -s -f --connect-timeout 1 --max-time 2 --data-binary @- http://127.0.0.1:47811/api/hooks/pre-tool-use & exit /b 0')
+    $expected = @('/d', '/s', '/c', 'curl.exe -s -f --connect-timeout 0.25 --max-time 2 --data-binary @- http://127.0.0.1:47811/api/hooks/pre-tool-use & exit /b 0')
     Check ((@($preHook[0].args) -join "`n") -eq ($expected -join "`n")) 'PreToolUse runs curl.exe through cmd and always exits 0'
     Check ($preHook[0].timeout -eq 3) 'PreToolUse timeout 3'
 
@@ -114,7 +114,7 @@ Invoke-Case 'hook closed port' {
     Write-Output "     (closed port: $($r.Ms) ms)"
     Check ($r.Code -eq 0) 'PreToolUse hook against a closed port exits 0'
     Check ($r.Out -eq '' -and $r.Err -eq '') 'PreToolUse hook against a closed port prints nothing (stdout and stderr)'
-    Check ($r.Ms -lt 2500) 'PreToolUse hook against a closed port returns within the connect timeout'
+    Check ($r.Ms -lt 600) 'PreToolUse hook against a closed port returns within 600 ms (connect timeout 0.25 s)'
 }
 
 # Needs a dev build answering on 47812 (ProcessTracker.Service.exe --dev); skipped otherwise.
@@ -146,8 +146,17 @@ $installFakes = {
     function Get-Health { $null }
     function Test-UserTask([string]$Name) { $false }
     function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) [void]$script:calls.Add("extract $DestinationPath") }
-    function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:calls.Add("run $Exe $($Arguments -join ' ')"); @{ Code = 0; Output = 'fake output' } }
+    $script:installCode = 0
+    function Invoke-Native([string]$Exe, [string[]]$Arguments) {
+        [void]$script:calls.Add("run $Exe $($Arguments -join ' ')")
+        $code = 0
+        if ($Arguments[0] -eq 'user') { $code = $script:installCode }
+        @{ Code = $code; Output = 'fake output' }
+    }
     function Find-Proctrack { 'C:\fake\proctrack.exe' }
+    function Test-MachineService { $false }
+    $script:taskAppDir = $null
+    function Get-TaskAppDir([string]$Name) { $script:taskAppDir }
     $script:release = @{
         tag_name = 'v0.2.0'
         assets   = @(
@@ -261,6 +270,107 @@ Invoke-Case 'install follows allowlisted redirect' {
         $script:redirect = 'https://release-assets.githubusercontent.com/abc/ProcessTracker-0.2.0-x64.zip.bin?sig=1'
         try { Invoke-InstallUser | Out-Null } catch { }   # the fake extract leaves no proctrack.exe; only the hops matter
         Check (@($script:calls | Where-Object { $_ -like 'get https://release-assets.githubusercontent.com/*' }).Count -eq 1) 'redirect to release-assets.githubusercontent.com is followed'
+    }
+}
+
+# Creates %LOCALAPPDATA%\Programs\ProcessTracker\app-<v>, complete (with bin\proctrack.exe) or not, plus a marker file.
+function New-AppDir([string]$Version, [bool]$Complete) {
+    $dir = Join-Path $env:LOCALAPPDATA "Programs\ProcessTracker\app-$Version"
+    New-Item -ItemType Directory -Path (Join-Path $dir 'bin') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'marker.txt') -Value 'keep'
+    if ($Complete) { Set-Content -LiteralPath (Join-Path $dir 'bin\proctrack.exe') -Value 'x' }
+    return $dir
+}
+
+Invoke-Case 'install does not redownload when app-<latest> exists and health is down' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $dir = New-AppDir '0.2.0' $true
+        $script:taskAppDir = $dir
+        $script:ExitCode = $null
+        Invoke-InstallUser | Out-Null
+        $exe = Join-Path $dir 'bin\proctrack.exe'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' -or $_ -like 'get *SHA256SUMS*' -or $_ -like 'extract *' }).Count -eq 0) 'install does not redownload when app-<latest> exists and health is down'
+        Check ($script:calls -contains "run $exe user install --app-dir $dir") 'registers the existing app-<latest> again (repairs a stopped install)'
+        Check ((Test-Path -LiteralPath (Join-Path $dir 'marker.txt')) -and $script:ExitCode -eq 0) 'the existing folder is kept'
+    }
+}
+
+Invoke-Case 'install does not redownload an older release than the installed one' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $dir = New-AppDir '0.3.0' $true
+        Invoke-InstallUser | Out-Null
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' -or $_ -like 'extract *' }).Count -eq 0) 'health down, installed 0.3.0 > latest 0.2.0: no download'
+        Check ($script:calls -contains "run $(Join-Path $dir 'bin\proctrack.exe') user install --app-dir $dir") 'registers the installed app-0.3.0 again'
+    }
+}
+
+Invoke-Case 'install never deletes the folder the task points to' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $dir = New-AppDir '0.2.0' $false   # incomplete, and the task runs it
+        $script:taskAppDir = $dir
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true }
+        Check ($threw -and (Test-Path -LiteralPath (Join-Path $dir 'marker.txt'))) 'install never deletes the folder the task points to'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' -or $_ -like 'extract *' }).Count -eq 0) 'nothing downloaded into the task''s folder'
+    }
+}
+
+Invoke-Case 'install replaces an incomplete leftover and cleans up a failed install' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            [void]$script:calls.Add("extract $DestinationPath")
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $dir = New-AppDir '0.2.0' $false   # incomplete leftover, not the task's folder
+        $script:installCode = 1
+        $script:ExitCode = $null
+        Invoke-InstallUser | Out-Null
+        Check (@($script:calls | Where-Object { $_ -like 'extract *' }).Count -eq 1) 'an incomplete leftover app-<v> is downloaded again'
+        Check ($script:ExitCode -eq 1) 'exit code of a failed proctrack user install is kept'
+        Check (-not (Test-Path -LiteralPath $dir)) 'app-<v> extracted by this run is removed when user install fails'
+    }
+}
+
+Invoke-Case 'install keeps a failed task folder it extracted' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $script:taskAppDir = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'   # task points at a missing folder
+        $script:installCode = 1
+        Invoke-InstallUser | Out-Null
+        Check (Test-Path -LiteralPath $script:taskAppDir) 'a failed install never removes the folder the task points to'
+    }
+}
+
+Invoke-Case 'install with the machine service installed but stopped' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        function Test-MachineService { $true }
+        $out = Invoke-InstallUser | Out-String
+        Check ($out -match 'machine-wide service is installed') 'service installed, not answering: says the machine-wide service is in use'
+        Check (($script:calls -join '|') -eq 'run C:\fake\proctrack.exe mcp unregister') 'service installed, not answering: no download, only mcp unregister'
     }
 }
 
@@ -396,16 +506,37 @@ Invoke-Case 'session-start other status is silent' {
     Check ([string]::IsNullOrEmpty($out)) 'session-start prints nothing on other errors'
 }
 
-# The real script end to end: an empty hook input and nothing listening on the port (the dev box may run the real
-# service, so only the exit code and the absence of error text are checked here).
+# The real script end to end, pointed at a closed port and a task that doesn't exist through its environment seams, so
+# it neither reaches the real tracker on 47811 nor starts the developer's own task.
 Invoke-Case 'session-start process' {
     $exe = (Get-Process -Id $PID).Path
     $saved = $ErrorActionPreference
+    $savedEnv = @{ Url = $env:PROCTRACK_HOOK_URL_BASE; Task = $env:PROCTRACK_USER_TASK }
     $ErrorActionPreference = 'Continue'
-    try { $out = '{}' | & $exe -NoProfile -ExecutionPolicy Bypass -File $sessionScript 2>&1 | Out-String; $code = $LASTEXITCODE }
-    finally { $ErrorActionPreference = $saved }
+    try {
+        $env:PROCTRACK_HOOK_URL_BASE = 'http://127.0.0.1:1'
+        $env:PROCTRACK_USER_TASK = '\ProcessTracker\User-plugin-tests-no-such-task'
+        $out = '{"session_id":"plugin-tests"}' | & $exe -NoProfile -ExecutionPolicy Bypass -File $sessionScript 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $saved
+        $env:PROCTRACK_HOOK_URL_BASE = $savedEnv.Url; $env:PROCTRACK_USER_TASK = $savedEnv.Task
+    }
     Check ($code -eq 0) 'session-start.ps1 exits 0'
-    Check ($out -notmatch 'Exception|At line|CategoryInfo') 'session-start.ps1 prints no error text'
+    Check ($out.Trim() -eq 'ProcessTracker is not running. Offer the user /process-tracker:install once; it installs a user-only copy without admin rights.') 'session-start.ps1 prints only the install offer (no error text)'
+}
+
+Invoke-Case 'session-start seams default to production' {
+    $savedEnv = @{ Url = $env:PROCTRACK_HOOK_URL_BASE; Task = $env:PROCTRACK_USER_TASK }
+    try {
+        Remove-Item Env:PROCTRACK_HOOK_URL_BASE, Env:PROCTRACK_USER_TASK -ErrorAction SilentlyContinue
+        . $sessionScript
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        Check ($script:SessionStartUri -eq 'http://127.0.0.1:47811/api/hooks/session-start') 'session-start URL defaults to 127.0.0.1:47811'
+        Check ((Get-UserTaskName) -eq "\ProcessTracker\User-$sid") 'session-start task name defaults to \ProcessTracker\User-<SID>'
+    }
+    finally { $env:PROCTRACK_HOOK_URL_BASE = $savedEnv.Url; $env:PROCTRACK_USER_TASK = $savedEnv.Task }
 }
 
 if ($failures -gt 0) { Write-Output "$failures check(s) failed"; exit 1 }

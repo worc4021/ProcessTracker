@@ -14,10 +14,17 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$script:SessionStartUri = 'http://127.0.0.1:47811/api/hooks/session-start'
+# Test seams (tests/plugin.tests.ps1): PROCTRACK_HOOK_URL_BASE replaces http://127.0.0.1:47811 and PROCTRACK_USER_TASK the
+# task name. Unset in production.
+$script:UrlBase = 'http://127.0.0.1:47811'
+if ($env:PROCTRACK_HOOK_URL_BASE) { $script:UrlBase = $env:PROCTRACK_HOOK_URL_BASE.TrimEnd('/') }
+$script:SessionStartUri = "$($script:UrlBase)/api/hooks/session-start"
 $script:PluginJson = Join-Path (Split-Path -Parent $PSScriptRoot) '.claude-plugin\plugin.json'
 
-function Get-UserTaskName { "\ProcessTracker\User-$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)" }
+function Get-UserTaskName {
+    if ($env:PROCTRACK_USER_TASK) { return $env:PROCTRACK_USER_TASK }
+    return "\ProcessTracker\User-$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
+}
 
 function Invoke-Native {
     # Runs a native program and returns its exit code and combined output, with 'Continue' locally so a stderr line
