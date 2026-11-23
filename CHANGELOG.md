@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/worc4021/ProcessTracker/compare/v0.2.0...v0.3.0) (2026-11-23)
+
+
+### Features
+
+* Claude Code plugin with a no-admin, self-updating user-only install ([6c272a6](https://github.com/worc4021/ProcessTracker/commit/6c272a61d9a7a63777d1f259107377dc9ed1e809))
+
 ## [0.2.0](https://github.com/worc4021/ProcessTracker/compare/v0.1.0...v0.2.0) (2026-11-21)
 
 
