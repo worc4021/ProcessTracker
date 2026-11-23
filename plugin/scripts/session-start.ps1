@@ -4,9 +4,10 @@
 
 .DESCRIPTION
     Windows PowerShell 5.1 or pwsh, no dependencies. Always exits 0 and prints at most one of:
-      - when the process listening on 127.0.0.1:47811 runs as another Windows user (neither this user nor SYSTEM), that
-        the port is held by another user's process; nothing is posted then. When the owner can't be looked up at all
-        (no Get-NetTCPConnection, WMI unavailable), the script goes on as if the check had passed;
+      - when a process listening on port 47811 on 127.0.0.1, ::1, 0.0.0.0 or :: is not this user's and not the
+        ProcessTracker service's (or its owner can't be read within 3 s), that the port is held by another user's
+        process; nothing is posted then. When the listeners can't be listed at all (no Get-NetTCPConnection), the
+        script goes on as if the check had passed;
       - the body of POST http://127.0.0.1:47811/api/hooks/session-start (the hook input plus plugin_version);
       - on 403, that ProcessTracker belongs to another user;
       - when nothing answers and the machine-wide ProcessTracker service is installed (sc query), that it is installed
@@ -45,7 +46,6 @@ function Test-Ipv6Loopback([Uri]$Uri) {
 $script:UrlBase = Resolve-UrlBase $env:PROCTRACK_HOOK_URL_BASE
 $script:SessionStartUri = "$($script:UrlBase)/api/hooks/session-start"
 $script:PluginJson = Join-Path (Split-Path -Parent $PSScriptRoot) '.claude-plugin\plugin.json'
-$script:SystemSid = 'S-1-5-18'
 
 function Get-UserTaskName {
     $override = $env:PROCTRACK_USER_TASK
@@ -74,38 +74,44 @@ function Test-MachineService {
     (Invoke-Native 'sc.exe' @('query', 'ProcessTracker')).Code -eq 0
 }
 
-function Get-ListenerOwnerSid([string]$Address, [int]$Port) {
-    # Who runs the process listening on $Address:$Port:
-    #   - its owner's SID when it can be read (always so for this user's own processes);
-    #   - S-1-5-18 when it is the ProcessTracker machine service's process (a standard user may not read SYSTEM's SID);
-    #   - '' when the owner can't be read and it isn't that service: another account's process;
-    #   - $null when nothing listens or the lookup itself fails (no Get-NetTCPConnection, WMI unavailable).
-    try { $listen = @(Get-NetTCPConnection -LocalAddress $Address -LocalPort $Port -State Listen -ErrorAction Stop) }
-    catch { return $null }   # also what "nothing listens" looks like
-    if ($listen.Count -eq 0) { return $null }
-    $owningPid = [int]$listen[0].OwningProcess
+function Get-ListenerVerdict([int]$Port) {
+    # Who listens on $Port where our connections to 127.0.0.1 (or [::1]) could land: 127.0.0.1, ::1 and the wildcards
+    # 0.0.0.0 and ::, which receive loopback connections too. Returns
+    #   'none'    when nothing listens there;
+    #   'trusted' when every such listener runs as this user or is the ProcessTracker machine service's process (a
+    #             standard user may not read SYSTEM's SID, so the service is recognised by its PID);
+    #   'foreign' when any of them runs as another account, or its owner can't be read (access denied, or WMI did not
+    #             answer within 3 s): an impostor must not get the payload;
+    #   $null     when the listener query itself fails (no Get-NetTCPConnection): the caller goes on without the check.
+    try { $all = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) }
+    catch { return $null }
+    $reachable = @('127.0.0.1', '0.0.0.0', '::', '::1')
+    $pids = @($all | Where-Object { $reachable -contains [string]$_.LocalAddress } |
+        ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
+    if ($pids.Count -eq 0) { return 'none' }
+
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     try {
         # The service first: it is the common case on machines with the MSI, and the cheaper query (about 0.4 s).
-        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='ProcessTracker'" -ErrorAction Stop
-        if ($null -ne $service -and [int]$service.ProcessId -eq $owningPid) { return $script:SystemSid }
-        $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$owningPid" -ErrorAction Stop
-        if ($null -eq $process) { return $null }
-        $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
-        if ($owner.ReturnValue -eq 0 -and $owner.Sid) { return [string]$owner.Sid }
-        return ''
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='ProcessTracker'" -OperationTimeoutSec 3 -ErrorAction Stop
+        $servicePid = 0
+        if ($null -ne $service) { $servicePid = [int]$service.ProcessId }
+        foreach ($owningPid in $pids) {
+            if ($servicePid -ne 0 -and $owningPid -eq $servicePid) { continue }
+            $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$owningPid" -OperationTimeoutSec 3 -ErrorAction Stop
+            if ($null -eq $process) { return 'foreign' }   # gone or hidden: can't vouch for it
+            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -OperationTimeoutSec 3 -ErrorAction Stop
+            if (-not ($owner.ReturnValue -eq 0 -and [string]$owner.Sid -eq $me)) { return 'foreign' }
+        }
+        return 'trusted'
     }
-    catch { return $null }
+    catch { return 'foreign' }   # WMI failed or timed out on a listener that exists
 }
 
 function Test-ForeignListener {
-    # True when the tracker's port is held by a process of another Windows user (not this user, not SYSTEM).
-    $uri = [Uri]$script:UrlBase
-    $address = '127.0.0.1'
-    if (Test-Ipv6Loopback $uri) { $address = '::1' }
-    $sid = Get-ListenerOwnerSid $address $uri.Port
-    if ($null -eq $sid) { return $false }
-    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    return -not ($sid -eq $me -or $sid -eq $script:SystemSid)
+    # True when the tracker's port is held, on an address our loopback connection can reach, by a process that is not
+    # this user's and not the machine service's.
+    return (Get-ListenerVerdict ([Uri]$script:UrlBase).Port) -eq 'foreign'
 }
 
 function Get-PluginVersion {

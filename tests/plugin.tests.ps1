@@ -494,10 +494,10 @@ $sessionFakes = {
     $script:lookups = New-Object System.Collections.ArrayList
     $script:taskExists = $false
     $script:machineService = $false
-    $script:listenerSid = $null   # nothing listens / the lookup failed
+    $script:verdict = $null   # nothing listens / the listener lookup failed
     function Test-UserTask([string]$Name) { $script:taskExists }
     function Test-MachineService { $script:machineService }
-    function Get-ListenerOwnerSid([string]$Address, [int]$Port) { [void]$script:lookups.Add("${Address}:$Port"); $script:listenerSid }
+    function Get-ListenerVerdict([int]$Port) { [void]$script:lookups.Add("$Port"); $script:verdict }
     function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:runs.Add("$Exe $($Arguments -join ' ')"); @{ Code = 0; Output = '' } }
 }
 # A fake POST that records the call and answers 200 with an empty object.
@@ -593,77 +593,148 @@ Invoke-Case 'session-start other status is silent' {
     Check ([string]::IsNullOrEmpty($out)) 'session-start prints nothing on other errors'
 }
 
-Invoke-Case 'session-start refuses another user''s listener' {
+Invoke-Case 'session-start refuses a foreign verdict' {
     . $sessionScript
     . $sessionFakes
     . $postOk
-    $script:listenerSid = 'S-1-5-21-111-222-333-1001'
+    $script:verdict = 'foreign'
     $out = Invoke-SessionStart '{"session_id":"s1"}'
-    Check ($out -eq "ProcessTracker: port 47811 is held by another Windows user's process; not using it. Ask an admin to install the machine-wide service.") 'another user''s listener: prints the one line'
-    Check ($script:posts.Count -eq 0) 'another user''s listener: the payload is not posted'
-    Check ($script:lookups -contains '127.0.0.1:47811') 'the owner of 127.0.0.1:47811 is looked up'
+    Check ($out -eq "ProcessTracker: port 47811 is held by another Windows user's process; not using it. Ask an admin to install the machine-wide service.") 'foreign listener: prints the one line'
+    Check ($script:posts.Count -eq 0) 'foreign listener: the payload is not posted'
+    Check ($script:lookups -contains '47811') 'the listeners of port 47811 are looked up'
 }
 
-Invoke-Case 'session-start refuses a listener whose owner is unreadable' {
+Invoke-Case 'session-start posts on a trusted, absent or unknown verdict' {
     . $sessionScript
     . $sessionFakes
     . $postOk
-    $script:listenerSid = ''
-    $out = Invoke-SessionStart '{}'
-    Check ($out -match 'held by another Windows user' -and $script:posts.Count -eq 0) 'unreadable owner (not the machine service): not posted'
-}
-
-Invoke-Case 'session-start posts to its own, SYSTEM''s or an unknown listener' {
-    . $sessionScript
-    . $sessionFakes
-    . $postOk
-    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    foreach ($sid in @($me, 'S-1-5-18', $null)) {
+    foreach ($v in @('trusted', 'none', $null)) {
         $script:posts.Clear()
-        $script:listenerSid = $sid
+        $script:verdict = $v
         $out = Invoke-SessionStart '{}'
-        Check ($script:posts.Count -eq 1 -and $out -eq '{}') "listener owned by '$sid': posted and passed through"
+        Check ($script:posts.Count -eq 1 -and $out -eq '{}') "verdict '$v': posted and passed through"
     }
 }
 
-Invoke-Case 'listener owner lookup' {
-    . $sessionScript
-    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $script:tcp = @([pscustomobject]@{ OwningProcess = 4321 })
-    $script:tcpThrows = $false
-    $script:owner = [pscustomobject]@{ ReturnValue = 0; Sid = $me }
+# The real owner lookup over faked Get-NetTCPConnection / Get-CimInstance / Invoke-CimMethod. $script:listeners is what
+# the full-port query returns; $script:owners maps a PID to its GetOwnerSid answer (missing = access denied).
+$ownerFakes = {
+    $script:posts = New-Object System.Collections.ArrayList
+    $script:me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $script:listeners = @()
+    $script:owners = @{}
     $script:servicePid = 0
-    $script:cimThrows = $false
+    $script:tcpThrows = $false
+    $script:cimHangs = $false
+    $script:cimTimeouts = New-Object System.Collections.ArrayList
+    function Test-MachineService { $false }
+    function New-Listener([string]$Address, [int]$OwningPid) { [pscustomobject]@{ LocalAddress = $Address; LocalPort = 47811; OwningProcess = $OwningPid } }
     function Get-NetTCPConnection {
         param([string]$LocalAddress, [int]$LocalPort, [string]$State, $ErrorAction)
-        if ($script:tcpThrows) { throw 'No matching MSFT_NetTCPConnection objects found' }
-        $script:tcpArgs = "$LocalAddress $LocalPort $State"
-        $script:tcp
+        if ($script:tcpThrows) { throw 'The term Get-NetTCPConnection is not recognized' }
+        $script:tcpArgs = "[$LocalAddress] $LocalPort $State"
+        # Like the real cmdlet: an address filter hides listeners on other addresses (the wildcard-bind bypass).
+        @($script:listeners | Where-Object { -not $LocalAddress -or $_.LocalAddress -eq $LocalAddress })
     }
     function Get-CimInstance {
-        param([string]$ClassName, [string]$Filter, $ErrorAction)
-        if ($script:cimThrows) { throw 'WMI is unavailable' }
-        if ($ClassName -eq 'Win32_Process') { return [pscustomobject]@{ ProcessId = 4321; Filter = $Filter } }
-        if ($ClassName -eq 'Win32_Service' -and $script:servicePid) { return [pscustomobject]@{ ProcessId = $script:servicePid } }
+        param([string]$ClassName, [string]$Filter, [int]$OperationTimeoutSec, $ErrorAction)
+        [void]$script:cimTimeouts.Add($OperationTimeoutSec)
+        if ($script:cimHangs) { throw 'The WS-Management service cannot complete the operation within the time specified in OperationTimeout.' }
+        if ($ClassName -eq 'Win32_Service') { if ($script:servicePid) { return [pscustomobject]@{ ProcessId = $script:servicePid } } return $null }
+        if ($ClassName -eq 'Win32_Process' -and $Filter -match 'ProcessId=(\d+)') { return [pscustomobject]@{ ProcessId = [int]$Matches[1] } }
         return $null
     }
-    function Invoke-CimMethod { param($InputObject, [string]$MethodName, $ErrorAction) $script:owner }
+    function Invoke-CimMethod {
+        param($InputObject, [string]$MethodName, [int]$OperationTimeoutSec, $ErrorAction)
+        [void]$script:cimTimeouts.Add($OperationTimeoutSec)
+        $sid = $script:owners[[int]$InputObject.ProcessId]
+        if ($sid) { return [pscustomobject]@{ ReturnValue = 0; Sid = $sid } }
+        return [pscustomobject]@{ ReturnValue = 2; Sid = $null }   # access denied
+    }
+}
+$foreignLine = "ProcessTracker: port 47811 is held by another Windows user's process; not using it. Ask an admin to install the machine-wide service."
 
-    Check ((Get-ListenerOwnerSid '127.0.0.1' 47811) -eq $me -and $script:tcpArgs -eq '127.0.0.1 47811 Listen') 'readable owner: its SID'
-    $script:owner = [pscustomobject]@{ ReturnValue = 2; Sid = $null }
-    $script:servicePid = 4321
-    Check ((Get-ListenerOwnerSid '127.0.0.1' 47811) -eq 'S-1-5-18') 'unreadable owner that is the ProcessTracker service: SYSTEM'
-    $script:servicePid = 999
-    $r = Get-ListenerOwnerSid '127.0.0.1' 47811
-    Check ($null -ne $r -and $r -eq '') 'unreadable owner, not the service: empty (another account)'
-    $script:tcp = @()
-    Check ($null -eq (Get-ListenerOwnerSid '127.0.0.1' 47811)) 'nothing listens: null'
+Invoke-Case 'owner check: foreign listener on 0.0.0.0' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
+    $script:listeners = @(New-Listener '0.0.0.0' 900)   # access denied, not the service
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $foreignLine -and $script:posts.Count -eq 0) 'a foreign listener on 0.0.0.0 is refused, nothing posted'
+    Check ($script:tcpArgs -eq '[] 47811 Listen') 'the listener query has no address filter'
+}
+
+Invoke-Case 'owner check: foreign listener on ::' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
+    $script:listeners = @(New-Listener '::' 901)
+    $script:owners = @{ 901 = 'S-1-5-21-111-222-333-1001' }   # readable, another user
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $foreignLine -and $script:posts.Count -eq 0) 'a foreign listener on :: is refused, nothing posted'
+}
+
+Invoke-Case 'owner check: own listener on 127.0.0.1 only' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
+    $script:listeners = @(New-Listener '127.0.0.1' 902)
+    $script:owners = @{ 902 = $script:me }
+    $out = Invoke-SessionStart '{}'
+    Check ($script:posts.Count -eq 1 -and $out -eq '{}') 'this user''s listener on 127.0.0.1: posted'
+}
+
+Invoke-Case 'owner check: the service on 0.0.0.0' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
+    $script:listeners = @(New-Listener '0.0.0.0' 903)
+    $script:servicePid = 903
+    $out = Invoke-SessionStart '{}'
+    Check ($script:posts.Count -eq 1 -and $out -eq '{}') 'the ProcessTracker service''s PID on 0.0.0.0: posted'
+}
+
+Invoke-Case 'owner check: own on 127.0.0.1 plus a foreign wildcard' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
+    $script:listeners = @((New-Listener '127.0.0.1' 902), (New-Listener '::' 904))
+    $script:owners = @{ 902 = $script:me }
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $foreignLine -and $script:posts.Count -eq 0) 'any foreign listener among several: refused'
+}
+
+Invoke-Case 'owner check: listeners that cannot receive loopback connections are ignored' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
+    $script:listeners = @(New-Listener '192.168.1.5' 905)
+    $out = Invoke-SessionStart '{}'
+    Check ($script:posts.Count -eq 1) 'a listener on a LAN address only: not considered, posted'
+}
+
+Invoke-Case 'owner check: lookup failures' {
+    . $sessionScript
+    . $ownerFakes
+    . $postOk
     $script:tcpThrows = $true
-    Check ($null -eq (Get-ListenerOwnerSid '127.0.0.1' 47811)) 'Get-NetTCPConnection fails: null (fall back)'
+    Invoke-SessionStart '{}' | Out-Null
+    Check ($script:posts.Count -eq 1) 'the listener query fails (no cmdlet): falls back and posts'
     $script:tcpThrows = $false
-    $script:tcp = @([pscustomobject]@{ OwningProcess = 4321 })
-    $script:cimThrows = $true
-    Check ($null -eq (Get-ListenerOwnerSid '127.0.0.1' 47811)) 'WMI fails: null (fall back)'
+    $script:posts.Clear()
+    $script:listeners = @()
+    Invoke-SessionStart '{}' | Out-Null
+    Check ($script:posts.Count -eq 1) 'nothing listens on the port at all: posts'
+    $script:posts.Clear()
+    $script:listeners = @(New-Listener '127.0.0.1' 906)
+    $script:cimHangs = $true
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $foreignLine -and $script:posts.Count -eq 0) 'WMI times out on a listener''s owner: refused, nothing posted'
+    $script:cimHangs = $false
+    $script:cimTimeouts.Clear()
+    $script:owners = @{ 906 = $script:me }
+    Invoke-SessionStart '{}' | Out-Null
+    Check ($script:cimTimeouts.Count -gt 0 -and @($script:cimTimeouts | Where-Object { $_ -ne 3 }).Count -eq 0) 'every CIM call passes -OperationTimeoutSec 3'
 }
 
 Invoke-Case 'session-start with the machine service installed but stopped' {
