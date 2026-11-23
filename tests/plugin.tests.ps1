@@ -1,7 +1,7 @@
 # Checks for the Claude Code plugin (plugin/) and its marketplace (.claude-plugin/marketplace.json).
 # Run under Windows PowerShell 5.1 and pwsh, non-elevated:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\plugin.tests.ps1
-# Nothing here touches the network (except curl against 127.0.0.1:1), Task Scheduler or %LOCALAPPDATA%: the scripts are
+# Nothing here touches the network (except the hook against 127.0.0.1:1 and a dev build on 47812 if one runs), Task Scheduler or %LOCALAPPDATA%: the scripts are
 # dot-sourced, which loads only their functions, and every side effect is replaced by a recording fake.
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -57,9 +57,9 @@ Invoke-Case 'hooks.json' {
     $pre = @($hooks.PreToolUse)
     $preHook = @($pre[0].hooks)
     Check ($pre.Count -eq 1 -and $pre[0].matcher -eq 'Bash|PowerShell|Task|Agent') 'PreToolUse matcher is Bash|PowerShell|Task|Agent'
-    Check ($preHook.Count -eq 1 -and $preHook[0].type -eq 'command' -and $preHook[0].command -eq 'curl.exe') 'hooks.json PreToolUse uses curl.exe'
-    $expected = @('-s', '-f', '--connect-timeout', '1', '--max-time', '2', '-H', 'Content-Type: application/json', '--data-binary', '@-', 'http://127.0.0.1:47811/api/hooks/pre-tool-use')
-    Check ((@($preHook[0].args) -join "`n") -eq ($expected -join "`n")) 'PreToolUse curl args (exec form)'
+    Check ($preHook.Count -eq 1 -and $preHook[0].type -eq 'command' -and $preHook[0].command -eq 'cmd.exe') 'hooks.json PreToolUse runs cmd.exe (exec form)'
+    $expected = @('/d', '/s', '/c', 'curl.exe -s -f --connect-timeout 1 --max-time 2 --data-binary @- http://127.0.0.1:47811/api/hooks/pre-tool-use & exit /b 0')
+    Check ((@($preHook[0].args) -join "`n") -eq ($expected -join "`n")) 'PreToolUse runs curl.exe through cmd and always exits 0'
     Check ($preHook[0].timeout -eq 3) 'PreToolUse timeout 3'
 
     $start = @($hooks.SessionStart)
@@ -70,14 +70,62 @@ Invoke-Case 'hooks.json' {
     Check ($startHook[0].timeout -eq 10) 'SessionStart timeout 10'
 }
 
-Invoke-Case 'curl' {
-    $hooks = (Read-Json (Join-Path $pluginDir 'hooks\hooks.json')).hooks
-    $curlArgs = @(@(@($hooks.PreToolUse)[0].hooks)[0].args | ForEach-Object { $_ -replace '127\.0\.0\.1:47811', '127.0.0.1:1' })
-    $saved = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try { $out = '{"tool_name":"Bash"}' | & curl.exe @curlArgs 2>$null | Out-String; $code = $LASTEXITCODE }
-    finally { $ErrorActionPreference = $saved }
-    Check ($code -ne 0 -and $out.Trim() -eq '') 'curl against closed port is silent (non-zero exit, empty stdout)'
+# Runs the PreToolUse hook the way Claude Code spawns an exec-form hook: the command with each args element as one
+# argument (Windows quoting rules, as Node and .NET's ArgumentList apply them), the payload on stdin. 47811 in the args is
+# replaced by $Port. Returns @{ Code; Out; Err; Ms }.
+function ConvertTo-CommandLineArgument([string]$Arg) {
+    # The MSVC/CommandLineToArgvW quoting that .NET's ArgumentList and Node use; for Windows PowerShell 5.1, whose
+    # ProcessStartInfo has no ArgumentList.
+    if ($Arg -ne '' -and $Arg -notmatch '[\s"]') { return $Arg }
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.Append('"')
+    $slashes = 0
+    foreach ($c in $Arg.ToCharArray()) {
+        if ($c -eq '\') { $slashes++; continue }
+        if ($c -eq '"') { [void]$sb.Append('\' * ($slashes * 2 + 1)) } elseif ($slashes) { [void]$sb.Append('\' * $slashes) }
+        $slashes = 0
+        [void]$sb.Append($c)
+    }
+    [void]$sb.Append('\' * ($slashes * 2)).Append('"')
+    return $sb.ToString()
+}
+function Invoke-PreToolUseHook([string]$Port, [string]$Payload) {
+    $hook = @(@((Read-Json (Join-Path $pluginDir 'hooks\hooks.json')).hooks.PreToolUse)[0].hooks)[0]
+    $hookArgs = @($hook.args | ForEach-Object { $_ -replace '127\.0\.0\.1:47811', "127.0.0.1:$Port" })
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $hook.command
+    if ($null -ne $psi.PSObject.Properties['ArgumentList']) { foreach ($a in $hookArgs) { $psi.ArgumentList.Add($a) } }
+    else { $psi.Arguments = (@($hookArgs | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join ' ') }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $p = [Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync()
+    $p.StandardInput.Write($Payload); $p.StandardInput.Close()
+    if (-not $p.WaitForExit(10000)) { $p.Kill(); throw 'the hook did not finish within 10 s' }
+    $watch.Stop()
+    return @{ Code = $p.ExitCode; Out = $out.Result; Err = $err.Result; Ms = $watch.ElapsedMilliseconds }
+}
+$heavyPayload = '{"session_id":"plugin-tests","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"dotnet build -m"},"cwd":"C:\repo"}'
+
+Invoke-Case 'hook closed port' {
+    $r = Invoke-PreToolUseHook '1' $heavyPayload
+    Write-Output "     (closed port: $($r.Ms) ms)"
+    Check ($r.Code -eq 0) 'PreToolUse hook against a closed port exits 0'
+    Check ($r.Out -eq '' -and $r.Err -eq '') 'PreToolUse hook against a closed port prints nothing (stdout and stderr)'
+    Check ($r.Ms -lt 2500) 'PreToolUse hook against a closed port returns within the connect timeout'
+}
+
+# Needs a dev build answering on 47812 (ProcessTracker.Service.exe --dev); skipped otherwise.
+Invoke-Case 'hook responder' {
+    $dev = $null
+    try { $dev = Invoke-RestMethod -Uri 'http://127.0.0.1:47812/api/health' -UseBasicParsing -TimeoutSec 1 } catch { }
+    if ($null -eq $dev -or $dev.mode -ne 'dev') { Write-Output 'skip PreToolUse hook against a responder (no dev build on 47812)'; return }
+    $r = Invoke-PreToolUseHook '47812' $heavyPayload
+    $json = $null
+    try { $json = $r.Out | ConvertFrom-Json } catch { }
+    Check ($r.Code -eq 0 -and $r.Out.Trim().StartsWith('{') -and $null -ne $json -and $r.Err -eq '') 'PreToolUse hook passes the JSON answer through'
 }
 
 Invoke-Case 'commands' {
@@ -99,6 +147,7 @@ $installFakes = {
     function Test-UserTask([string]$Name) { $false }
     function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) [void]$script:calls.Add("extract $DestinationPath") }
     function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:calls.Add("run $Exe $($Arguments -join ' ')"); @{ Code = 0; Output = 'fake output' } }
+    function Find-Proctrack { 'C:\fake\proctrack.exe' }
     $script:release = @{
         tag_name = 'v0.2.0'
         assets   = @(
@@ -223,7 +272,18 @@ Invoke-Case 'install defers to the machine service' {
     $out = Invoke-InstallUser | Out-String
     Check ($out -match 'machine-wide service') 'service mode: says the machine-wide service is in use'
     Check ($out -match 'proctrack user uninstall') 'service mode with a user task: points at proctrack user uninstall'
-    Check (@($script:calls | Where-Object { $_ -like 'get *' -or $_ -like 'run *' }).Count -eq 0) 'service mode: no download, nothing run'
+    Check (@($script:calls | Where-Object { $_ -like 'get *' }).Count -eq 0) 'service mode: no download'
+    Check (($script:calls -join '|') -eq 'run C:\fake\proctrack.exe mcp unregister') 'service mode: runs only proctrack mcp unregister'
+}
+
+Invoke-Case 'install defers to the machine service without proctrack' {
+    . $installScript
+    . $installFakes
+    function Get-Health { [pscustomobject]@{ version = '0.2.0'; mode = 'service' } }
+    function Find-Proctrack { $null }
+    $out = Invoke-InstallUser | Out-String
+    Check ($out -match 'proctrack mcp unregister') 'service mode, proctrack not found: hint to run proctrack mcp unregister'
+    Check ($script:calls.Count -eq 0) 'service mode, proctrack not found: nothing run'
 }
 
 Invoke-Case 'install skips a current user-mode copy' {

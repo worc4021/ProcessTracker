@@ -18,8 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "curl.exe",
-            "args": ["-s", "-f", "--connect-timeout", "1", "--max-time", "2", "-H", "Content-Type: application/json", "--data-binary", "@-", "http://127.0.0.1:47811/api/hooks/pre-tool-use"],
+            "command": "cmd.exe",
+            "args": ["/d", "/s", "/c", "curl.exe -s -f --connect-timeout 1 --max-time 2 --data-binary @- http://127.0.0.1:47811/api/hooks/pre-tool-use & exit /b 0"],
             "timeout": 3
           }
         ]
