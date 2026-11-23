@@ -15,6 +15,8 @@ public sealed class UserInstallTests : IDisposable
     private readonly StringWriter _out = new(), _err = new();
     private string TaskXml = "";
     private int _signals;
+    private int _stops;
+    private bool _stopSucceeds = true;
 
     public UserInstallTests() => Directory.CreateDirectory(_root);
     public void Dispose() => Directory.Delete(_root, recursive: true);
@@ -30,10 +32,11 @@ public sealed class UserInstallTests : IDisposable
         return dir;
     }
 
-    private static HealthDto Health(string mode, string owner = Me) => new("1.0.0", DateTime.UtcNow, null, null, mode, mode == "user" ? owner : null);
+    private static HealthDto Health(string mode, string owner = Me, string version = "1.0.0") =>
+        new(version, DateTime.UtcNow, null, null, mode, mode == "user" ? owner : null);
 
     private UserInstall Make(bool elevated = false, bool machineService = false, Func<HealthDto?>? health = null,
-        string? localAppData = null, bool runningFromInside = false)
+        string? localAppData = null, bool runningFromInside = false, TimeSpan? startRetry = null)
     {
         var task = new UserTask((exe, args, _) =>
         {
@@ -52,16 +55,23 @@ public sealed class UserInstallTests : IDisposable
             ProcessId = 4242,
             Health = _ => Task.FromResult(health?.Invoke()),
             SignalExit = () => { _signals++; return true; },
+            StopInstance = _ => { _stops++; return _stopSucceeds; },
+            AppVersion = FolderVersion,
             LocalAppData = localAppData ?? _root,
             HealthTimeout = TimeSpan.FromMilliseconds(100),
             StopTimeout = TimeSpan.FromMilliseconds(100),
             PollInterval = TimeSpan.FromMilliseconds(10),
+            StartRetryInterval = startRetry ?? TimeSpan.FromSeconds(5),
             Out = _out,
             Err = _err,
         });
     }
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
+    /// <summary>The version an app folder holds, from its app-X.Y.Z name (the fake exe has no version resource).</summary>
+    private static Version? FolderVersion(string dir) =>
+        Path.GetFileName(dir) is { } name && name.StartsWith("app-", StringComparison.Ordinal) && Version.TryParse(name[4..], out var v) ? v : null;
 
     [Fact]
     public async Task UserInstall_Elevated_Refuses()
@@ -105,12 +115,80 @@ public sealed class UserInstallTests : IDisposable
     }
 
     [Fact]
-    public async Task Install_OwnInstanceAlreadyRunning_DoesNotRunTask()
+    public async Task Install_SameVersionAlreadyRunning_DoesNotRestart()
     {
-        var code = await Make(health: () => Health("user", owner: @"pc\ME")).InstallAsync(AppDir(), Ct);
+        var code = await Make(health: () => Health("user", owner: @"pc\ME", version: "1.0.0")).InstallAsync(AppDir(), Ct);
 
         Assert.Equal(0, code);
+        Assert.Equal(0, _stops);
         Assert.DoesNotContain(_schtasks, c => c.StartsWith("/Run"));
+    }
+
+    [Fact]
+    public async Task Install_OlderVersionRunning_RestartsAndWaitsForNewVersion()
+    {
+        // 0.9.0 answers until it is stopped; then nothing for a few polls; then the task's new 1.0.0.
+        var stoppedAtPoll = -1;
+        var polls = 0;
+        HealthDto? Answer()
+        {
+            polls++;
+            if (_stops == 0) return Health("user", version: "0.9.0");
+            if (stoppedAtPoll < 0) stoppedAtPoll = polls;
+            return polls - stoppedAtPoll < 3 ? null : Health("user", version: "1.0.0-dev.202611231200");
+        }
+
+        var code = await Make(health: Answer).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(0, code);
+        Assert.Equal(1, _stops);
+        Assert.Contains(_schtasks, c => c.StartsWith("/Run"));
+        Assert.True(polls - stoppedAtPoll >= 3, "returned before the new version answered");
+        Assert.Contains("0.9.0", _out.ToString());
+        Assert.Contains("1.0.0", _out.ToString());
+    }
+
+    [Fact]
+    public async Task Install_SameVersionFromAnotherFolderRunning_Restarts()
+    {
+        TaskXml = UserTask.BuildXml(Path.Combine(Programs, "elsewhere", "app-1.0.0"), Sid);
+        var code = await Make(health: () => Health("user", version: "1.0.0")).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(0, code);
+        Assert.Equal(1, _stops);
+        Assert.Contains(_schtasks, c => c.StartsWith("/Run"));
+    }
+
+    [Fact]
+    public async Task Install_NothingAnswersAfterStart_StartsTaskAgain()
+    {
+        var polls = 0;
+        var code = await Make(health: () => ++polls < 8 ? null : Health("user"), startRetry: TimeSpan.FromMilliseconds(25))
+            .InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(0, code);
+        Assert.True(_schtasks.Count(c => c.StartsWith("/Run")) >= 2, string.Join(" | ", _schtasks));
+    }
+
+    [Fact]
+    public async Task Install_OlderVersionKeepsAnswering_FailsAfterTimeout()
+    {
+        var code = await Make(health: () => Health("user", version: "0.9.0")).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Contains("1.0.0", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_OldVersionDoesNotStop_RefusesWithoutRunningTask()
+    {
+        _stopSucceeds = false;
+        var code = await Make(health: () => Health("user", version: "0.9.0")).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.Equal(1, _stops);
+        Assert.DoesNotContain(_schtasks, c => c.StartsWith("/Run"));
+        Assert.Contains("did not stop", _err.ToString());
     }
 
     [Fact]

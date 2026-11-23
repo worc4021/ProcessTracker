@@ -56,6 +56,8 @@ public static class UserCommand
             catch (Exception e) when (e is ServiceUnreachableException or ApiException) { return null; }
         },
         SignalExit = () => UserModeSignal.TrySignal(),
+        // Proctrack briefly takes the instance mutex to see it free (as the MSI's stop does); the service is not running.
+        StopInstance = timeout => new StopUserInstances(timeout: timeout).Run().Ok,
         LocalAppData = UserInstallEnvironment.DefaultLocalAppData(),
     });
 

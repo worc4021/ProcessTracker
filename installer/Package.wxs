@@ -89,7 +89,7 @@
                   Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- A user-mode ProcessTracker holds the single-instance mutex the service needs: ask it to exit first. Exit 1 (it
-         did not stop within 10 s) fails the install rather than leaving a service that cannot start.
+         did not stop within 30 s) fails the install rather than leaving a service that cannot start.
          Only when the Service component is being installed ($Service=3): only then does StopServices stop the machine
          service (ServiceControl acts on its component's action). In a maintenance re-run of the installed MSI no
          component has an action, the running service keeps holding the mutex, and stop-user-instances would time out

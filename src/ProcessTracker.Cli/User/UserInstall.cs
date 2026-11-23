@@ -22,12 +22,22 @@ public sealed class UserInstallEnvironment
     /// <summary>The health answer of the production port; null when nothing answers.</summary>
     public required Func<CancellationToken, Task<HealthDto?>> Health { get; init; }
     public required Func<bool> SignalExit { get; init; }
+    /// <summary>
+    /// Sets the exit event and waits up to the given time for the single-instance mutex to be free; false when it is
+    /// still held. Used to restart an older (or relocated) copy of this user's instance.
+    /// </summary>
+    public required Func<TimeSpan, bool> StopInstance { get; init; }
+    /// <summary>The X.Y.Z an app folder holds; null when unknown. Defaults to <see cref="DefaultAppVersion"/>.</summary>
+    public Func<string, Version?> AppVersion { get; init; } = DefaultAppVersion;
     /// <summary>%LOCALAPPDATA%; the only root anything is deleted under.</summary>
     public required string LocalAppData { get; init; }
     public int ProcessId { get; init; } = Environment.ProcessId;
     public TimeSpan HealthTimeout { get; init; } = TimeSpan.FromSeconds(30);
-    public TimeSpan StopTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    /// <summary>How long a stop waits for the instance: beyond user mode's own 15 s shutdown plus the final flush.</summary>
+    public TimeSpan StopTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(500);
+    /// <summary>While nothing answers after a start, the task is started again this often.</summary>
+    public TimeSpan StartRetryInterval { get; init; } = TimeSpan.FromSeconds(5);
     public TextWriter Out { get; init; } = Console.Out;
     public TextWriter Err { get; init; } = Console.Error;
 
@@ -35,6 +45,24 @@ public sealed class UserInstallEnvironment
     public string DataDir => Path.Combine(LocalAppData, "ProcessTracker");
 
     public static string DefaultLocalAppData() => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+    /// <summary>
+    /// The numeric X.Y.Z of <paramref name="appDir"/>'s service exe (its product version, the informational version),
+    /// else of the folder name <c>app-X.Y.Z</c>; null when neither gives one.
+    /// </summary>
+    public static Version? DefaultAppVersion(string appDir)
+    {
+        try
+        {
+            var exe = Path.Combine(appDir, UserTask.ServiceExeName);
+            if (File.Exists(exe) && FileVersionInfo.GetVersionInfo(exe).ProductVersion is { } product
+                && Admin.FetchRelease.NumericVersion(product) is { } fromExe)
+                return fromExe;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException) { }
+        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(appDir));
+        return name.StartsWith("app-", StringComparison.OrdinalIgnoreCase) ? Admin.FetchRelease.NumericVersion(name[4..]) : null;
+    }
 
     public static bool DefaultRunningFrom(string dir) =>
         Environment.ProcessPath is { } exe
@@ -62,7 +90,8 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine("The machine-wide ProcessTracker service is installed; it serves every user, so user mode is not needed. Nothing was changed.");
             return Refused;
         }
-        if (await RunningAsync(ct) == Running.Other)
+        var before = await env.Health(ct);
+        if (Classify(before) == Running.Other)
         {
             env.Err.WriteLine(OtherUser);
             return Refused;
@@ -74,20 +103,52 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine($"{exe} not found. Nothing was changed.");
             return Refused;
         }
+        var target = env.AppVersion(appDir);
+
+        // This user's instance already runs: keep it when it is this version from this folder; otherwise it is an older
+        // (or relocated) copy that re-registering alone would leave running, so it is restarted below.
+        var restart = false;
+        if (Classify(before) == Running.Mine)
+        {
+            var runningVersion = FetchReleaseVersion(before!.Version);
+            var previousAppDir = env.Task.RegisteredAppDir();
+            restart = (target is not null && runningVersion != target)
+                      || (previousAppDir is not null && !SamePath(previousAppDir, appDir));
+        }
 
         if (env.Task.Register(appDir) != 0) return Refused;
         env.Out.WriteLine($"Registered {env.Task.TaskName}.");
 
+        if (restart)
+        {
+            env.Out.WriteLine($"Restarting ProcessTracker {before!.Version} to run {Describe(target)} from {appDir}...");
+            if (!env.StopInstance(env.StopTimeout))
+            {
+                env.Err.WriteLine($"The running ProcessTracker {before.Version} did not stop within {env.StopTimeout.TotalSeconds:0} s; "
+                                  + "the new version starts at your next logon.");
+                return Refused;
+            }
+        }
+
         // Task Scheduler starts it, as at logon: no handles inherited from this console, outside this process's job.
-        if (await RunningAsync(ct) != Running.Mine && env.Task.Start() != 0) return Refused;
+        if ((restart || Classify(await env.Health(ct)) != Running.Mine) && env.Task.Start() != 0) return Refused;
 
         var clock = Stopwatch.StartNew();
+        var lastStart = Stopwatch.StartNew();
         while (true)
         {
-            var running = await RunningAsync(ct);
-            if (running == Running.Mine)
+            var health = await env.Health(ct);
+            var running = Classify(health);
+            if (running == Running.None && lastStart.Elapsed >= env.StartRetryInterval)
             {
-                env.Out.WriteLine("ProcessTracker user mode is running.");
+                // The task ignores /Run while it counts an instance as running (MultipleInstancesPolicy IgnoreNew); a
+                // stopped instance may still be exiting when the first /Run came, so ask again while nothing answers.
+                env.Task.Start();
+                lastStart.Restart();
+            }
+            if (running == Running.Mine && (target is null || FetchReleaseVersion(health!.Version) == target))
+            {
+                env.Out.WriteLine($"ProcessTracker {health!.Version} user mode is running.");
                 return Ok;
             }
             if (running == Running.Other)
@@ -98,9 +159,17 @@ public sealed class UserInstall(UserInstallEnvironment env)
             if (clock.Elapsed >= env.HealthTimeout) break;
             await Task.Delay(env.PollInterval, ct);
         }
-        env.Err.WriteLine($"The task is registered, but ProcessTracker did not report mode=user within {env.HealthTimeout.TotalSeconds:0} s.");
+        env.Err.WriteLine($"The task is registered, but ProcessTracker {Describe(target)} did not report mode=user within {env.HealthTimeout.TotalSeconds:0} s.");
         return Refused;
     }
+
+    private static Version? FetchReleaseVersion(string informational) => Admin.FetchRelease.NumericVersion(informational);
+
+    private static string Describe(Version? version) => version?.ToString(3) ?? "(version unknown)";
+
+    private static bool SamePath(string a, string b) =>
+        string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(a)), Path.TrimEndingDirectorySeparator(Path.GetFullPath(b)),
+            StringComparison.OrdinalIgnoreCase);
 
     public async Task<int> UninstallAsync(bool purgeData, CancellationToken ct = default)
     {
@@ -153,9 +222,10 @@ public sealed class UserInstall(UserInstallEnvironment env)
     public static string CleanupExe => Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
 
     /// <summary>Whether a user-mode instance answers on the port, and whether it is this user's.</summary>
-    private async Task<Running> RunningAsync(CancellationToken ct)
+    private async Task<Running> RunningAsync(CancellationToken ct) => Classify(await env.Health(ct));
+
+    private Running Classify(HealthDto? health)
     {
-        var health = await env.Health(ct);
         if (health is not { Mode: "user" }) return Running.None;
         return string.Equals(health.Owner, env.CurrentUser(), StringComparison.OrdinalIgnoreCase) ? Running.Mine : Running.Other;
     }

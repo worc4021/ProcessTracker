@@ -43,7 +43,7 @@ public static class AdminCommand
         removeTask.SetAction(_ => RunTask(t => t.Remove(), "removed"));
 
         var stopUserInstances = new Command("stop-user-instances",
-            "Ask running user-mode instances to exit and wait up to 10 s for them (exit 1 on timeout).");
+            "Ask running user-mode instances to exit and wait up to 30 s for them (exit 1 on timeout).");
         stopUserInstances.SetAction(_ => Report(new StopUserInstances().Run()));
 
         var asset = new Option<string>("--asset") { Description = "Release asset to fetch.", Required = true };

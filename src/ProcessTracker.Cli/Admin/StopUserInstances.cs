@@ -15,7 +15,8 @@ public sealed class StopUserInstances(
     string mutexName = UserModeSignal.InstanceMutexName,
     TimeSpan? timeout = null)
 {
-    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>Beyond user mode's own 15 s host shutdown plus its final flush, so a busy instance is not given up on early.</summary>
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(100);
     private readonly TimeSpan _timeout = timeout ?? DefaultTimeout;
 
