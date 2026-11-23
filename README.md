@@ -224,8 +224,16 @@ only to GitHub's release asset host, the hash is checked before anything is unpa
 strictly newer version, so there is no downgrade.
 
 If you maintain the repository, enable two-factor authentication on the account, protect `main` with branch
-protection, and keep the release workflow's permissions minimal. When code signing is switched on (see
-[Releasing](#releasing)), both updaters will additionally require a valid signature, and the hash-only path goes away.
+protection, and keep the release workflow's permissions minimal. No updater checks a signature today. Before code
+signing is switched on (see [Releasing](#releasing)), the updaters will be changed to require a valid signature, so that
+the hash-only path goes away; that change is planned, not done.
+
+**Machines shared with other Windows users.** The user-only copy listens on `127.0.0.1:47811` only while it runs. While
+it is not running (before you log on, after it stopped or crashed), another local user can start a program of their own
+on that port and pose as ProcessTracker: it would then receive the command lines your hooks send and could put text
+into your Claude Code sessions. The plugin's SessionStart hook checks who owns the listening process and refuses
+another user's, but the PreToolUse hook and the MCP connection do not. On a machine that other people log on to, ask
+an admin to install the machine-wide MSI instead: the service holds the port from boot, so nobody else can take it.
 
 ## Ports, data and settings
 
@@ -360,8 +368,14 @@ tracker is not running; SessionStart tells the agent what is going on.
 
 - **SessionStart** adds a short paragraph to the session: the mode, the pressure and suggested parallelism, the top
   sessions by memory, how long ago you last used the machine, and a one-line rule. If the tracker is older than the plugin,
-  it says an update is due. When the tracker does not answer:
+  it says an update is due: a user-only copy updates itself daily or with `/process-tracker:install` (which restarts a
+  running older copy on the new version), the machine-wide service updates itself daily (winget or GitHub); a
+  development build gets no such line. Before it sends anything, it checks who runs the process on port 47811: another
+  Windows user's process (neither you nor SYSTEM) gets nothing, and the session is told so. When the tracker does not
+  answer:
   - no tracker and no install: it tells the agent to offer `/process-tracker:install` once;
+  - the machine-wide service is installed but stopped: it says to ask an admin to start it (a leftover user-only copy is
+    not started, since it would exit while the service is installed);
   - a user-only install exists but is not running: it starts it and says so;
   - the tracker belongs to another Windows user (the 403 case): it says so and points to the machine-wide service.
 - **PreToolUse** runs before `Bash`, `PowerShell`, `Task` and `Agent` calls. The service decides whether the command is

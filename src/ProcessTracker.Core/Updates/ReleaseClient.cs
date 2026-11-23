@@ -8,7 +8,8 @@ namespace ProcessTracker.Core.Updates;
 /// <summary>
 /// Reads the latest ProcessTracker GitHub release and downloads its assets with hash verification.
 /// This is the security gate for unattended installs: <see cref="DownloadVerifiedAsync"/> is the single place
-/// where verification happens (a signature check will be added there once releases are signed).
+/// where verification happens. Today that is the SHA-256 check only: no signature is verified. Before code signing is
+/// switched on, this method is to be changed to also require a valid signature (planned, not implemented).
 /// </summary>
 /// <remarks>
 /// The caller supplies the handler and it MUST NOT follow redirects itself (<c>AllowAutoRedirect = false</c>);
