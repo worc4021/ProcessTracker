@@ -6,18 +6,22 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Logging.EventLog;
 using Microsoft.Extensions.Primitives;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Core.Updates;
 using ProcessTracker.Native;
 using ProcessTracker.Service;
 using ProcessTracker.Service.Api;
 using ProcessTracker.Service.Logging;
 using ProcessTracker.Service.Mcp;
+using ProcessTracker.Service.Updates;
 
 // Flags: --console (run as a console app instead of a Windows service), --dev (port 47812, dev data dir, no
 // single-instance mutex) and --user (run as the logged-in user, with data, settings and a log file in
 // %LOCALAPPDATA%\ProcessTracker). They are also accepted as configuration keys Console/Dev/User, e.g. "--Dev=true".
-// With --user, --takeover <previousAppDir> asks the running user-mode instance to exit and waits up to 30 s for it.
+// With --user, --takeover <previousAppDir> asks the running user-mode instance to exit and waits up to 30 s for it;
+// if this version then completes no collector tick within 60 s, it starts the previous one again (Updates/Takeover).
 // Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running (or holds the exit event),
-// 3 the server ended up listening on a non-loopback address, 4 user mode refused: the machine service is installed.
+// 3 the server ended up listening on a non-loopback address, 4 user mode refused: the machine service is installed,
+// 5 a --takeover start did not become healthy and started the previous version again.
 var commandLine = new ConfigurationBuilder().AddCommandLine(RunModes.NormalizeFlags(args)).Build();
 
 // The exe is a GUI-subsystem app (no window at logon in user mode); --console gets a console before anything logs.
@@ -84,6 +88,7 @@ if (instanceChecks && runMode == RunMode.User && ServiceProbe.IsMachineServiceIn
 // --takeover <previousAppDir> (user mode): a newer version replacing a running one asks it to exit through the exit
 // event, then waits for it to release the mutex.
 var takeover = runMode == RunMode.User && !string.IsNullOrEmpty(commandLine["Takeover"]);
+var previousAppDir = takeover ? AppFolders.Normalize(commandLine["Takeover"]!) : null;
 if (instanceChecks && takeover)
 {
     try { UserModeSignal.TrySignal(); }
@@ -97,12 +102,44 @@ if (instanceChecks && mutex is null)
     return 2;
 }
 
+// User mode's log file. The host disposes it on shutdown; a takeover's rollback still logs after that (it reopens).
+var fileLog = runMode == RunMode.User ? new FileLoggerProvider(logDir) : null;
+
+// A --takeover start: Takeover decides once the collector ticks, or no tick comes, or the host fails. Rolling back
+// needs this instance gone first (host stopped, mutex released on this thread), hence the hand-offs below.
+Task<int>? takeoverRun = null;
+ITrackerHost? takeoverTracker = null;
+Action? stopHost = null;
+var exitRequested = false;
+var hostEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var instanceReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+int exitCode;
 try
 {
     // User mode: the exit event the MSI (before starting the machine service) or a newer version sets to stop this
     // instance gracefully. Created only once the mutex is ours, so a stale signal for the previous instance is reset.
     using var exitEvent = instanceChecks && runMode == RunMode.User ? CreateExitEvent() : null;
     if (instanceChecks && runMode == RunMode.User && exitEvent is null) return 2;
+
+    if (instanceChecks && previousAppDir is not null)
+    {
+        takeoverRun = Takeover.RunAsync(previousAppDir,
+            () => Takeover.FirstTickAsync(() => Volatile.Read(ref takeoverTracker), hostEnded.Task, Takeover.HealthyWithin,
+                TimeProvider.System),
+            new TakeoverEnvironment
+            {
+                NewAppDir = AppFolders.Normalize(AppContext.BaseDirectory),
+                Task = new UserTask(ProcessRunner.Run),
+                Starter = new DetachedProcessStarter(),
+                ReleaseInstance = () =>
+                {
+                    Volatile.Read(ref stopHost)?.Invoke();
+                    return instanceReleased.Task;
+                },
+                ExitRequested = () => Volatile.Read(ref exitRequested),
+                Log = fileLog!.CreateLogger("ProcessTracker.Takeover"),
+            });
+    }
 
     if (runMode == RunMode.User)
     {
@@ -111,7 +148,7 @@ try
         // stays at Warning. Registered through a factory so the host disposes it (closing the file) on shutdown.
         builder.Logging.ClearProviders();
         if (asConsole) builder.Logging.AddConsole();
-        builder.Services.AddSingleton<ILoggerProvider>(_ => new FileLoggerProvider(logDir));
+        builder.Services.AddSingleton<ILoggerProvider>(_ => fileLog!);
         builder.Logging.AddFilter<FileLoggerProvider>(null, LogLevel.Information);
         builder.Logging.AddFilter<FileLoggerProvider>("Microsoft.AspNetCore", LogLevel.Warning);
         builder.Logging.AddFilter<FileLoggerProvider>("ModelContextProtocol", LogLevel.Warning);
@@ -158,8 +195,15 @@ try
         builder.Services.AddHostedService(sp => new UserModeExitWatcher(exitEvent,
             sp.GetRequiredService<IHostApplicationLifetime>(), sp.GetRequiredService<ILogger<UserModeExitWatcher>>()));
     }
+    if (instanceChecks && runMode == RunMode.User) AddSelfUpdate(builder.Services);
 
     var app = builder.Build();
+    Volatile.Write(ref takeoverTracker, app.Services.GetRequiredService<ITrackerHost>());
+    Volatile.Write(ref stopHost, () =>
+    {
+        try { app.Lifetime.StopApplication(); }
+        catch (ObjectDisposedException) { } // the host has already gone
+    });
     if (ServiceOptions.HasIgnoredPort(config, commandLine))
         app.Logger.LogWarning("Port in appsettings.json is ignored; listening on {Port} (only --Port on the command line changes it)",
             options.Port);
@@ -215,11 +259,47 @@ try
 
     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
     app.Run(); // synchronous, so the mutex is released on the thread that acquired it
-    return exposed ? 3 : 0;
+    Volatile.Write(ref exitRequested, exitEvent?.WaitOne(0) == true);
+    exitCode = exposed ? 3 : 0;
+}
+catch (Exception e) when (takeoverRun is { IsCompleted: false })
+{
+    // The new version's host failed before its first tick: Takeover starts the previous one once the mutex is free.
+    fileLog!.CreateLogger("ProcessTracker").LogCritical(e, "The host failed to start");
+    exitCode = Takeover.RolledBack;
 }
 finally
 {
+    hostEnded.TrySetResult();
     mutex?.ReleaseMutex();
+    instanceReleased.TrySetResult();
+}
+
+// An undecided takeover decides now (hostEnded), and once it has started the previous version its code is the result.
+if (takeoverRun is not null && takeoverRun.GetAwaiter().GetResult() is var takeoverExit and not 0) return takeoverExit;
+return exitCode;
+
+// User mode installed in %LOCALAPPDATA%\Programs\ProcessTracker\app-<X.Y.Z> keeps itself up to date from GitHub
+// releases. Anywhere else (a build output, a copied folder) it does not.
+static void AddSelfUpdate(IServiceCollection services)
+{
+    var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    if (SelfUpdateWorker.InstallRootFor(AppContext.BaseDirectory, localAppData) is not { } installRoot
+        || SelfUpdateWorker.NumericVersion(RestEndpoints.Version) is not { } currentVersion)
+        return;
+    services.AddHostedService(sp => new SelfUpdateWorker(
+        new ReleaseClient(new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(30) },
+            RestEndpoints.Version),
+        new SelfUpdateEnvironment
+        {
+            CurrentAppDir = AppFolders.Normalize(AppContext.BaseDirectory),
+            CurrentVersion = currentVersion,
+            InstallRoot = installRoot,
+            TempDir = Path.GetTempPath(),
+            MachineServiceInstalled = ServiceProbe.IsMachineServiceInstalled,
+            Starter = new DetachedProcessStarter(),
+        },
+        sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<SelfUpdateWorker>>()));
 }
 
 static EventWaitHandle? CreateExitEvent()
