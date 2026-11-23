@@ -15,7 +15,8 @@ using ProcessTracker.Service.Mcp;
 // Flags: --console (run as a console app instead of a Windows service), --dev (port 47812, dev data dir, no
 // single-instance mutex) and --user (run as the logged-in user, with data, settings and a log file in
 // %LOCALAPPDATA%\ProcessTracker). They are also accepted as configuration keys Console/Dev/User, e.g. "--Dev=true".
-// Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running,
+// With --user, --takeover <previousAppDir> asks the running user-mode instance to exit and waits up to 30 s for it.
+// Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running (or holds the exit event),
 // 3 the server ended up listening on a non-loopback address, 4 user mode refused: the machine service is installed.
 var commandLine = new ConfigurationBuilder().AddCommandLine(RunModes.NormalizeFlags(args)).Build();
 
@@ -80,7 +81,16 @@ if (instanceChecks && runMode == RunMode.User && ServiceProbe.IsMachineServiceIn
     return 4;
 }
 
-using var mutex = instanceChecks ? SingleInstance.TryAcquire() : null;
+// --takeover <previousAppDir> (user mode): a newer version replacing a running one asks it to exit through the exit
+// event, then waits for it to release the mutex.
+var takeover = runMode == RunMode.User && !string.IsNullOrEmpty(commandLine["Takeover"]);
+if (instanceChecks && takeover)
+{
+    try { UserModeSignal.TrySignal(); }
+    catch (UnauthorizedAccessException) { } // another user's instance: the mutex wait below fails and says so
+}
+
+using var mutex = instanceChecks ? SingleInstance.TryAcquire(takeover ? SingleInstance.TakeoverWait : TimeSpan.Zero) : null;
 if (instanceChecks && mutex is null)
 {
     Console.Error.WriteLine(@"Another ProcessTracker instance holds Global\ProcessTracker.Service; exiting.");
@@ -89,6 +99,11 @@ if (instanceChecks && mutex is null)
 
 try
 {
+    // User mode: the exit event the MSI (before starting the machine service) or a newer version sets to stop this
+    // instance gracefully. Created only once the mutex is ours, so a stale signal for the previous instance is reset.
+    using var exitEvent = instanceChecks && runMode == RunMode.User ? CreateExitEvent() : null;
+    if (instanceChecks && runMode == RunMode.User && exitEvent is null) return 2;
+
     if (runMode == RunMode.User)
     {
         // User mode: no event log (creating its source needs admin) and no Windows service host. Information and above
@@ -138,6 +153,11 @@ try
         .WithHttpTransport(o => o.Stateless = true)
         .WithTools<ProcessTrackerTools>(ContractJson.Options); // same JSON contract as REST (enums as strings)
     builder.Services.AddHostedService<CollectorWorker>();
+    if (exitEvent is not null)
+    {
+        builder.Services.AddHostedService(sp => new UserModeExitWatcher(exitEvent,
+            sp.GetRequiredService<IHostApplicationLifetime>(), sp.GetRequiredService<ILogger<UserModeExitWatcher>>()));
+    }
 
     var app = builder.Build();
     if (ServiceOptions.HasIgnoredPort(config, commandLine))
@@ -202,20 +222,34 @@ finally
     mutex?.ReleaseMutex();
 }
 
+static EventWaitHandle? CreateExitEvent()
+{
+    try { return UserModeSignal.CreateForInstance(); }
+    catch (UnauthorizedAccessException e)
+    {
+        Console.Error.WriteLine($"Cannot create the user-mode exit event: {e.Message} Exiting.");
+        return null;
+    }
+}
+
 /// <summary>The machine-wide single-instance guard (not taken with --dev).</summary>
 internal static class SingleInstance
 {
-    private const string Name = @"Global\ProcessTracker.Service";
+    /// <summary>How long a --takeover start waits for the instance it replaces to exit.</summary>
+    public static readonly TimeSpan TakeoverWait = TimeSpan.FromSeconds(30);
 
-    /// <summary>The owned mutex, or null when another instance (possibly under another account) holds it.</summary>
-    public static Mutex? TryAcquire()
+    /// <summary>
+    /// The owned mutex, or null when another instance (possibly under another account) still holds it after
+    /// <paramref name="wait"/>.
+    /// </summary>
+    public static Mutex? TryAcquire(TimeSpan wait, string name = UserModeSignal.InstanceMutexName)
     {
         Mutex m;
-        try { m = new Mutex(initiallyOwned: false, Name); }
+        try { m = new Mutex(initiallyOwned: false, name); }
         catch (UnauthorizedAccessException) { return null; } // created by an instance under another account
         try
         {
-            if (m.WaitOne(0)) return m;
+            if (m.WaitOne(wait)) return m;
         }
         catch (AbandonedMutexException)
         {

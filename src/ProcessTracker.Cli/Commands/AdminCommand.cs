@@ -41,7 +41,15 @@ public static class AdminCommand
         var removeTask = new Command("remove-task", "Remove the auto-upgrade scheduled task (requires elevation).");
         removeTask.SetAction(_ => RunTask(t => t.Remove(), "removed"));
 
-        return new Command("admin", "Installer helpers.") { Hidden = true, Subcommands = { prepare, remove, registerTask, removeTask } };
+        var stopUserInstances = new Command("stop-user-instances",
+            "Ask running user-mode instances to exit and wait up to 10 s for them (exit 1 on timeout).");
+        stopUserInstances.SetAction(_ => Report(new StopUserInstances().Run()));
+
+        return new Command("admin", "Installer helpers.")
+        {
+            Hidden = true,
+            Subcommands = { prepare, remove, registerTask, removeTask, stopUserInstances },
+        };
     }
 
     private static bool RefuseUnlessElevated()
