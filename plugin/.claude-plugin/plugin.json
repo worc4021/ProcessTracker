@@ -1,6 +1,6 @@
 {
   "name": "process-tracker",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Connects Claude Code to ProcessTracker: an MCP server for per-session process history and machine load, load warnings before heavy commands, and /process-tracker:install for a user-only copy without admin rights.",
   "author": {
     "name": "worc4021"
