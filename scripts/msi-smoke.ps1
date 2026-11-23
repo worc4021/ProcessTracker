@@ -304,7 +304,9 @@ try {
     Assert-EventSource
     Assert-DataFolderOwner
     Assert-That (Test-Path -LiteralPath (Join-Path $dataDir 'state.db')) 'state.db exists after the first install'
-    Assert-That ((Read-MsiLog (Join-Path $LogDir 'install.log')) -match 'Action start \d+:\d+:\d+: McpRegister\.') 'the first install ran McpRegister'
+    $installLog = Read-MsiLog (Join-Path $LogDir 'install.log')
+    Assert-That ($installLog -notmatch 'McpRegister') 'the install no longer registers MCP'
+    Assert-That ($installLog -match 'Action start \d+:\d+:\d+: StopUserInstances\.') 'the install stopped user-mode instances'
 
     Write-Step 'Change a setting'
     [IO.File]::WriteAllText($settingsPath, '{"RetentionHours":48}', (New-Object Text.UTF8Encoding($false)))
@@ -315,7 +317,9 @@ try {
     Assert-Installed $UpgradeMsi 'the upgrade MSI'
     Assert-ServiceConfiguration
     Assert-TaskRunsAsSystem
-    Assert-That ((Read-MsiLog (Join-Path $LogDir 'upgrade.log')) -match 'Skipping action: McpRegister \(condition is false\)') 'the upgrade skipped McpRegister'
+    $upgradeLog = Read-MsiLog (Join-Path $LogDir 'upgrade.log')
+    Assert-That ($upgradeLog -notmatch 'McpRegister') 'the upgrade no longer registers MCP'
+    Assert-That ($upgradeLog -match 'Action start \d+:\d+:\d+: StopUserInstances\.') 'the upgrade stopped user-mode instances'
     $retention = $null
     try { $retention = (Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json).RetentionHours } catch { $retention = $null }
     Assert-That ($retention -eq 48) "RetentionHours 48 survived the upgrade (is $retention)"
