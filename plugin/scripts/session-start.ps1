@@ -6,8 +6,9 @@
     Windows PowerShell 5.1 or pwsh, no dependencies. Always exits 0 and prints at most one of:
       - when a process listening on port 47811 on 127.0.0.1, ::1, 0.0.0.0 or :: is not this user's and not the
         ProcessTracker service's (or its owner can't be read within 3 s), that the port is held by another user's
-        process; nothing is posted then. When the listeners can't be listed at all (no Get-NetTCPConnection), the
-        script goes on as if the check had passed;
+        process; nothing is posted then. When the listeners can't be listed with their processes (Get-NetTCPConnection
+        missing or failing), the script goes on only when nothing listens on those addresses at all; otherwise it says
+        it could not check the port and posts nothing;
       - the body of POST http://127.0.0.1:47811/api/hooks/session-start (the hook input plus plugin_version);
       - on 403, that ProcessTracker belongs to another user;
       - when nothing answers and the machine-wide ProcessTracker service is installed (sc query), that it is installed
@@ -82,10 +83,14 @@ function Get-ListenerVerdict([int]$Port) {
     #             standard user may not read SYSTEM's SID, so the service is recognised by its PID);
     #   'foreign' when any of them runs as another account, or its owner can't be read (access denied, or WMI did not
     #             answer within 3 s): an impostor must not get the payload;
-    #   $null     when the listener query itself fails (no Get-NetTCPConnection): the caller goes on without the check.
-    try { $all = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) }
-    catch { return $null }
+    #   'unknown' when the listener query itself fails (Get-NetTCPConnection missing or failing) and something does
+    #             listen there: who it is can't be told, so it is not trusted either.
     $reachable = @('127.0.0.1', '0.0.0.0', '::', '::1')
+    try { $all = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) }
+    catch {
+        if (Test-PortListening $Port) { return 'unknown' }
+        return 'none'
+    }
     $pids = @($all | Where-Object { $reachable -contains [string]$_.LocalAddress } |
         ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
     if ($pids.Count -eq 0) { return 'none' }
@@ -108,10 +113,19 @@ function Get-ListenerVerdict([int]$Port) {
     catch { return 'foreign' }   # WMI failed or timed out on a listener that exists
 }
 
-function Test-ForeignListener {
-    # True when the tracker's port is held, on an address our loopback connection can reach, by a process that is not
-    # this user's and not the machine service's.
-    return (Get-ListenerVerdict ([Uri]$script:UrlBase).Port) -eq 'foreign'
+function Test-PortListening([int]$Port) {
+    # True when anything listens on $Port at 127.0.0.1, ::1, 0.0.0.0 or :: (no owning process: the fallback when
+    # Get-NetTCPConnection fails), or when even that can't be read.
+    try {
+        $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        foreach ($endpoint in $listeners) {
+            if ($endpoint.Port -ne $Port) { continue }
+            $address = $endpoint.Address
+            if ([Net.IPAddress]::IsLoopback($address) -or $address.Equals([Net.IPAddress]::Any) -or $address.Equals([Net.IPAddress]::IPv6Any)) { return $true }
+        }
+        return $false
+    }
+    catch { return $true }
 }
 
 function Get-PluginVersion {
@@ -148,9 +162,15 @@ function Send-SessionStart([string]$Body) {
 
 function Invoke-SessionStart([string]$InputJson) {
     # Returns the text to print (possibly empty).
-    if (Test-ForeignListener) {
-        # An impostor would receive the hook input and could inject context: post nothing.
-        return "ProcessTracker: port $(([Uri]$script:UrlBase).Port) is held by another Windows user's process; not using it. Ask an admin to install the machine-wide service."
+    # An impostor would receive the hook input and could inject context: post nothing to a listener that is another
+    # account's, or whose account can't be checked.
+    $port = ([Uri]$script:UrlBase).Port
+    $verdict = Get-ListenerVerdict $port
+    if ($verdict -eq 'foreign') {
+        return "ProcessTracker: port $port is held by another Windows user's process; not using it. Ask an admin to install the machine-wide service."
+    }
+    if ($verdict -eq 'unknown') {
+        return "ProcessTracker: could not check which account's process holds port $port; not using it."
     }
     $result = Send-SessionStart (Add-PluginVersion $InputJson (Get-PluginVersion))
     if ($result.Status -eq 200) { return $result.Body }

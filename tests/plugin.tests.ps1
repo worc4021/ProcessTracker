@@ -658,11 +658,23 @@ Invoke-Case 'session-start refuses a foreign verdict' {
     Check ($script:lookups -contains '47811') 'the listeners of port 47811 are looked up'
 }
 
-Invoke-Case 'session-start posts on a trusted, absent or unknown verdict' {
+$unknownLine = "ProcessTracker: could not check which account's process holds port 47811; not using it."
+
+Invoke-Case 'session-start refuses an unknown verdict' {
     . $sessionScript
     . $sessionFakes
     . $postOk
-    foreach ($v in @('trusted', 'none', $null)) {
+    $script:verdict = 'unknown'
+    $out = Invoke-SessionStart '{"session_id":"s1"}'
+    Check ($out -eq $unknownLine) 'listeners that cannot be checked: prints the one line'
+    Check ($script:posts.Count -eq 0) 'listeners that cannot be checked: the payload is not posted'
+}
+
+Invoke-Case 'session-start posts on a trusted or absent verdict' {
+    . $sessionScript
+    . $sessionFakes
+    . $postOk
+    foreach ($v in @('trusted', 'none')) {
         $script:posts.Clear()
         $script:verdict = $v
         $out = Invoke-SessionStart '{}'
@@ -679,6 +691,8 @@ $ownerFakes = {
     $script:owners = @{}
     $script:servicePid = 0
     $script:tcpThrows = $false
+    $script:portListening = $true   # what the fallback listener check sees when Get-NetTCPConnection fails
+    function Test-PortListening([int]$Port) { $script:portListening }
     $script:cimHangs = $false
     $script:cimTimeouts = New-Object System.Collections.ArrayList
     function Test-MachineService { $false }
@@ -772,8 +786,11 @@ Invoke-Case 'owner check: lookup failures' {
     . $ownerFakes
     . $postOk
     $script:tcpThrows = $true
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'the listener query fails while something listens: refused, nothing posted'
+    $script:portListening = $false
     Invoke-SessionStart '{}' | Out-Null
-    Check ($script:posts.Count -eq 1) 'the listener query fails (no cmdlet): falls back and posts'
+    Check ($script:posts.Count -eq 1) 'the listener query fails and nothing listens: posts'
     $script:tcpThrows = $false
     $script:posts.Clear()
     $script:listeners = @()
@@ -789,6 +806,16 @@ Invoke-Case 'owner check: lookup failures' {
     $script:owners = @{ 906 = $script:me }
     Invoke-SessionStart '{}' | Out-Null
     Check ($script:cimTimeouts.Count -gt 0 -and @($script:cimTimeouts | Where-Object { $_ -ne 3 }).Count -eq 0) 'every CIM call passes -OperationTimeoutSec 3'
+}
+
+Invoke-Case 'fallback listener check' {
+    . $sessionScript
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    try { Check (Test-PortListening $port) 'Test-PortListening: a listener on 127.0.0.1 is seen' }
+    finally { $listener.Stop() }
+    Check (-not (Test-PortListening $port)) 'Test-PortListening: a closed port is not'
 }
 
 Invoke-Case 'session-start with the machine service installed but stopped' {
