@@ -42,15 +42,21 @@ jobs:
           if ($env:TAG -ne "v$version") { throw "Tag '$env:TAG' does not match version.txt ($version)." }
           "VERSION=$version" >> $env:GITHUB_ENV
           "MSI=artifacts\ProcessTracker-$version-x64.msi" >> $env:GITHUB_ENV
+          "ZIP=artifacts\ProcessTracker-$version-x64.zip" >> $env:GITHUB_ENV
 
       - name: Test
         run: dotnet test --solution ProcessTracker.slnx -c Release -- --filter-not-trait "Category=Perf"
 
-      - name: Build MSI
+      - name: Build MSI and zip
         run: |
           ./scripts/build-msi.ps1 -Configuration Release -OutDir artifacts
           if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 failed.' }
           if (-not (Test-Path -LiteralPath $env:MSI)) { throw "Expected $env:MSI was not produced." }
+          if (-not (Test-Path -LiteralPath $env:ZIP)) { throw "Expected $env:ZIP was not produced." }
+
+      # Before the MSI smoke test: user mode exits at start while the machine service is installed.
+      - name: User-mode smoke test
+        run: ./scripts/user-smoke.ps1 -Zip $env:ZIP
 
       # The same MSI rebuilt with a dev suffix is the upgrade candidate. It goes to its own folder so the
       # release stage and MSI stay untouched.
@@ -62,8 +68,8 @@ jobs:
       - name: MSI smoke test
         run: ./scripts/msi-smoke.ps1 -Msi $env:MSI -UpgradeMsi "artifacts-smoke\ProcessTracker-$env:VERSION-x64.msi" -LogDir "$env:RUNNER_TEMP\msi-smoke"
 
-      # build-msi.ps1 republishes (and wipes) the stage, so signed binaries cannot go through it:
-      # sign the already-published stage, then run only its wix build step again.
+      # build-msi.ps1 republishes (and wipes) the stage, so the signed stage is packaged again with -SkipPublish:
+      # the MSI and the zip then both carry the signed binaries.
       - name: Sign binaries
         if: vars.SIGNING_ENABLED == 'true'
         uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
@@ -78,13 +84,11 @@ jobs:
             ${{ github.workspace }}\artifacts\stage\ProcessTracker.Service.exe
             ${{ github.workspace }}\artifacts\stage\bin\proctrack.exe
 
-      - name: Rebuild MSI from signed binaries
+      - name: Rebuild MSI and zip from signed binaries
         if: vars.SIGNING_ENABLED == 'true'
         run: |
-          $stage = Join-Path $PWD 'artifacts\stage'
-          dotnet build installer\ProcessTracker.Installer.wixproj -c Release --no-incremental -warnaserror "-p:StageDir=$stage" "-p:ProductVersion=$env:VERSION" -o artifacts\wix
-          if ($LASTEXITCODE -ne 0) { throw 'wix build failed.' }
-          Copy-Item -LiteralPath "artifacts\wix\ProcessTracker-$env:VERSION-x64.msi" -Destination $env:MSI -Force
+          ./scripts/build-msi.ps1 -Configuration Release -OutDir artifacts -SkipPublish
+          if ($LASTEXITCODE -ne 0) { throw 'build-msi.ps1 -SkipPublish failed.' }
 
       - name: Sign MSI
         if: vars.SIGNING_ENABLED == 'true'
@@ -100,16 +104,19 @@ jobs:
 
       - name: Write SHA256SUMS.txt
         run: |
-          $hash = (Get-FileHash -LiteralPath $env:MSI -Algorithm SHA256).Hash.ToLowerInvariant()
-          $line = "$hash  $(Split-Path -Leaf $env:MSI)`n"
-          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS.txt'), $line, [Text.UTF8Encoding]::new($false))
+          # One "<hex>  <name>" line per asset, the MSI first.
+          $lines = foreach ($asset in $env:MSI, $env:ZIP) {
+            $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $asset)`n"
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS.txt'), (-join $lines), [Text.UTF8Encoding]::new($false))
           Get-Content -LiteralPath SHA256SUMS.txt
 
       - name: Upload to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload $env:TAG $env:MSI SHA256SUMS.txt --clobber --repo $env:GITHUB_REPOSITORY
+          gh release upload $env:TAG $env:MSI $env:ZIP SHA256SUMS.txt --clobber --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed.' }
 
       - name: Submit to winget
@@ -132,3 +139,58 @@ jobs:
           $msg = 'winget step skipped (WINGET_PUBLISHED is not true)'
           Write-Host "::notice::$msg"
           "::notice::$msg" >> $env:GITHUB_STEP_SUMMARY
+
+      # The plugin marketplace on main installs the plugin from a tag: point it, and plugin.json, at this release.
+      # A rebuild of an older tag leaves a newer pointer alone.
+      - name: Check out main for the marketplace bump
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          path: marketplace-bump
+
+      - name: Point the plugin marketplace at the tag
+        working-directory: marketplace-bump
+        run: |
+          $marketplace = '.claude-plugin/marketplace.json'
+          $manifest = 'plugin/.claude-plugin/plugin.json'
+          $current = [string](Get-Content -LiteralPath $marketplace -Raw | ConvertFrom-Json).plugins[0].source.ref
+          if ($current -match '^v(\d+\.\d+\.\d+)$' -and [version]$Matches[1] -gt [version]$env:VERSION) {
+            Write-Host "::notice::The plugin marketplace points at $current, newer than $env:TAG; left alone."
+            exit 0
+          }
+
+          # Replaces the one "<key>": "<string>" in place, so the rest of the file stays as it is.
+          function Set-JsonString([string]$Path, [string]$Key, [string]$Value) {
+            $full = Join-Path $PWD $Path
+            $text = [IO.File]::ReadAllText($full)
+            $pattern = '("' + $Key + '"\s*:\s*")[^"]*(")'
+            $count = [regex]::Matches($text, $pattern).Count
+            if ($count -ne 1) { throw "$Path must hold exactly one `"$Key`" string (found $count)." }
+            [IO.File]::WriteAllText($full, [regex]::Replace($text, $pattern, "`${1}$Value`${2}"), [Text.UTF8Encoding]::new($false))
+          }
+          Set-JsonString $marketplace 'ref' $env:TAG
+          Set-JsonString $manifest 'version' $env:VERSION
+          $ref = (Get-Content -LiteralPath $marketplace -Raw | ConvertFrom-Json).plugins[0].source.ref
+          $version = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).version
+          if ($ref -ne $env:TAG -or $version -ne $env:VERSION) { throw "The bump left ref '$ref' and version '$version'." }
+
+          git diff --quiet -- $marketplace $manifest
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "The plugin marketplace already points at $env:TAG; nothing to commit."
+            exit 0
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --quiet -m "chore: point the plugin marketplace at $env:TAG" -- $marketplace $manifest
+          if ($LASTEXITCODE -ne 0) { throw 'git commit failed.' }
+          $push = git push origin HEAD:main 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $push
+          if ($code -ne 0) {
+            # Branch protection or a ruleset turned the workflow token away.
+            if ($push -match 'protected branch|GH006|GH013|denied|403') {
+              Write-Host '::error::allow github-actions to push marketplace bumps to main'
+              throw 'allow github-actions to push marketplace bumps to main'
+            }
+            throw "git push failed with exit code $code."
+          }
