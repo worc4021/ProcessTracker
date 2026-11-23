@@ -101,12 +101,33 @@ function Get-LastLine([string]$Text) {
     return $lines[$lines.Count - 1]
 }
 
+function New-UpgradeFolderSecurity {
+    # A protected DACL (nothing inherited) granting full control to SYSTEM and Administrators only.
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+    return $security
+}
+
+function Protect-UpgradeFolder([string]$Path) {
+    Set-Acl -LiteralPath $Path -AclObject (New-UpgradeFolderSecurity)
+}
+
 function Invoke-GitHubFallback {
     # Downloads the latest release's MSI through proctrack (hash-verified, only when newer) and installs it.
     param([switch]$WhatIf)
     $proctrack = Join-Path $PSScriptRoot 'bin\proctrack.exe'
     $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
-    # As SYSTEM this is C:\Windows\Temp; a new folder there inherits an ACL that admits only SYSTEM and Administrators.
+    # As SYSTEM this is C:\Windows\Temp, where Users may create files and folders (inherited by subfolders); so the
+    # folder gets an explicit protected DACL for SYSTEM and Administrators right after it is created.
     $outDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ProcessTracker-upgrade-' + [Guid]::NewGuid().ToString('N'))
     $fetchArgs = @('admin', 'fetch-release', '--asset', 'msi', '--out', $outDir)
 
@@ -118,6 +139,7 @@ function Invoke-GitHubFallback {
 
     New-Item -ItemType Directory -Path $outDir | Out-Null # fails if it exists: the folder must be ours alone
     try {
+        Protect-UpgradeFolder $outDir
         $fetch = Invoke-Native $proctrack $fetchArgs
         Write-Output $fetch.Output
         if ($fetch.Code -eq $fetchUpToDateCode) {

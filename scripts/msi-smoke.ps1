@@ -10,7 +10,8 @@
          InformationalVersion with a collector tick younger than 5 s.
       2. Checks the service (Automatic, Running, recovery 5 s / 5 s / 30 s, reset after a day), the SYSTEM scheduled
          task \ProcessTracker\AutoUpgrade, bin on the machine PATH, the ProcessTracker event source and the data
-         folder owner (Administrators).
+         folder owner (Administrators). Then re-runs -Msi in maintenance mode: it must exit 0 and skip
+         StopUserInstances while the service keeps running.
       3. Writes {"RetentionHours":48} to the data folder's appsettings.json, installs -UpgradeMsi (a build with another
          InformationalVersion, e.g. build-msi.ps1 -DevSuffix smoke2) and waits for health to report it; the setting and
          state.db must survive.
@@ -307,6 +308,12 @@ try {
     $installLog = Read-MsiLog (Join-Path $LogDir 'install.log')
     Assert-That ($installLog -notmatch 'McpRegister') 'the install no longer registers MCP'
     Assert-That ($installLog -match 'Action start \d+:\d+:\d+: StopUserInstances\.') 'the install stopped user-mode instances'
+
+    Write-Step "Re-run $Msi (maintenance mode, the service keeps running)"
+    $rerun = Invoke-Msiexec '/i' $Msi 'rerun.log'
+    Assert-That ($rerun.Code -eq 0) "re-running the installed MSI exits 0 (exit $($rerun.Code), log $($rerun.Log))"
+    Assert-That ((Read-MsiLog $rerun.Log) -match 'Skipping action: StopUserInstances \(condition is false\)') 'the re-run skipped StopUserInstances (the Service component has no action)'
+    Assert-That ((Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status -eq 'Running') 'the service is still Running after the re-run'
 
     Write-Step 'Change a setting'
     [IO.File]::WriteAllText($settingsPath, '{"RetentionHours":48}', (New-Object Text.UTF8Encoding($false)))

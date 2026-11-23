@@ -21,7 +21,34 @@ $n = Get-Outcome -1978335212 ''
 Check ($n.EventId -eq 1002 -and $n.Message -like '*no installed package*') '0x8A150014 -> 1002 with explanation'
 Check ((Get-Outcome 5 ('x' * 5000)).Message.Length -lt 2400) 'winget output truncated in the message'
 
+# The download folder's DACL: protected, full control for SYSTEM and Administrators only. Applied to a folder of our
+# own; as its owner we can still read the ACL back (and delete it through the parent's rights) afterwards.
+function Get-RuleSummary($Security) {
+    return @($Security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        ForEach-Object { "$($_.IdentityReference.Value)|$($_.AccessControlType)|$($_.FileSystemRights)|$($_.IsInherited)" } | Sort-Object)
+}
+$expectedRules = @('S-1-5-18|Allow|FullControl|False', 'S-1-5-32-544|Allow|FullControl|False')
+$built = New-UpgradeFolderSecurity
+Check ($built.AreAccessRulesProtected -and ((Get-RuleSummary $built) -join ';') -eq ($expectedRules -join ';')) 'New-UpgradeFolderSecurity: protected, SYSTEM and Administrators full control only'
+$aclDir = Join-Path ([System.IO.Path]::GetTempPath()) ('pt-acl-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $aclDir | Out-Null
+try {
+    Protect-UpgradeFolder $aclDir
+    $applied = Get-Acl -LiteralPath $aclDir
+    Check ($applied.AreAccessRulesProtected -and ((Get-RuleSummary $applied) -join ';') -eq ($expectedRules -join ';')) 'Protect-UpgradeFolder leaves exactly those two rules, protected, on the folder'
+}
+finally {
+    # Locked out now except for the owner's implicit WRITE_DAC: restore the inherited ACL, then delete.
+    Invoke-Native (Join-Path $env:SystemRoot 'System32\icacls.exe') @($aclDir, '/reset', '/q') | Out-Null
+    Remove-Item -LiteralPath $aclDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+Check (-not (Test-Path -LiteralPath $aclDir)) 'the protected test folder could be removed again'
+
 # ---- GitHub fallback. The functions upgrade.ps1 calls are replaced from here on: nothing runs, nothing is installed.
+# Protect-UpgradeFolder (checked above) is recorded only: applied for real it would lock this non-elevated test out of
+# the folder its fake fetch-release writes into.
+$script:protected = @()
+function Protect-UpgradeFolder([string]$Path) { $script:protected += $Path }
 $script:events = @()
 $script:calls = @()
 $script:fetchCode = 0
@@ -47,7 +74,7 @@ function Invoke-Native {
     return @{ Code = 0; Output = "$msi`r`n" }
 }
 function Reset-Fallback([int]$Fetch = 0, [int]$Msiexec = 0, [string]$Winget = $null, [int]$WingetCode = 0) {
-    $script:events = @(); $script:calls = @(); $script:fetchOut = $null
+    $script:events = @(); $script:calls = @(); $script:fetchOut = $null; $script:protected = @()
     $script:fetchCode = $Fetch; $script:msiexecCode = $Msiexec; $script:wingetPath = $Winget; $script:wingetCode = $WingetCode
 }
 function Get-Call([string]$ExeName) { return , @($script:calls | Where-Object { [IO.Path]::GetFileName($_.Exe) -eq $ExeName }) }
@@ -66,6 +93,7 @@ Check ((Get-Call 'proctrack.exe').Count -eq 1 -and $null -eq (Get-Call 'winget.e
 Check ($msiexec.Count -eq 1 -and $msiexec[0].Exe -eq (Join-Path $env:SystemRoot 'System32\msiexec.exe')) 'msiexec runs by its full System32 path'
 Check ($msiexec.Count -eq 1 -and (($msiexec[0].Arguments -join '|') -eq ('/i|' + (Join-Path $script:fetchOut 'ProcessTracker-0.3.0-x64.msi') + '|/qn|/norestart'))) 'msiexec /i <verified msi> /qn /norestart'
 Check ($script:fetchOut -like ([IO.Path]::GetTempPath() + 'ProcessTracker-upgrade-*')) 'fetch-release downloads into a fresh folder under the temp folder'
+Check ($script:protected.Count -eq 1 -and $script:protected[0] -eq $script:fetchOut) 'the download folder is protected before fetch-release writes into it'
 Check (-not (Test-Path -LiteralPath $script:fetchOut)) 'the download folder is deleted afterwards'
 
 Reset-Fallback -Msiexec 1603
