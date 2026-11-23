@@ -5,6 +5,7 @@ using System.Net.Http.Json;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -88,6 +89,16 @@ public sealed class RestEndpointsTests : IDisposable
         Assert.Equal(T0.AddHours(-1), health.StartedUtc);
         Assert.Equal(T0.AddSeconds(-3), health.LastTickUtc);
         Assert.Equal(3.0, health.TickAgeSeconds!.Value, 3);
+    }
+
+    [Fact]
+    public async Task Health_ReportsMode()
+    {
+        var json = await _http.GetStringAsync("/api/health", TestContext.Current.CancellationToken);
+
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("dev", doc.RootElement.GetProperty("mode").GetString());
+        Assert.False(doc.RootElement.TryGetProperty("owner", out _), json);
     }
 
     [Fact]

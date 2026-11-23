@@ -12,6 +12,9 @@ public sealed class ServiceOptions
     private const double MaxRetentionHours = 24 * 30;
     private const double MaxOrphanIdleAlertMinutes = 7 * 24 * 60;
 
+    /// <summary>The run mode, from the command line only (a Mode in a settings file is ignored).</summary>
+    public RunMode Mode { get; private set; }
+
     /// <summary>
     /// Loopback port; 0 means the mode default (47811, or 47812 with --dev). Only the command line can set it (for
     /// development and tests): the installer, upgrade task and CLI all assume 47811, so a Port in an appsettings.json
@@ -19,7 +22,10 @@ public sealed class ServiceOptions
     /// </summary>
     public int Port { get; set; }
 
-    /// <summary>Data folder; empty means %ProgramData%\ProcessTracker (or %LOCALAPPDATA%\ProcessTracker-dev with --dev).</summary>
+    /// <summary>
+    /// Data folder; empty means %ProgramData%\ProcessTracker, or %LOCALAPPDATA%\ProcessTracker with --user, or
+    /// %LOCALAPPDATA%\ProcessTracker-dev with --dev.
+    /// </summary>
     public string DataDir { get; set; } = "";
 
     /// <summary>Profile whose .claude\projects transcripts are read; empty means each session's profile is that of its anchor's owner.</summary>
@@ -52,19 +58,24 @@ public sealed class ServiceOptions
 
     /// <param name="config">All configuration (settings files and command line).</param>
     /// <param name="commandLine">The command line alone: the only source of <see cref="Port"/>.</param>
-    /// <param name="dev">Development mode (--dev).</param>
-    public static ServiceOptions Resolve(IConfiguration config, IConfiguration commandLine, bool dev)
+    /// <param name="mode">The run mode (see <see cref="RunModes.ParseMode"/>).</param>
+    public static ServiceOptions Resolve(IConfiguration config, IConfiguration commandLine, RunMode mode)
     {
         var o = new ServiceOptions();
         config.Bind(o);
+        o.Mode = mode;
         o.Port = commandLine.GetValue<int>(nameof(Port));
-        if (o.Port == 0) o.Port = dev ? DevPort : ProductionPort;
-        if (string.IsNullOrWhiteSpace(o.DataDir))
-        {
-            o.DataDir = dev
-                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessTracker-dev")
-                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ProcessTracker");
-        }
+        if (o.Port == 0) o.Port = mode == RunMode.Dev ? DevPort : ProductionPort;
+        if (string.IsNullOrWhiteSpace(o.DataDir)) o.DataDir = DefaultDataDir(mode);
         return o;
     }
+
+    /// <summary>The data folder of a mode when DataDir is not set; its appsettings.json is the second settings file.</summary>
+    public static string DefaultDataDir(RunMode mode) => mode switch
+    {
+        RunMode.Service => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ProcessTracker"),
+        RunMode.User => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessTracker"),
+        RunMode.Dev => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessTracker-dev"),
+        _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null),
+    };
 }

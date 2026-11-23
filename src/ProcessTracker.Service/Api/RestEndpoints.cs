@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Reflection;
+using System.Security.Principal;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Http.Json;
 using Microsoft.Extensions.Options;
@@ -22,11 +23,18 @@ public static class RestEndpoints
     public static string Version { get; } =
         typeof(RestEndpoints).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "0.0.0";
 
+    /// <summary>The account this process runs as (DOMAIN\user), reported by <c>/api/health</c> in user mode.</summary>
+    private static readonly Lazy<string> ProcessUser = new(() =>
+    {
+        using var me = WindowsIdentity.GetCurrent();
+        return me.Name;
+    });
+
     public static IEndpointRouteBuilder MapRestEndpoints(this IEndpointRouteBuilder app)
     {
         var api = app.MapGroup("/api");
 
-        api.MapGet("/health", (ITrackerHost host, TimeProvider time) => Health(host, time));
+        api.MapGet("/health", (ITrackerHost host, TimeProvider time, ServiceOptions options) => Health(host, time, options.Mode));
 
         api.MapGet("/load", (ITrackerHost host, ICallerResolver callers, HttpContext ctx) => Load(host, CallerUnit(callers, ctx)));
 
@@ -72,12 +80,13 @@ public static class RestEndpoints
         return app;
     }
 
-    public static HealthDto Health(ITrackerHost host, TimeProvider time)
+    public static HealthDto Health(ITrackerHost host, TimeProvider time, RunMode mode)
     {
         var view = host.View;
         DateTime? last = view.TimestampUtc == TrackerView.Empty.TimestampUtc ? null : ContractJson.AsUtc(view.TimestampUtc);
         double? age = last is { } l ? Math.Max(0, (time.GetUtcNow().UtcDateTime - l).TotalSeconds) : null;
-        return new HealthDto(Version, ContractJson.AsUtc(host.StartedUtc), last, age);
+        return new HealthDto(Version, ContractJson.AsUtc(host.StartedUtc), last, age, mode.WireName(),
+            mode == RunMode.User ? ProcessUser.Value : null);
     }
 
     /// <summary>Machine pressure over the last few ticks, with the caller's own usage when <paramref name="callerUnit"/> is in the view.</summary>

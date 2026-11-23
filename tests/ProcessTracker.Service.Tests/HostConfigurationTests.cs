@@ -15,7 +15,7 @@ public sealed class HostConfigurationTests
             .Build();
 
     private static ServiceOptions Resolve(params (string Key, string Value)[] settings) =>
-        ServiceOptions.Resolve(Config(settings), Config(), dev: true);
+        ServiceOptions.Resolve(Config(settings), Config(), RunMode.Dev);
 
     [Fact]
     public void Defaults_AreValid()
@@ -43,17 +43,18 @@ public sealed class HostConfigurationTests
     [Fact]
     public void OutOfRangePort_OnCommandLine_IsRejected()
     {
-        var errors = ServiceOptions.Resolve(Config(("Port", "70000")), Config(("Port", "70000")), dev: true).Validate();
+        var errors = ServiceOptions.Resolve(Config(("Port", "70000")), Config(("Port", "70000")), RunMode.Dev).Validate();
         Assert.Contains(errors, e => e.StartsWith("Port", StringComparison.Ordinal));
     }
 
     [Theory]
-    [InlineData(false, ServiceOptions.ProductionPort)]
-    [InlineData(true, ServiceOptions.DevPort)]
-    public void Port_FromSettingsFiles_IsIgnored(bool dev, int expected)
+    [InlineData(RunMode.Service, ServiceOptions.ProductionPort)]
+    [InlineData(RunMode.User, ServiceOptions.ProductionPort)]
+    [InlineData(RunMode.Dev, ServiceOptions.DevPort)]
+    public void Port_FromSettingsFiles_IsIgnored(RunMode mode, int expected)
     {
         // The updater, install script and CLI all assume 47811: a port in appsettings.json must not move the service.
-        var o = ServiceOptions.Resolve(Config(("Port", "50000"), ("RetentionHours", "48")), Config(), dev);
+        var o = ServiceOptions.Resolve(Config(("Port", "50000"), ("RetentionHours", "48")), Config(), mode);
         Assert.Equal(expected, o.Port);
         Assert.Equal(48, o.RetentionHours);
     }
@@ -61,7 +62,7 @@ public sealed class HostConfigurationTests
     [Fact]
     public void Port_FromCommandLine_IsUsed()
     {
-        var o = ServiceOptions.Resolve(Config(("Port", "50001")), Config(("Port", "50001")), dev: false);
+        var o = ServiceOptions.Resolve(Config(("Port", "50001")), Config(("Port", "50001")), RunMode.Service);
         Assert.Equal(50001, o.Port);
     }
 

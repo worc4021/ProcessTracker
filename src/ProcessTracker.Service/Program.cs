@@ -1,39 +1,87 @@
 using System.Diagnostics;
 using System.Net;
+using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Logging.EventLog;
 using Microsoft.Extensions.Primitives;
 using ProcessTracker.Core.Contracts;
+using ProcessTracker.Native;
 using ProcessTracker.Service;
 using ProcessTracker.Service.Api;
+using ProcessTracker.Service.Logging;
 using ProcessTracker.Service.Mcp;
 
-// Flags: --console (run as a console app instead of a Windows service) and --dev (port 47812, dev data dir,
-// no single-instance mutex). Both are also accepted as configuration keys Console/Dev, e.g. "--Dev=true".
+// Flags: --console (run as a console app instead of a Windows service), --dev (port 47812, dev data dir, no
+// single-instance mutex) and --user (run as the logged-in user, with data, settings and a log file in
+// %LOCALAPPDATA%\ProcessTracker). They are also accepted as configuration keys Console/Dev/User, e.g. "--Dev=true".
 // Exit codes: 0 stopped normally, 1 invalid configuration, 2 another instance is running,
-// 3 the server ended up listening on a non-loopback address.
-var configArgs = args.Select(a => a switch
+// 3 the server ended up listening on a non-loopback address, 4 user mode refused: the machine service is installed.
+var commandLine = new ConfigurationBuilder().AddCommandLine(RunModes.NormalizeFlags(args)).Build();
+
+// The exe is a GUI-subsystem app (no window at logon in user mode); --console gets a console before anything logs.
+var asConsole = bool.TryParse(commandLine["Console"], out var consoleFlag) && consoleFlag;
+if (asConsole) ConsoleWindow.Attach();
+
+RunMode runMode;
+try { runMode = RunModes.ParseMode(commandLine); }
+catch (InvalidOperationException e) // --user with --dev, or a flag value that is not a bool
 {
-    "--dev" => "--Dev=true",
-    "--console" => "--Console=true",
-    _ => a,
-}).ToArray();
-var mode = new ConfigurationBuilder().AddCommandLine(configArgs).Build();
+    Console.Error.WriteLine("Invalid configuration: " + e.Message);
+    return 1;
+}
 
 // The API is unauthenticated and runs as SYSTEM, so no configuration may add or replace listeners. The command line
 // is re-emitted without listener keys (the host reads urls etc. from the arguments it is created with), a last
 // configuration source blanks them for the JSON files, Kestrel's own "Kestrel" section is ignored, and a startup
 // check stops the host if it is listening anywhere but loopback anyway.
-var hostArgs = mode.AsEnumerable()
+var hostArgs = commandLine.AsEnumerable()
     .Where(kv => kv.Value is not null && !LoopbackGuard.IsListenerKey(kv.Key))
     .Select(kv => $"--{kv.Key}={kv.Value}")
     .ToArray();
-var dev = mode.GetValue<bool>("Dev");
-var asConsole = mode.GetValue<bool>("Console");
 
-using var mutex = dev ? null : SingleInstance.TryAcquire();
-if (!dev && mutex is null)
+var builder = WebApplication.CreateBuilder(hostArgs);
+
+// Configuration: appsettings.json next to the exe, then the mode's data folder's appsettings.json
+// (%ProgramData%\ProcessTracker, or %LOCALAPPDATA%\ProcessTracker in user mode; none in dev mode), then the command
+// line. Port comes from the command line only (see ServiceOptions.Port).
+var config = builder.Configuration;
+config.Sources.Clear();
+config.AddJsonFile(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), optional: true, reloadOnChange: false);
+if (runMode != RunMode.Dev)
+{
+    config.AddJsonFile(Path.Combine(ServiceOptions.DefaultDataDir(runMode), "appsettings.json"),
+        optional: true, reloadOnChange: false);
+}
+config.AddCommandLine(hostArgs);
+config.AddInMemoryCollection(LoopbackGuard.NeutralizedHostingKeys);
+
+ServiceOptions options;
+try { options = ServiceOptions.Resolve(config, commandLine, runMode); }
+catch (InvalidOperationException e) // a value that does not convert, e.g. RetentionHours=abc
+{
+    Console.Error.WriteLine("Invalid configuration: " + e.Message);
+    return 1;
+}
+if (options.Validate() is { Count: > 0 } errors)
+{
+    Console.Error.WriteLine("Invalid configuration: " + string.Join("; ", errors));
+    return 1;
+}
+var logDir = Path.Combine(options.DataDir, "logs");
+
+// The machine service always wins: a user-mode instance does not start while it is installed, running or not.
+var instanceChecks = runMode != RunMode.Dev && !Program.SkipInstanceChecks;
+if (instanceChecks && runMode == RunMode.User && ServiceProbe.IsMachineServiceInstalled())
+{
+    using var log = new FileLoggerProvider(logDir);
+    log.CreateLogger("ProcessTracker").LogInformation(
+        "The machine-wide ProcessTracker service is installed; this user-mode instance exits (code 4)");
+    return 4;
+}
+
+using var mutex = instanceChecks ? SingleInstance.TryAcquire() : null;
+if (instanceChecks && mutex is null)
 {
     Console.Error.WriteLine(@"Another ProcessTracker instance holds Global\ProcessTracker.Service; exiting.");
     return 2;
@@ -41,36 +89,19 @@ if (!dev && mutex is null)
 
 try
 {
-    var builder = WebApplication.CreateBuilder(hostArgs);
-
-    // Configuration: appsettings.json next to the exe, then %ProgramData%\ProcessTracker\appsettings.json
-    // (production only), then the command line. Port comes from the command line only (see ServiceOptions.Port).
-    var config = builder.Configuration;
-    config.Sources.Clear();
-    config.AddJsonFile(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), optional: true, reloadOnChange: false);
-    if (!dev)
+    if (runMode == RunMode.User)
     {
-        config.AddJsonFile(
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ProcessTracker", "appsettings.json"),
-            optional: true, reloadOnChange: false);
+        // User mode: no event log (creating its source needs admin) and no Windows service host. Information and above
+        // go to a rolling file in the data folder, and to the console with --console. Per-request framework logging
+        // stays at Warning. Registered through a factory so the host disposes it (closing the file) on shutdown.
+        builder.Logging.ClearProviders();
+        if (asConsole) builder.Logging.AddConsole();
+        builder.Services.AddSingleton<ILoggerProvider>(_ => new FileLoggerProvider(logDir));
+        builder.Logging.AddFilter<FileLoggerProvider>(null, LogLevel.Information);
+        builder.Logging.AddFilter<FileLoggerProvider>("Microsoft.AspNetCore", LogLevel.Warning);
+        builder.Logging.AddFilter<FileLoggerProvider>("ModelContextProtocol", LogLevel.Warning);
     }
-    config.AddCommandLine(hostArgs);
-    config.AddInMemoryCollection(LoopbackGuard.NeutralizedHostingKeys);
-
-    ServiceOptions options;
-    try { options = ServiceOptions.Resolve(config, mode, dev); }
-    catch (InvalidOperationException e) // a value that does not convert, e.g. RetentionHours=abc
-    {
-        Console.Error.WriteLine("Invalid configuration: " + e.Message);
-        return 1;
-    }
-    if (options.Validate() is { Count: > 0 } errors)
-    {
-        Console.Error.WriteLine("Invalid configuration: " + string.Join("; ", errors));
-        return 1;
-    }
-
-    if (!asConsole)
+    else if (!asConsole)
     {
         // As a service, Information and above go to the Application event log under the source the MSI creates
         // (Get-WinEvent -ProviderName ProcessTracker). Per-request framework logging stays at Warning.
@@ -108,7 +139,7 @@ try
     builder.Services.AddHostedService<CollectorWorker>();
 
     var app = builder.Build();
-    if (ServiceOptions.HasIgnoredPort(config, mode))
+    if (ServiceOptions.HasIgnoredPort(config, commandLine))
         app.Logger.LogWarning("Port in appsettings.json is ignored; listening on {Port} (only --Port on the command line changes it)",
             options.Port);
 
@@ -141,9 +172,9 @@ try
             app.Lifetime.StopApplication();
             return;
         }
-        app.Logger.LogInformation("ProcessTracker {Version} listening on {Addresses}, data in {DataDir}, GC heap limit {HeapMb} MB{Dev}",
+        app.Logger.LogInformation("ProcessTracker {Version} listening on {Addresses}, data in {DataDir}, GC heap limit {HeapMb} MB, {Mode} mode",
             RestEndpoints.Version, string.Join(", ", addresses), options.DataDir,
-            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20, dev ? " (dev)" : "");
+            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20, runMode.WireName());
     });
 
     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
@@ -227,4 +258,42 @@ public static class LoopbackGuard
     }
 }
 
-public partial class Program;
+/// <summary>
+/// The exe is a GUI-subsystem app so that user mode shows no window at logon. With --console it borrows the parent's
+/// console, or opens its own, so log lines still appear. Output that is already redirected to a pipe or file (a test or
+/// script capturing it) is left as it is.
+/// </summary>
+internal static class ConsoleWindow
+{
+    private const int AttachParentProcess = -1;
+    private const int StdOutputHandle = -11;
+    private const uint FileTypeDisk = 1, FileTypePipe = 3;
+
+    public static void Attach()
+    {
+        var stdout = GetStdHandle(StdOutputHandle);
+        if (stdout is not (0 or -1) && GetFileType(stdout) is FileTypeDisk or FileTypePipe) return;
+        if (!AttachConsole(AttachParentProcess)) AllocConsole();
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint GetStdHandle(int stdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetFileType(nint file);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AllocConsole();
+}
+
+public partial class Program
+{
+    /// <summary>
+    /// Test seam (ruling R1), set only by the test host: skips the single-instance mutex and the machine-service probe,
+    /// so tests never contend with an installed ProcessTracker service. Deliberately not a configuration key.
+    /// </summary>
+    internal static bool SkipInstanceChecks { get; set; }
+}
