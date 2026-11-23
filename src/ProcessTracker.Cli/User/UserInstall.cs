@@ -186,16 +186,23 @@ public sealed class UserInstall(UserInstallEnvironment env)
             env.Err.WriteLine(removed
                 ? $"The task was removed again; nothing of {appDir} is registered."
                 : $"Removing the task {env.Task.TaskName} failed; 'proctrack user uninstall' removes it.");
+            // A copy ran without a task (started by hand, or its task was deleted): there is nothing to start it with.
+            if (previouslyRunning is not null)
+                env.Err.WriteLine($"The ProcessTracker {previouslyRunning.Version} that was running was stopped and is not running now; "
+                                  + "it had no scheduled task to start it again.");
             return Refused;
         }
-        if (!SamePath(previousAppDir, appDir) && env.Task.Register(previousAppDir) != 0)
+        var samePlace = SamePath(previousAppDir, appDir);
+        if (!samePlace && env.Task.Register(previousAppDir) != 0)
         {
             env.Err.WriteLine($"Pointing the task back at {previousAppDir} failed; it still points at {appDir}.");
             return Refused;
         }
         if (previouslyRunning is null)
         {
-            env.Err.WriteLine($"The task points at the previous version in {previousAppDir} again.");
+            env.Err.WriteLine(samePlace
+                ? $"The task still points at {appDir}."
+                : $"The task points at the previous version in {previousAppDir} again.");
             return Refused;
         }
         if (stuck)

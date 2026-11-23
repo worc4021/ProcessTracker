@@ -269,6 +269,30 @@ public sealed class UserInstallTests : IDisposable
     }
 
     [Fact]
+    public async Task Install_RunningCopyWithoutTask_NewNeverHealthy_SaysTheStoppedCopyIsGone()
+    {
+        // A copy of this user's runs (started by hand, say) but no task is registered: the rollback has nothing to start it with.
+        var old = Health("user", version: "0.9.0");
+        var code = await Make(health: () => _stops == 0 ? old : null).InstallAsync(AppDir(), Ct);
+
+        Assert.Equal(1, code);
+        Assert.StartsWith("/Delete", _schtasks.Where(c => !c.StartsWith("/Query")).Last());
+        Assert.Contains("ProcessTracker 0.9.0 that was running was stopped and is not running now", _err.ToString());
+    }
+
+    [Fact]
+    public async Task Install_SameFolderAgain_NeverHealthy_DoesNotCallItThePreviousVersion()
+    {
+        var dir = AppDir();
+        TaskXml = UserTask.BuildXml(dir, Sid);
+        var code = await Make(health: () => null).InstallAsync(dir, Ct);
+
+        Assert.Equal(1, code);
+        Assert.Contains($"The task still points at {dir}.", _err.ToString());
+        Assert.DoesNotContain("previous version", _err.ToString());
+    }
+
+    [Fact]
     public async Task Install_OtherUserAnswersAfterStart_RollsBack()
     {
         var previous = Path.Combine(Programs, "app-0.9.0");

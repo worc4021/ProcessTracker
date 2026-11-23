@@ -114,6 +114,24 @@ public sealed class FileLoggerProviderTests : IDisposable
     }
 
     [Fact]
+    public void RolloverBlocked_KeepsLoggingToTheCurrentFile()
+    {
+        // A viewer holds processtracker.log.1 open without FILE_SHARE_DELETE, so it can't be replaced.
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(Path.Combine(_dir, "processtracker.log.1"), "old\n");
+        using var viewer = new FileStream(Path.Combine(_dir, "processtracker.log.1"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using (var provider = new FileLoggerProvider(_dir, maxBytes: 500))
+        {
+            var logger = provider.CreateLogger("c");
+            for (var i = 0; i < 20; i++) logger.LogInformation("line {I:D3} {Pad}", i, new string('x', 40));
+        }
+
+        var text = Read("processtracker.log");
+        Assert.Contains("line 000", text);
+        Assert.Contains("line 019", text); // over the limit, but nothing is lost while the rollover can't happen
+    }
+
+    [Fact]
     public void MutexNameTakenByAnotherKindOfObject_StillLogs()
     {
         // Something else squats the name (here an event): logging goes on without the cross-process ordering.

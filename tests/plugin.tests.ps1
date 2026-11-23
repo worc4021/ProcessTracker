@@ -540,6 +540,8 @@ Invoke-Case 'running-from check' {
     try { Check (-not (Test-RunningFrom $empty)) 'Test-RunningFrom: an empty folder is not in use' }
     finally { Remove-Item -LiteralPath $empty -Recurse -Force }
     Check (-not (Test-RunningFrom ($own + 'x'))) 'Test-RunningFrom: a sibling folder whose name only starts the same is not in use'
+    $exe = (Get-Process -Id $PID).Path
+    Check (-not (Test-RunningFrom ($exe -replace '\.exe$', ''))) 'Test-RunningFrom: a folder named like the start of a running exe is not in use'
 }
 
 Invoke-Case 'install keeps a failed task folder it extracted' {
@@ -800,7 +802,7 @@ $ownerFakes = {
     $script:owners = @{}
     $script:servicePid = 0
     $script:tcpThrows = $false
-    $script:portListening = $true   # what the fallback listener check sees when Get-NetTCPConnection fails
+    $script:portListening = $false  # what the fallback listener check sees (it runs when the query lists nothing)
     function Test-PortListening([int]$Port) { $script:portListening }
     $script:cimHangs = $false
     $script:cimTimeouts = New-Object System.Collections.ArrayList
@@ -895,6 +897,7 @@ Invoke-Case 'owner check: lookup failures' {
     . $ownerFakes
     . $postOk
     $script:tcpThrows = $true
+    $script:portListening = $true
     $out = Invoke-SessionStart '{}'
     Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'the listener query fails while something listens: refused, nothing posted'
     $script:portListening = $false
@@ -906,10 +909,15 @@ Invoke-Case 'owner check: lookup failures' {
     Invoke-SessionStart '{}' | Out-Null
     Check ($script:posts.Count -eq 1) 'nothing listens on the port at all: posts'
     $script:posts.Clear()
+    $script:portListening = $true   # the query failed quietly (a non-terminating error) while something listens
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'the query lists nothing but something listens: refused, nothing posted'
+    $script:portListening = $false
+    $script:posts.Clear()
     $script:listeners = @(New-Listener '127.0.0.1' 906)
     $script:cimHangs = $true
     $out = Invoke-SessionStart '{}'
-    Check ($out -eq $foreignLine -and $script:posts.Count -eq 0) 'WMI times out on a listener''s owner: refused, nothing posted'
+    Check ($out -eq $unknownLine -and $script:posts.Count -eq 0) 'WMI times out on a listener''s owner: says it could not check, nothing posted'
     $script:cimHangs = $false
     $script:cimTimeouts.Clear()
     $script:owners = @{ 906 = $script:me }

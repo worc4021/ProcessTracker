@@ -202,7 +202,7 @@ function Get-TaskAppDir([string]$Name) {
 function Test-RunningFrom([string]$Dir) {
     # True when a process runs an executable inside $Dir (deleting it would leave it half-deleted), or when the
     # processes can't be listed.
-    $prefix = [IO.Path]::GetFullPath($Dir).TrimEnd('') + ''
+    $prefix = [IO.Path]::GetFullPath($Dir).TrimEnd('\') + '\'
     try {
         foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
             $path = $null

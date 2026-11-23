@@ -5,10 +5,11 @@
 .DESCRIPTION
     Windows PowerShell 5.1 or pwsh, no dependencies. Always exits 0 and prints at most one of:
       - when a process listening on port 47811 on 127.0.0.1, ::1, 0.0.0.0 or :: is not this user's and not the
-        ProcessTracker service's (or its owner can't be read within 3 s), that the port is held by another user's
-        process; nothing is posted then. When the listeners can't be listed with their processes (Get-NetTCPConnection
-        missing or failing), the script goes on only when nothing listens on those addresses at all; otherwise it says
-        it could not check the port and posts nothing;
+        ProcessTracker service's (reading its owner is refused, as it is for another account's process), that the port
+        is held by another user's process; nothing is posted then;
+      - when something listens there but whose it is can't be told (Get-NetTCPConnection missing or listing nothing,
+        the process gone, or WMI failing or not answering within 3 s), that the port could not be checked; nothing is
+        posted then;
       - the body of POST http://127.0.0.1:47811/api/hooks/session-start (the hook input plus plugin_version);
       - on 403, that ProcessTracker belongs to another user;
       - when nothing answers and the machine-wide ProcessTracker service is installed (sc query), that it is installed
@@ -81,10 +82,11 @@ function Get-ListenerVerdict([int]$Port) {
     #   'none'    when nothing listens there;
     #   'trusted' when every such listener runs as this user or is the ProcessTracker machine service's process (a
     #             standard user may not read SYSTEM's SID, so the service is recognised by its PID);
-    #   'foreign' when any of them runs as another account, or its owner can't be read (access denied, or WMI did not
-    #             answer within 3 s): an impostor must not get the payload;
-    #   'unknown' when the listener query itself fails (Get-NetTCPConnection missing or failing) and something does
-    #             listen there: who it is can't be told, so it is not trusted either.
+    #   'foreign' when any of them runs as another account, or reading its owner is refused (a standard user may
+    #             read the owner of every process of its own): an impostor must not get the payload;
+    #   'unknown' when something listens there but who it is can't be told: the listener query failed (Get-NetTCPConnection
+    #             missing, or failing quietly and listing nothing), the process vanished, or WMI failed or did not answer
+    #             within 3 s. It is not trusted either.
     $reachable = @('127.0.0.1', '0.0.0.0', '::', '::1')
     try { $all = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) }
     catch {
@@ -93,7 +95,12 @@ function Get-ListenerVerdict([int]$Port) {
     }
     $pids = @($all | Where-Object { $reachable -contains [string]$_.LocalAddress } |
         ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
-    if ($pids.Count -eq 0) { return 'none' }
+    if ($pids.Count -eq 0) {
+        # Get-NetTCPConnection reports a failure the same way as "no listener" (a non-terminating error, silenced), so
+        # an empty answer is only believed when the listener list agrees.
+        if (Test-PortListening $Port) { return 'unknown' }
+        return 'none'
+    }
 
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     try {
@@ -104,13 +111,13 @@ function Get-ListenerVerdict([int]$Port) {
         foreach ($owningPid in $pids) {
             if ($servicePid -ne 0 -and $owningPid -eq $servicePid) { continue }
             $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$owningPid" -OperationTimeoutSec 3 -ErrorAction Stop
-            if ($null -eq $process) { return 'foreign' }   # gone or hidden: can't vouch for it
+            if ($null -eq $process) { return 'unknown' }   # gone or hidden: can't vouch for it
             $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -OperationTimeoutSec 3 -ErrorAction Stop
             if (-not ($owner.ReturnValue -eq 0 -and [string]$owner.Sid -eq $me)) { return 'foreign' }
         }
         return 'trusted'
     }
-    catch { return 'foreign' }   # WMI failed or timed out on a listener that exists
+    catch { return 'unknown' }   # WMI failed or timed out on a listener that exists
 }
 
 function Test-PortListening([int]$Port) {

@@ -85,7 +85,10 @@ public sealed class FileLoggerProvider : ILoggerProvider
                 if (stream.Length > 0 && stream.Length + bytes.Length > _maxBytes)
                 {
                     stream.Dispose();
-                    File.Move(_path, _rolledPath, overwrite: true);
+                    // A reader holding either file without FILE_SHARE_DELETE blocks the rollover: then the file grows past
+                    // the limit until it is free, rather than every entry being lost meanwhile.
+                    try { File.Move(_path, _rolledPath, overwrite: true); }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
                     using var fresh = Open();
                     fresh.Write(bytes);
                 }
