@@ -53,6 +53,7 @@ public sealed class FileLoggerProvider : ILoggerProvider
             try
             {
                 _stream ??= Open();
+                _stream.Seek(0, SeekOrigin.End); // another process (a takeover or rollback) may have appended since
                 if (_stream.Length > 0 && _stream.Length + bytes.Length > _maxBytes)
                 {
                     _stream.Dispose();
@@ -67,8 +68,11 @@ public sealed class FileLoggerProvider : ILoggerProvider
         }
     }
 
-    /// <summary>Appends; others may read the file while it is open.</summary>
-    private FileStream Open() => new(_path, FileMode.Append, FileAccess.Write, FileShare.Read);
+    /// <summary>
+    /// Appends. Others may read, write (a takeover or rollback process logging while the instance it replaces still
+    /// holds the file) and rename or delete it (rolling over) while it is open.
+    /// </summary>
+    private FileStream Open() => new(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
 
     private void DropStream()
     {

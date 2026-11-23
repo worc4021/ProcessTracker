@@ -50,7 +50,8 @@ public static class HookAdvisor
 
     /// <summary>
     /// The context paragraph a session gets when it starts: mode, pressure and parallelism, the top three sessions, the
-    /// user's last input and the load-check rule; then a version-skew line when the plugin and the tracker differ.
+    /// user's last input and the load-check rule; then a version-skew line when the plugin and the tracker differ (an older
+    /// tracker is pointed out in user and service mode, each with its own way to update; a dev build gets no line).
     /// </summary>
     public static string SessionStart(LoadReport load, string mode, TimeSpan? sinceInput, Version? pluginVersion, Version trackerVersion)
     {
@@ -63,8 +64,17 @@ public static class HookAdvisor
 
         if (pluginVersion is not null && trackerVersion < pluginVersion)
         {
-            text.Append(Invariant($"\nProcessTracker {trackerVersion} is older than the plugin ({pluginVersion}); "))
-                .Append("it updates itself daily, or the user can run /process-tracker:install now.");
+            // Only user mode is updated by /process-tracker:install; a dev build is whatever the developer built.
+            if (mode == "user")
+            {
+                text.Append(Invariant($"\nProcessTracker {trackerVersion} is older than the plugin ({pluginVersion}); "))
+                    .Append("it updates itself daily, or the user can run /process-tracker:install now.");
+            }
+            else if (mode == "service")
+            {
+                text.Append(Invariant($"\nProcessTracker {trackerVersion} is older than the plugin ({pluginVersion}); "))
+                    .Append("the machine-wide service updates itself daily (winget or GitHub).");
+            }
         }
         else if (pluginVersion is not null && pluginVersion < trackerVersion)
         {

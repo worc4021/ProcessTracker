@@ -131,7 +131,9 @@ try
 {
     // User mode: the exit event the MSI (before starting the machine service) or a newer version sets to stop this
     // instance gracefully. Created only once the mutex is ours, so a stale signal for the previous instance is reset.
-    using var exitEvent = instanceChecks && runMode == RunMode.User ? CreateExitEvent() : null;
+    using var exitEvent = instanceChecks && runMode == RunMode.User
+        ? UserModeExitEvent.TryCreate(fileLog!.CreateLogger("ProcessTracker"))
+        : null;
     if (instanceChecks && runMode == RunMode.User && exitEvent is null) return 2;
 
     if (instanceChecks && previousAppDir is not null)
@@ -338,12 +340,31 @@ static void AddSelfUpdate(IServiceCollection services)
         sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<SelfUpdateWorker>>()));
 }
 
-static EventWaitHandle? CreateExitEvent()
+/// <summary>User mode's exit event, created once the instance mutex is ours.</summary>
+internal static class UserModeExitEvent
 {
-    try { return UserModeSignal.CreateForInstance(); }
-    catch (UnauthorizedAccessException e)
+    /// <summary>
+    /// The exit event, or null (the caller exits with code 2) when the name is taken: by another user's event
+    /// (<see cref="UnauthorizedAccessException"/>) or by an object of another type squatting it
+    /// (<see cref="WaitHandleCannotBeOpenedException"/>). Both are logged to <paramref name="log"/> and stderr.
+    /// </summary>
+    public static EventWaitHandle? TryCreate(ILogger log, string name = UserModeSignal.ExitEventName)
+    {
+        try { return UserModeSignal.CreateForInstance(name); }
+        catch (UnauthorizedAccessException e)
+        {
+            return Refuse(log, name, e);
+        }
+        catch (WaitHandleCannotBeOpenedException e)
+        {
+            return Refuse(log, name, e);
+        }
+    }
+
+    private static EventWaitHandle? Refuse(ILogger log, string name, Exception e)
     {
         Console.Error.WriteLine($"Cannot create the user-mode exit event: {e.Message} Exiting.");
+        log.LogError("Cannot create the user-mode exit event {Name}: {Reason} Exiting (code 2)", name, e.Message);
         return null;
     }
 }

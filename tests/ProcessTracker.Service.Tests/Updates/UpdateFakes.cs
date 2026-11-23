@@ -41,6 +41,9 @@ public sealed class FakeGitHub : HttpMessageHandler
     /// <summary>When true the latest-release request fails (rate limit).</summary>
     public bool ApiFails { get; set; }
 
+    /// <summary>When true the zip's body never arrives (a stalled transfer): reads block until cancelled.</summary>
+    public bool StallZip { get; set; }
+
     public List<Uri> Requests { get; } = [];
 
     private string Version => Tag[1..];
@@ -66,7 +69,10 @@ public sealed class FakeGitHub : HttpMessageHandler
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent($"{hash}  {ZipName}\n") });
         }
         if (uri.AbsoluteUri.EndsWith("/" + ZipName, StringComparison.Ordinal))
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Zip) });
+        {
+            HttpContent content = StallZip ? new StreamContent(new StalledStream()) : new ByteArrayContent(Zip);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+        }
         return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
     }
 
@@ -83,6 +89,30 @@ public sealed class FakeGitHub : HttpMessageHandler
         }
         return ms.ToArray();
     }
+}
+
+/// <summary>A response body whose reads never complete until they are cancelled.</summary>
+public sealed class StalledStream : Stream
+{
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException("async only");
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+    {
+        await Task.Delay(Timeout.Infinite, ct);
+        return 0;
+    }
+
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+        ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
 }
 
 /// <summary>A temporary folder deleted on dispose.</summary>

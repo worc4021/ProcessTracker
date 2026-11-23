@@ -132,6 +132,26 @@ public sealed class HookAdvisorTests
     }
 
     [Fact]
+    public void SessionStart_OlderTracker_ServiceMode_SaysServiceUpdatesItself()
+    {
+        var text = HookAdvisor.SessionStart(Load(Pressure.Low, 4), "service", null, new Version(1, 3, 0), new Version(1, 2, 5));
+
+        Assert.EndsWith(
+            RuleLine + "\nProcessTracker 1.2.5 is older than the plugin (1.3.0); the machine-wide service updates itself daily "
+            + "(winget or GitHub).",
+            text, StringComparison.Ordinal);
+        Assert.DoesNotContain("/process-tracker:install", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SessionStart_OlderTracker_DevMode_NoSkewLine()
+    {
+        var text = HookAdvisor.SessionStart(Load(Pressure.Low, 4), "dev", null, new Version(1, 3, 0), new Version(1, 2, 5));
+
+        Assert.EndsWith(RuleLine, text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SessionStart_OlderPlugin_SuggestsAutoUpdate()
     {
         var text = HookAdvisor.SessionStart(Load(Pressure.Low, 4), "user", null, new Version(1, 2, 0), new Version(1, 10, 0));

@@ -22,6 +22,8 @@ public sealed class SelfUpdateEnvironment
     public required IProcessStarter Starter { get; init; }
     public TimeSpan FirstCheck { get; init; } = TimeSpan.FromMinutes(10);
     public TimeSpan Interval { get; init; } = TimeSpan.FromHours(24);
+    /// <summary>Bounds one check's release lookup and download, so a stalled transfer cannot hold updates back.</summary>
+    public TimeSpan DownloadTimeout { get; init; } = TimeSpan.FromMinutes(15);
 }
 
 /// <summary>
@@ -82,6 +84,23 @@ public sealed class SelfUpdateWorker(
             return UpdateCheck.MachineService;
         }
 
+        // One stalled transfer must not hold updates back until the next logon: the lookup and the download share a deadline.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(env.DownloadTimeout);
+        try
+        {
+            return await CheckBoundedAsync(deadline.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            log.LogWarning("The update check did not finish within {Minutes} min; nothing changed, trying again later",
+                env.DownloadTimeout.TotalMinutes);
+            return UpdateCheck.DownloadFailed;
+        }
+    }
+
+    private async Task<UpdateCheck> CheckBoundedAsync(CancellationToken ct)
+    {
         var latest = await releases.GetLatestAsync(ct);
         if (latest is null)
         {

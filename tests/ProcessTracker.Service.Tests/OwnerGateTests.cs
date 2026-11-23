@@ -2,7 +2,12 @@ using System.Collections.Frozen;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using ProcessTracker.Core.Contracts;
 using ProcessTracker.Core.Hooks;
 using ProcessTracker.Core.Model;
@@ -132,5 +137,35 @@ public sealed class OwnerGateTests
         using var http = app.CreateLocalClient();
 
         Assert.Equal(HttpStatusCode.OK, (await http.GetAsync("/api/load", ct)).StatusCode);
+    }
+
+    // The production gate over a real socket: a Kestrel host on an ephemeral loopback port (never 47811, no mutex, no
+    // machine-service probe; ruling R1) with the real OwnerGate, called from this process. Same user, so it must pass:
+    // TcpOwnerLookup must find the client's connection and ProcessOwner.SidOf must read this process's SID.
+    [Fact]
+    public async Task OwnerGate_RealLoopbackConnection_SameUser_IsOwner()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.ConfigureKestrel(k => k.Listen(IPAddress.Loopback, 0));
+        await using var host = builder.Build();
+        var gate = new OwnerGate();
+        host.Run(ctx =>
+        {
+            ctx.Response.StatusCode = gate.IsOwner(ctx) ? StatusCodes.Status200OK : StatusCodes.Status403Forbidden;
+            return Task.CompletedTask;
+        });
+        await host.StartAsync(ct);
+        try
+        {
+            var address = host.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+            Assert.DoesNotContain(":47811", address, StringComparison.Ordinal);
+            using var http = new HttpClient();
+
+            var response = await http.GetAsync(address + "/api/load", ct);
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+        finally { await host.StopAsync(ct); }
     }
 }

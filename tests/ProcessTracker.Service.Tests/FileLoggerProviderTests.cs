@@ -53,5 +53,36 @@ public sealed class FileLoggerProviderTests : IDisposable
     }
 
     [Fact]
+    public void SecondWriterOnTheSameFile_BothWritersKeepLogging()
+    {
+        // A takeover or rollback process logs to the same file while the instance it replaces still holds it open.
+        using (var first = new FileLoggerProvider(_dir))
+        using (var second = new FileLoggerProvider(_dir))
+        {
+            first.CreateLogger("old").LogInformation("one");
+            second.CreateLogger("new").LogInformation("two");
+            first.CreateLogger("old").LogInformation("three");
+            second.CreateLogger("new").LogInformation("four");
+        }
+
+        var text = Read("processtracker.log");
+        foreach (var line in new[] { "old: one", "new: two", "old: three", "new: four" })
+            Assert.Contains(line, text);
+        Assert.Equal(4, text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length);
+    }
+
+    [Fact]
+    public void FileCanBeRenamedWhileOpen()
+    {
+        using var provider = new FileLoggerProvider(_dir);
+        provider.CreateLogger("c").LogInformation("held");
+
+        // Another process rolling the file over (rename) must not fail because this one holds it.
+        File.Move(Path.Combine(_dir, "processtracker.log"), Path.Combine(_dir, "processtracker.log.1"), overwrite: true);
+
+        Assert.Contains("held", Read("processtracker.log.1"));
+    }
+
+    [Fact]
     public void DefaultMaxSize_Is5MB() => Assert.Equal(5L * 1024 * 1024, FileLoggerProvider.DefaultMaxBytes);
 }

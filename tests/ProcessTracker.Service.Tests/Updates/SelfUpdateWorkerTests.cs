@@ -21,7 +21,7 @@ public sealed class SelfUpdateWorkerTests : IDisposable
 
     public void Dispose() => _temp.Dispose();
 
-    private SelfUpdateWorker Worker(TimeSpan? firstCheck = null, TimeSpan? interval = null) => new(
+    private SelfUpdateWorker Worker(TimeSpan? firstCheck = null, TimeSpan? interval = null, TimeSpan? downloadTimeout = null) => new(
         new ReleaseClient(_github, "0.2.0"),
         new SelfUpdateEnvironment
         {
@@ -33,6 +33,7 @@ public sealed class SelfUpdateWorkerTests : IDisposable
             Starter = _starter,
             FirstCheck = firstCheck ?? TimeSpan.FromMinutes(10),
             Interval = interval ?? TimeSpan.FromHours(24),
+            DownloadTimeout = downloadTimeout ?? TimeSpan.FromMinutes(15),
         },
         TimeProvider.System,
         NullLogger<SelfUpdateWorker>.Instance);
@@ -109,6 +110,29 @@ public sealed class SelfUpdateWorkerTests : IDisposable
         Assert.False(Directory.Exists(NewAppDir));
         Assert.Empty(_starter.Started);
     }
+
+    [Fact]
+    public async Task Worker_StalledDownload_GivesUpAfterTimeout()
+    {
+        _github.StallZip = true;
+
+        var check = Worker(downloadTimeout: TimeSpan.FromMilliseconds(300)).CheckOnceAsync(Ct);
+        var finished = await Task.WhenAny(check, Task.Delay(TimeSpan.FromSeconds(30), Ct));
+
+        Assert.Same(check, finished);
+        Assert.Equal(UpdateCheck.DownloadFailed, await check);
+        Assert.False(Directory.Exists(NewAppDir));
+        Assert.Empty(_starter.Started);
+        Assert.False(Directory.Exists(Path.Combine(_temp.Path, "tmp", "ProcessTracker-update-0.3.0")));
+    }
+
+    [Fact]
+    public void Environment_DownloadTimeout_Defaults15Minutes() =>
+        Assert.Equal(TimeSpan.FromMinutes(15), new SelfUpdateEnvironment
+        {
+            CurrentAppDir = @"C:\a", CurrentVersion = new Version(1, 0, 0), InstallRoot = @"C:\b", TempDir = @"C:\c",
+            MachineServiceInstalled = () => false, Starter = new FakeStarter(),
+        }.DownloadTimeout);
 
     [Theory]
     [InlineData("../escaped.txt")]
