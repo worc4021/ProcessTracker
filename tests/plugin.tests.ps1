@@ -1,0 +1,352 @@
+# Checks for the Claude Code plugin (plugin/) and its marketplace (.claude-plugin/marketplace.json).
+# Run under Windows PowerShell 5.1 and pwsh, non-elevated:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tests\plugin.tests.ps1
+# Nothing here touches the network (except curl against 127.0.0.1:1), Task Scheduler or %LOCALAPPDATA%: the scripts are
+# dot-sourced, which loads only their functions, and every side effect is replaced by a recording fake.
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path -Parent $PSScriptRoot
+$pluginDir = Join-Path $repo 'plugin'
+$installScript = Join-Path $pluginDir 'scripts\install-user.ps1'
+$sessionScript = Join-Path $pluginDir 'scripts\session-start.ps1'
+
+$failures = 0
+function Check([bool]$Condition, [string]$Name) {
+    if ($Condition) { Write-Output "ok   $Name" } else { Write-Output "FAIL $Name"; $script:failures++ }
+}
+function Read-Json([string]$Path) { Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+function Get-Names($Object) { @($Object.PSObject.Properties | ForEach-Object { $_.Name }) }
+function New-TestDir {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ('pt-plugin-tests-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $d | Out-Null
+    return $d
+}
+
+# Runs one case in a child scope, so the dot-sourced functions and the fakes it defines don't leak into the next case.
+# A case that throws counts as a failure of that case and the run goes on.
+function Invoke-Case([string]$Name, [scriptblock]$Body) {
+    try { & $Body }
+    catch { Write-Output "FAIL $Name (threw: $($_.Exception.Message))"; $script:failures++ }
+}
+
+# ---------------------------------------------------------------- manifests
+
+Invoke-Case 'manifests' {
+    $market = Read-Json (Join-Path $repo '.claude-plugin\marketplace.json')
+    $plugin = Read-Json (Join-Path $pluginDir '.claude-plugin\plugin.json')
+    $entry = @($market.plugins)
+    Check ($market.name -eq 'processtracker') 'marketplace name is processtracker'
+    Check ($market.owner.name -eq 'worc4021') 'marketplace owner is worc4021'
+    Check ($entry.Count -eq 1 -and $entry[0].name -eq 'process-tracker') 'marketplace lists one plugin, process-tracker'
+    Check ($plugin.name -eq 'process-tracker' -and $plugin.name -eq $entry[0].name) 'marketplace.json and plugin.json parse and names match'
+    Check ($entry[0].source.source -eq 'git-subdir' -and $entry[0].source.url -eq 'https://github.com/worc4021/ProcessTracker.git' -and $entry[0].source.path -eq 'plugin') 'plugin source is the plugin subdirectory of the repo'
+    Check ($plugin.version -match '^[0-9]+\.[0-9]+\.[0-9]+$') 'plugin.json version is X.Y.Z'
+    Check ($entry[0].source.ref -eq ('v' + $plugin.version)) 'marketplace ref equals v + plugin.json version'
+    Check ($plugin.homepage -eq 'https://github.com/worc4021/ProcessTracker' -and $plugin.license -eq 'MIT' -and $plugin.description) 'plugin.json has homepage, license MIT and a description'
+
+    $mcp = Read-Json (Join-Path $pluginDir '.mcp.json')
+    $server = $mcp.mcpServers.'process-tracker'
+    Check ((Get-Names $mcp.mcpServers).Count -eq 1 -and $server.type -eq 'http' -and $server.url -eq 'http://127.0.0.1:47811/mcp') '.mcp.json declares the process-tracker http server'
+    Check ($server.headers.'X-Claude-Session' -eq '${CLAUDE_CODE_HOST_SESSION_ID:-}') '.mcp.json sends X-Claude-Session'
+}
+
+Invoke-Case 'hooks.json' {
+    $hooksText = Get-Content -LiteralPath (Join-Path $pluginDir 'hooks\hooks.json') -Raw -Encoding UTF8
+    $hooks = ($hooksText | ConvertFrom-Json).hooks
+    Check ($hooksText -notmatch 'onFailure' -and $hooksText -notmatch 'permissionDecision') 'hooks.json has no onFailure block and no permissionDecision'
+
+    $pre = @($hooks.PreToolUse)
+    $preHook = @($pre[0].hooks)
+    Check ($pre.Count -eq 1 -and $pre[0].matcher -eq 'Bash|PowerShell|Task|Agent') 'PreToolUse matcher is Bash|PowerShell|Task|Agent'
+    Check ($preHook.Count -eq 1 -and $preHook[0].type -eq 'command' -and $preHook[0].command -eq 'curl.exe') 'hooks.json PreToolUse uses curl.exe'
+    $expected = @('-s', '-f', '--connect-timeout', '1', '--max-time', '2', '-H', 'Content-Type: application/json', '--data-binary', '@-', 'http://127.0.0.1:47811/api/hooks/pre-tool-use')
+    Check ((@($preHook[0].args) -join "`n") -eq ($expected -join "`n")) 'PreToolUse curl args (exec form)'
+    Check ($preHook[0].timeout -eq 3) 'PreToolUse timeout 3'
+
+    $start = @($hooks.SessionStart)
+    $startHook = @($start[0].hooks)
+    Check ($start.Count -eq 1 -and $startHook.Count -eq 1 -and $startHook[0].command -eq 'powershell.exe') 'SessionStart runs powershell.exe'
+    $expectedStart = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '${CLAUDE_PLUGIN_ROOT}/scripts/session-start.ps1')
+    Check ((@($startHook[0].args) -join "`n") -eq ($expectedStart -join "`n")) 'SessionStart args (exec form)'
+    Check ($startHook[0].timeout -eq 10) 'SessionStart timeout 10'
+}
+
+Invoke-Case 'curl' {
+    $hooks = (Read-Json (Join-Path $pluginDir 'hooks\hooks.json')).hooks
+    $curlArgs = @(@(@($hooks.PreToolUse)[0].hooks)[0].args | ForEach-Object { $_ -replace '127\.0\.0\.1:47811', '127.0.0.1:1' })
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = '{"tool_name":"Bash"}' | & curl.exe @curlArgs 2>$null | Out-String; $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $saved }
+    Check ($code -ne 0 -and $out.Trim() -eq '') 'curl against closed port is silent (non-zero exit, empty stdout)'
+}
+
+Invoke-Case 'commands' {
+    $install = Get-Content -LiteralPath (Join-Path $pluginDir 'commands\install.md') -Raw
+    $uninstall = Get-Content -LiteralPath (Join-Path $pluginDir 'commands\uninstall.md') -Raw
+    $status = Get-Content -LiteralPath (Join-Path $pluginDir 'commands\status.md') -Raw
+    Check ($install.Contains('powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-user.ps1"')) 'install.md runs install-user.ps1'
+    Check ($uninstall.Contains('user uninstall') -and $uninstall.Contains('--purge-data')) 'uninstall.md runs proctrack user uninstall, --purge-data only on request'
+    Check ($status.Contains('user status') -and $status.Contains('proctrack load')) 'status.md runs proctrack user status and proctrack load'
+}
+
+# ---------------------------------------------------------------- install-user.ps1
+
+# Fakes shared by the install cases. $script:calls records what would have happened.
+$installFakes = {
+    $script:calls = New-Object System.Collections.ArrayList
+    function Test-Elevated { $false }
+    function Get-Health { $null }
+    function Test-UserTask([string]$Name) { $false }
+    function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) [void]$script:calls.Add("extract $DestinationPath") }
+    function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:calls.Add("run $Exe $($Arguments -join ' ')"); @{ Code = 0; Output = 'fake output' } }
+    $script:release = @{
+        tag_name = 'v0.2.0'
+        assets   = @(
+            @{ name = 'ProcessTracker-0.2.0-x64.zip'; browser_download_url = 'https://github.com/worc4021/ProcessTracker/releases/download/v0.2.0/ProcessTracker-0.2.0-x64.zip' },
+            @{ name = 'SHA256SUMS.txt'; browser_download_url = 'https://github.com/worc4021/ProcessTracker/releases/download/v0.2.0/SHA256SUMS.txt' })
+    } | ConvertTo-Json -Depth 5
+    $script:zipBytes = [Text.Encoding]::ASCII.GetBytes('not really a zip')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $script:goodHash = (($sha.ComputeHash($script:zipBytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    $script:sumsHash = $script:goodHash
+    $script:redirect = $null
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$MaximumRedirection, [hashtable]$Headers,
+            [switch]$PassThru, [switch]$SkipHttpErrorCheck, [int]$TimeoutSec, [string]$Method, $Body, [string]$ContentType)
+        [void]$script:calls.Add("get $Uri")
+        if ($Uri -like 'https://api.github.com/*') { return [pscustomobject]@{ StatusCode = 200; Content = $script:release; Headers = @{} } }
+        if ($script:redirect -and $Uri -like 'https://github.com/*/releases/download/*.zip') { return [pscustomobject]@{ StatusCode = 302; Content = ''; Headers = @{ Location = $script:redirect } } }
+        if ($Uri -like '*/SHA256SUMS.txt') { [IO.File]::WriteAllText($OutFile, "$($script:sumsHash)  ProcessTracker-0.2.0-x64.zip`n") }
+        elseif ($Uri -like '*-x64.zip*') { [IO.File]::WriteAllBytes($OutFile, $script:zipBytes) }
+        else { throw "unexpected download $Uri" }
+        return [pscustomobject]@{ StatusCode = 200; Content = ''; Headers = @{} }
+    }
+}
+
+# Points %TEMP% and %LOCALAPPDATA% at a fresh folder for one case and restores them afterwards.
+function Use-TestEnvironment([scriptblock]$Body) {
+    $saved = @{ TEMP = $env:TEMP; TMP = $env:TMP; LOCALAPPDATA = $env:LOCALAPPDATA }
+    $root = New-TestDir
+    try {
+        $env:TEMP = Join-Path $root 'temp'; $env:TMP = $env:TEMP; $env:LOCALAPPDATA = Join-Path $root 'local'
+        New-Item -ItemType Directory -Path $env:TEMP, $env:LOCALAPPDATA | Out-Null
+        & $Body $root
+    }
+    finally {
+        $env:TEMP = $saved.TEMP; $env:TMP = $saved.TMP; $env:LOCALAPPDATA = $saved.LOCALAPPDATA
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Invoke-Case 'install refuses when elevated' {
+    . $installScript
+    . $installFakes
+    function Test-Elevated { $true }
+    $threw = $false
+    try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+    Check $threw 'install-user.ps1 refuses when elevated (throws)'
+    Check ($message -match 'elevated') 'refusal message says elevated'
+    Check (@($script:calls | Where-Object { $_ -like 'get *' }).Count -eq 0) 'install-user.ps1 refuses when elevated: no download call'
+}
+
+Invoke-Case 'install rejects hash mismatch' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:sumsHash = '0' * 64
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'SHA-256') 'install-user.ps1 rejects hash mismatch (throws)'
+        Check (@($script:calls | Where-Object { $_ -like 'get *.zip' }).Count -eq 1) 'the zip was downloaded'
+        Check (@($script:calls | Where-Object { $_ -like 'extract *' -or $_ -like 'run *' }).Count -eq 0) 'install-user.ps1 rejects hash mismatch: no extract, nothing run'
+        Check (@(Get-ChildItem -LiteralPath $env:TEMP -Recurse -File).Count -eq 0) 'downloads deleted after a mismatch'
+    }
+}
+
+Invoke-Case 'install happy path' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        # The fake Expand-Archive creates the layout a real zip would.
+        function Expand-Archive {
+            param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+            [void]$script:calls.Add("extract $DestinationPath")
+            New-Item -ItemType Directory -Path (Join-Path $DestinationPath 'bin') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $DestinationPath 'bin\proctrack.exe') -Value 'x'
+        }
+        $script:ExitCode = $null
+        $out = Invoke-InstallUser | Out-String
+        $appDir = Join-Path $env:LOCALAPPDATA 'Programs\ProcessTracker\app-0.2.0'
+        $exe = Join-Path $appDir 'bin\proctrack.exe'
+        Check (Test-Path -LiteralPath $exe) 'extracted to %LOCALAPPDATA%\Programs\ProcessTracker\app-0.2.0'
+        Check ($script:calls -contains "run $exe user install --app-dir $appDir") 'runs proctrack user install --app-dir <app dir>'
+        Check ($script:calls -contains "run $exe mcp unregister") 'runs proctrack mcp unregister'
+        Check ($script:ExitCode -eq 0 -and $out -match 'fake output') 'prints proctrack output and keeps its exit code'
+        Check (@($script:calls | Where-Object { $_ -like 'get https://api.github.com/repos/worc4021/ProcessTracker/releases/latest' }).Count -eq 1) 'reads the latest release from the GitHub API'
+        Check (@(Get-ChildItem -LiteralPath $env:TEMP -Recurse -File).Count -eq 0) 'downloads deleted after install'
+    }
+}
+
+Invoke-Case 'install refuses foreign redirect' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:redirect = 'https://evil.example/x.zip'
+        $threw = $false
+        try { Invoke-InstallUser | Out-Null } catch { $threw = $true; $message = $_.Exception.Message }
+        Check ($threw -and $message -match 'evil\.example') 'redirect to a foreign host is refused'
+        Check (@($script:calls | Where-Object { $_ -like '*evil.example*' }).Count -eq 0) 'the foreign host is never contacted'
+        Check (@($script:calls | Where-Object { $_ -like 'extract *' }).Count -eq 0) 'nothing extracted after a refused redirect'
+    }
+}
+
+Invoke-Case 'install follows allowlisted redirect' {
+    Use-TestEnvironment {
+        param($root)
+        . $installScript
+        . $installFakes
+        $script:redirect = 'https://release-assets.githubusercontent.com/abc/ProcessTracker-0.2.0-x64.zip.bin?sig=1'
+        try { Invoke-InstallUser | Out-Null } catch { }   # the fake extract leaves no proctrack.exe; only the hops matter
+        Check (@($script:calls | Where-Object { $_ -like 'get https://release-assets.githubusercontent.com/*' }).Count -eq 1) 'redirect to release-assets.githubusercontent.com is followed'
+    }
+}
+
+Invoke-Case 'install defers to the machine service' {
+    . $installScript
+    . $installFakes
+    function Get-Health { [pscustomobject]@{ version = '0.2.0'; mode = 'service' } }
+    function Test-UserTask([string]$Name) { $true }
+    $out = Invoke-InstallUser | Out-String
+    Check ($out -match 'machine-wide service') 'service mode: says the machine-wide service is in use'
+    Check ($out -match 'proctrack user uninstall') 'service mode with a user task: points at proctrack user uninstall'
+    Check (@($script:calls | Where-Object { $_ -like 'get *' -or $_ -like 'run *' }).Count -eq 0) 'service mode: no download, nothing run'
+}
+
+Invoke-Case 'install skips a current user-mode copy' {
+    . $installScript
+    . $installFakes
+    function Get-Health { [pscustomobject]@{ version = '0.2.0'; mode = 'user'; owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } }
+    $out = Invoke-InstallUser | Out-String
+    Check ($out -match 'already') 'own user-mode copy at the latest version: nothing to do'
+    Check (@($script:calls | Where-Object { $_ -like 'get *.zip' -or $_ -like 'run *' }).Count -eq 0) 'no zip download when not strictly newer'
+}
+
+Invoke-Case 'SHA256SUMS parsing' {
+    . $installScript
+    $sums = Read-Sha256Sums ("$('ab' * 32)  a.zip`n`n$('CD' * 32)  SHA256SUMS-other.txt`n")
+    Check ($sums['a.zip'] -eq ('ab' * 32) -and $sums['SHA256SUMS-other.txt'] -eq ('cd' * 32)) 'SHA256SUMS: two-space format, lower-cased'
+    $threw = $false
+    try { Read-Sha256Sums 'nonsense line' | Out-Null } catch { $threw = $true }
+    Check $threw 'SHA256SUMS: malformed line throws'
+}
+
+# ---------------------------------------------------------------- session-start.ps1
+
+$sessionFakes = {
+    $script:posts = New-Object System.Collections.ArrayList
+    $script:runs = New-Object System.Collections.ArrayList
+    $script:taskExists = $false
+    function Test-UserTask([string]$Name) { $script:taskExists }
+    function Invoke-Native([string]$Exe, [string[]]$Arguments) { [void]$script:runs.Add("$Exe $($Arguments -join ' ')"); @{ Code = 0; Output = '' } }
+}
+function New-ConnectionRefused {
+    New-Object System.Net.WebException('Unable to connect to the remote server', [System.Net.WebExceptionStatus]::ConnectFailure)
+}
+
+Invoke-Case 'session-start unreachable' {
+    . $sessionScript
+    . $sessionFakes
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        [void]$script:posts.Add($Uri)
+        throw (New-ConnectionRefused)
+    }
+    $out = Invoke-SessionStart '{"session_id":"s1","hook_event_name":"SessionStart"}'
+    Check ($out -match '/process-tracker:install') 'session-start.ps1 prints install offer when unreachable'
+    Check ($script:posts -contains 'http://127.0.0.1:47811/api/hooks/session-start') 'session-start posts to /api/hooks/session-start'
+    Check ($script:runs.Count -eq 0) 'no task to start when none exists'
+}
+
+Invoke-Case 'session-start starts an existing user task' {
+    . $sessionScript
+    . $sessionFakes
+    $script:taskExists = $true
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        throw (New-ConnectionRefused)
+    }
+    $out = Invoke-SessionStart '{}'
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Check ($script:runs -contains "schtasks.exe /Run /TN \ProcessTracker\User-$sid") 'runs schtasks /Run on \ProcessTracker\User-<SID>'
+    Check ($out -match 'started' -and $out -notmatch '/process-tracker:install') 'prints one line saying it was started'
+    Check (@($out -split "`n" | Where-Object { $_.Trim() }).Count -eq 1) 'one line'
+}
+
+Invoke-Case 'session-start 403' {
+    . $sessionScript
+    . $sessionFakes
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        [pscustomobject]@{ StatusCode = 403; Content = 'this ProcessTracker belongs to another user; ask an admin to install the machine-wide service' }
+    }
+    $out = Invoke-SessionStart '{}'
+    Check ($out -eq 'ProcessTracker on this machine belongs to another user; ask an admin to install the machine-wide service.') 'session-start prints the other-user line on 403'
+}
+
+Invoke-Case 'session-start passes the response through' {
+    . $sessionScript
+    . $sessionFakes
+    $script:body = $null
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        $script:body = [Text.Encoding]::UTF8.GetString([byte[]]$Body)
+        $script:timeout = $TimeoutSec
+        [pscustomobject]@{ StatusCode = 200; Content = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"hi"}}' }
+    }
+    $out = Invoke-SessionStart '{"session_id":"s1","cwd":"C:\\Users\\caf\u00e9"}'
+    Check ($out -eq '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"hi"}}') 'session-start writes the response body to stdout'
+    $sent = $script:body | ConvertFrom-Json
+    $version = (Read-Json (Join-Path $pluginDir '.claude-plugin\plugin.json')).version
+    Check ($sent.plugin_version -eq $version -and $sent.session_id -eq 's1') 'session-start adds plugin_version from plugin.json'
+    Check ($script:timeout -eq 3) 'session-start POST timeout 3 s'
+}
+
+Invoke-Case 'session-start other status is silent' {
+    . $sessionScript
+    . $sessionFakes
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [string]$Method, [switch]$UseBasicParsing, [string]$ContentType, $Body, [int]$TimeoutSec,
+            [int]$MaximumRedirection, [switch]$SkipHttpErrorCheck)
+        [pscustomobject]@{ StatusCode = 500; Content = 'boom' }
+    }
+    $out = Invoke-SessionStart '{}'
+    Check ([string]::IsNullOrEmpty($out)) 'session-start prints nothing on other errors'
+}
+
+# The real script end to end: an empty hook input and nothing listening on the port (the dev box may run the real
+# service, so only the exit code and the absence of error text are checked here).
+Invoke-Case 'session-start process' {
+    $exe = (Get-Process -Id $PID).Path
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = '{}' | & $exe -NoProfile -ExecutionPolicy Bypass -File $sessionScript 2>&1 | Out-String; $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $saved }
+    Check ($code -eq 0) 'session-start.ps1 exits 0'
+    Check ($out -notmatch 'Exception|At line|CategoryInfo') 'session-start.ps1 prints no error text'
+}
+
+if ($failures -gt 0) { Write-Output "$failures check(s) failed"; exit 1 }
+exit 0

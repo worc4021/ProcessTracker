@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "process-tracker": {
+      "type": "http",
+      "url": "http://127.0.0.1:47811/mcp",
+      "headers": {
+        "X-Claude-Session": "${CLAUDE_CODE_HOST_SESSION_ID:-}"
+      }
+    }
+  }
+}

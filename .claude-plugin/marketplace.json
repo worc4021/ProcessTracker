@@ -1,0 +1,19 @@
+{
+  "name": "processtracker",
+  "description": "ProcessTracker for Claude Code: per-session process tracking, machine load warnings and an MCP server.",
+  "owner": {
+    "name": "worc4021"
+  },
+  "plugins": [
+    {
+      "name": "process-tracker",
+      "description": "Shows Claude which processes each session started and warns before heavy commands when the machine is under load.",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/worc4021/ProcessTracker.git",
+        "path": "plugin",
+        "ref": "v0.2.0"
+      }
+    }
+  ]
+}
