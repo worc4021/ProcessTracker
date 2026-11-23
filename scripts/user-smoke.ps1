@@ -10,13 +10,15 @@
       1. Extracts -Zip twice, into <work>\first and <work>\second; checks ProcessTracker.Service.exe is at the zip root,
          bin\proctrack.exe is present and upgrade.ps1 is not.
       2. Starts <first>\ProcessTracker.Service.exe --user --DataDir <work>\data and expects /api/health to report mode
-         "user" and this account as the owner within 30 s.
+         "user" and this account as the owner within 30 s. Then GET /api/load must answer 200 and POST
+         /api/hooks/pre-tool-use with the body {} must answer 200 with the body {}: both come from this account, so they
+         pass the real owner gate (TCP table lookup and process SID), which the unit tests replace with a fake.
       3. Takeover: starts <second>\ProcessTracker.Service.exe --user --takeover <first> --DataDir <work>\data and
          expects, within 60 s, the first instance to exit (code 0), the listener on 47811 to be the second instance and
          its log to say it took over. Both folders are outside %LOCALAPPDATA%\Programs\ProcessTracker, so the takeover
          leaves the logon task alone (it logs that and skips UserTask.Register) and neither instance self-updates.
       4. Runs <second>\bin\proctrack.exe admin stop-user-instances, which sets Global\ProcessTracker.UserMode.Exit and
-         waits up to 10 s for the instance mutex, and expects exit 0 and the second instance gone (code 0) within 10 s.
+         waits up to 30 s for the instance mutex, and expects exit 0 and the second instance gone (code 0) within 10 s.
     Everything is removed afterwards: instances still running are stopped, the work folder is deleted, and a
     \ProcessTracker\User-<SID> task the run created is removed.
 
@@ -90,6 +92,26 @@ function Get-HealthField([string]$Name) {
     return [string]$field.Value
 }
 
+# Status code and body of one request to the instance; Status 0 when nothing answered. A 4xx/5xx is returned, not thrown.
+function Invoke-Api([string]$Method, [string]$Path, [string]$Body) {
+    $p = @{ Uri = "http://127.0.0.1:$port$Path"; Method = $Method; UseBasicParsing = $true; TimeoutSec = 5 }
+    if (-not [string]::IsNullOrEmpty($Body)) { $p['Body'] = [Text.Encoding]::UTF8.GetBytes($Body); $p['ContentType'] = 'application/json' }
+    if ($PSVersionTable.PSVersion.Major -ge 7) { $p['SkipHttpErrorCheck'] = $true }
+    try {
+        $r = Invoke-WebRequest @p
+        return @{ Status = [int]$r.StatusCode; Body = [string]$r.Content }
+    }
+    catch {
+        # Windows PowerShell 5.1 throws a WebException for an HTTP error status; it carries the response.
+        $e = $_.Exception
+        while ($null -ne $e) {
+            if ($null -ne $e.Response) { return @{ Status = [int]$e.Response.StatusCode; Body = '' } }
+            $e = $e.InnerException
+        }
+        return @{ Status = 0; Body = "$($_.Exception.Message)" }
+    }
+}
+
 # The process listening on 47811, or $null.
 function Get-ListenerPid {
     $listen = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
@@ -160,6 +182,12 @@ try {
     $owner = Get-HealthField 'owner'
     Assert-That ($owner -eq $me.Name) "/api/health owner is $($me.Name) (is $owner)"
     Assert-That ((Get-ListenerPid) -eq $one.Id) "the first instance (pid $($one.Id)) listens on $port"
+
+    Write-Step 'The owner gate lets this account through'
+    $load = Invoke-Api 'GET' '/api/load' $null
+    Assert-That ($load.Status -eq 200) "GET /api/load answers 200 to its owner (status $($load.Status))"
+    $hook = Invoke-Api 'POST' '/api/hooks/pre-tool-use' '{}'
+    Assert-That ($hook.Status -eq 200 -and $hook.Body.Trim() -eq '{}') "POST /api/hooks/pre-tool-use {} answers 200 with {} (status $($hook.Status), body '$($hook.Body)')"
 
     Write-Step 'Take over with the second copy'
     $two = Start-Instance $second "--user --takeover `"$first`" --DataDir `"$dataDir`""

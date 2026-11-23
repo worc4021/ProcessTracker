@@ -15,7 +15,8 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      # The simple release type bumps version.txt itself; no extra-files entry (that would double-bump).
+      # version.txt is bumped by the simple release type itself (so it is not listed in extra-files, which would
+      # double-bump it); plugin/.claude-plugin/plugin.json is bumped through the config's extra-files entry.
       - id: release
         uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         with:
