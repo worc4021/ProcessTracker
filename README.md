@@ -161,7 +161,7 @@ against an MSI install.
 
 ## User-only vs machine-wide
 
-Both modes run the same executable. They share one single-instance mutex, so only one instance serves port 47811.
+Both modes run the same executable. The machine-wide and user-only modes share one single-instance mutex, so only one instance serves port 47811.
 
 | | Machine-wide (MSI) | User-only (plugin) | Development (`--console --dev`) |
 |---|---|---|---|
@@ -261,7 +261,7 @@ Get-WinEvent -ProviderName ProcessTracker -MaxEvents 50
 ```
 
 In user-only mode there is no event log (creating its source needs admin). It writes a rolling log file instead,
-`%LOCALAPPDATA%ProcessTrackerlogsprocesstracker.log`. In console mode, logs go to the console.
+`%LOCALAPPDATA%\ProcessTracker\logs\processtracker.log`. In console mode, logs go to the console.
 
 ## proctrack
 
@@ -355,13 +355,15 @@ sessions without the MCP entry, add this to `%USERPROFILE%\.claude\CLAUDE.md`:
 
 ## Hooks
 
-The plugin has two hooks (`plugin/hooks/hooks.json`). Neither blocks anything, and both stay silent when the tracker is
-not running.
+The plugin has two hooks (`plugin/hooks/hooks.json`). Neither ever blocks anything. PreToolUse is silent when the
+tracker is not running; SessionStart tells the agent what is going on.
 
 - **SessionStart** adds a short paragraph to the session: the mode, the pressure and suggested parallelism, the top
-  sessions by memory, how long ago you last used the machine, and a one-line rule. If the tracker is not running, it
-  tells the agent to offer `/process-tracker:install` once. If the tracker is older than the plugin, it says an update is
-  due.
+  sessions by memory, how long ago you last used the machine, and a one-line rule. If the tracker is older than the plugin,
+  it says an update is due. When the tracker does not answer:
+  - no tracker and no install: it tells the agent to offer `/process-tracker:install` once;
+  - a user-only install exists but is not running: it starts it and says so;
+  - the tracker belongs to another Windows user (the 403 case): it says so and points to the machine-wide service.
 - **PreToolUse** runs before `Bash`, `PowerShell`, `Task` and `Agent` calls. The service decides whether the command is
   heavy (builds, test runs, MATLAB or Dymola launches, explicit parallelism, and subagent launches). Other commands, and
   any command at Low pressure, get no output.
