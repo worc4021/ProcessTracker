@@ -5,7 +5,14 @@
       "release-type": "simple",
       "bump-minor-pre-major": true,
       "package-name": "ProcessTracker",
-      "include-component-in-tag": false
+      "include-component-in-tag": false,
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "plugin/.claude-plugin/plugin.json",
+          "jsonpath": "$.version"
+        }
+      ]
     }
   }
 }

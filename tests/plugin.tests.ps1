@@ -40,7 +40,10 @@ Invoke-Case 'manifests' {
     Check ($plugin.name -eq 'process-tracker' -and $plugin.name -eq $entry[0].name) 'marketplace.json and plugin.json parse and names match'
     Check ($entry[0].source.source -eq 'git-subdir' -and $entry[0].source.url -eq 'https://github.com/worc4021/ProcessTracker.git' -and $entry[0].source.path -eq 'plugin') 'plugin source is the plugin subdirectory of the repo'
     Check ($plugin.version -match '^[0-9]+\.[0-9]+\.[0-9]+$') 'plugin.json version is X.Y.Z'
-    Check ($entry[0].source.ref -eq ('v' + $plugin.version)) 'marketplace ref equals v + plugin.json version'
+    # release-please bumps plugin.json in the release PR; the release workflow moves the ref after tagging.
+    $ref = [string]$entry[0].source.ref
+    Check ($ref -match '^v\d+\.\d+\.\d+$') 'marketplace ref is vX.Y.Z'
+    Check ($ref -match '^v\d+\.\d+\.\d+$' -and $plugin.version -match '^[0-9]+\.[0-9]+\.[0-9]+$' -and [version]$ref.Substring(1) -le [version]$plugin.version) 'marketplace ref version <= plugin.json version'
     Check ($plugin.homepage -eq 'https://github.com/worc4021/ProcessTracker' -and $plugin.license -eq 'MIT' -and $plugin.description) 'plugin.json has homepage, license MIT and a description'
 
     $mcp = Read-Json (Join-Path $pluginDir '.mcp.json')
